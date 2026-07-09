@@ -44,7 +44,13 @@ def parse_args():
     p.add_argument("--axis", type=str, default="friction", help="OOD axis name (see dr_axes.AXES)")
     p.add_argument("--grid", type=float, nargs="+", default=None, help="override the axis grid values")
     p.add_argument("--per_point", type=int, default=256, help="envs (== seeds) per grid point")
-    p.add_argument("--steps", type=int, default=1000, help="measured steps")
+    p.add_argument("--steps", type=int, default=2000,
+                   help="measured steps. NOTE: timeout fires at max_episode_length+1 "
+                        "(1001 for the 20s/0.02dt default), so a full-survival policy "
+                        "logs its FIRST complete episode only at step 1001 -- with "
+                        "steps<=1000 `mean_return` stays 0. Use >=1001 (default 2000 "
+                        "captures a full episode plus margin; go higher for tighter "
+                        "return/fall distributions).")
     p.add_argument("--warmup", type=int, default=100, help="unrecorded settling steps before measuring")
     p.add_argument("--command_vx", type=float, default=0.5, help="fixed forward command [m/s]")
     p.add_argument("--seed", type=int, default=1, help="global seed (repeat runs to add more seeds)")
@@ -89,7 +95,9 @@ def resolve_load_run(root, run_name, load_run):
             f"No run matching run_name '{run_name}' in {root}. Available: {runs}. "
             f"Pass --load_run explicitly."
         )
-    chosen = matching[-1]
+    # pick the calendar-latest by mtime, not by string sort: the `MonDD_HH-MM-SS`
+    # folder prefix does not sort chronologically across month/day boundaries.
+    chosen = max(matching, key=lambda d: os.path.getmtime(os.path.join(root, d)))
     print(f"[eval] auto-selected latest '{run_name}' run: {chosen}")
     return chosen
 

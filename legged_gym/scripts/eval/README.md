@@ -42,18 +42,24 @@ source /ari/users/btutak/auv/sim/genesis-wp/activate.sh   # or local .venv
 python legged_gym/scripts/eval/sweep.py --task go2_bench_oracle \
     --per_point 64 --steps 200 --warmup 50 --out logs/eval/smoke.npz
 
-# real curve, 2 baselines on the friction axis
+# real curve, 2 baselines on the friction axis.
+# steps MUST be >= max_episode_length+1 (1001 for 20s/0.02dt), else a full-survival
+# policy never completes an episode and `mean_return` reads 0. Default is 2000
+# (one full episode + margin); go higher for tighter return/fall distributions.
 python legged_gym/scripts/eval/sweep.py --task go2_bench_nodr \
-    --per_point 256 --steps 1000 --out logs/eval/friction_nodr.npz
+    --per_point 256 --steps 2000 --out logs/eval/friction_nodr.npz
 python legged_gym/scripts/eval/sweep.py --task go2_bench_mlp \
-    --per_point 256 --steps 1000 --out logs/eval/friction_mlp.npz
+    --per_point 256 --steps 2000 --out logs/eval/friction_mlp.npz
 
 python legged_gym/scripts/eval/plot_sweep.py \
     logs/eval/friction_nodr.npz logs/eval/friction_mlp.npz \
     --out logs/eval/friction_curve.png
 ```
 
-`--load_run <dir>` / `--ckpt <n>` pick a specific checkpoint (default: latest).
+`--load_run <dir>` / `--ckpt <n>` pick a specific checkpoint. Default auto-selects
+the calendar-latest (mtime) run whose folder carries this task's `run_name`, and
+fails loud if none match -- so a sibling method's checkpoint can never be loaded
+by accident. For a published curve, prefer passing `--load_run` explicitly.
 Repeat a run with a different `--seed` to stack more seeds.
 
 ## Known caveats
@@ -71,7 +77,11 @@ Repeat a run with a different `--seed` to stack more seeds.
 
 ## Status
 
-Written offline (local box has no Genesis env). NOT yet run against a live sim --
-first execution is the UHeM smoke test above. Reviewed by a second pass:
-command-curriculum freeze bug fixed. Baseline checkpoints
-(`go2_bench_nodr`, `go2_bench_mlp`, `go2_bench_oracle`) still need training.
+Smoke-tested on a live local Genesis/CUDA box (Genesis 1.0.0, torch 2.8.0+cu126):
+loader isolation, warmup episode-clock reset, `.npz` provenance, and plot input
+validation all verified. Reviewed across two passes: command-curriculum freeze bug,
+checkpoint cross-method contamination, and warmup metric shift all fixed.
+
+Only a `go2_bench_oracle` checkpoint exists so far; the `go2_bench_nodr` and
+`go2_bench_mlp` baselines still need training before the real degradation curves
+can be produced.
