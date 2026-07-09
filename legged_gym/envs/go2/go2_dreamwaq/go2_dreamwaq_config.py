@@ -7,13 +7,13 @@ class Go2DreamwaqCfg( Go2RoughCommonCfg ):
         num_camera_envs = 1 # number of envs with depth camera, starting from the first env
         num_envs = 3200
         num_actions = 12
-        num_observations = 45  # num_obs
+        num_observations = 45  # num_obs # one frame
         frame_stack = 5    # number of frames to stack for obs_history
-        num_history_obs = int(num_observations * frame_stack)
+        num_history_obs = int(num_observations * frame_stack) # vae encoder input size
         num_latent_dims = 16
         num_explicit_dims = 24  # base linear velocity
         num_decoder_output = num_observations
-        c_frame_stack = 5
+        c_frame_stack = 5  # critic frame stack
         num_single_critic_obs = num_observations + 31 + 81 + 17 + 3
         num_privileged_obs = c_frame_stack * num_single_critic_obs
         # Privileged_obs and critic_obs are seperated here

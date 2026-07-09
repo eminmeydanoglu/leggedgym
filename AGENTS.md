@@ -117,6 +117,64 @@ cd LeggedGym-Ex && pip install -e ".[genesis]"
 export SIMULATOR=genesis
 ```
 
+### Local Genesis Setup With uv
+This checkout is installed for Genesis with a repo-local uv environment, not conda or Docker.
+
+```bash
+cd /home/emin/code/online-estimation/genesis-wp/LeggedGym-Ex
+uv venv --python python3.11 .venv
+env UV_CACHE_DIR=/tmp/uv-cache UV_HTTP_TIMEOUT=180 \
+  uv pip install --python .venv/bin/python -e '.[genesis]' \
+  --extra-index-url https://download.pytorch.org/whl/cu126
+```
+
+Verified on this laptop:
+- Python: `3.11.13`
+- GPU: `NVIDIA GeForce RTX 3050 Laptop GPU`, 4 GB VRAM
+- Driver: `595.71.05`
+- Torch: `2.8.0+cu126`
+- Genesis: `1.0.0`
+- `.venv` size after install: about `8.9G`
+
+Use `.venv/bin/python` directly for commands. Plain `uv run` may try to resolve incompatible extras (`genesis` vs `isaacgym`); if `uv run` is needed, use `uv run --no-sync --python .venv/bin/python`.
+
+```bash
+# Verify imports and CUDA
+env SIMULATOR=genesis .venv/bin/python -c \
+  "import torch, genesis; print(torch.__version__, torch.cuda.is_available(), genesis.__version__)"
+
+# List tasks
+env SIMULATOR=genesis .venv/bin/python tests/test_all_tasks.py --list
+
+# Smoke test
+env SIMULATOR=genesis WANDB_MODE=disabled \
+  .venv/bin/python tests/test_all_tasks.py --tasks go2 --iterations 1 --headless
+```
+
+Training/play examples for this setup:
+
+```bash
+# Laptop-safe small run
+env SIMULATOR=genesis WANDB_MODE=disabled \
+  .venv/bin/python -m legged_gym.scripts.train \
+  --task go2 --headless --num_envs 64 --max_iterations 100
+
+# Larger machine run
+env SIMULATOR=genesis WANDB_MODE=disabled \
+  .venv/bin/python -m legged_gym.scripts.train \
+  --task go2 --headless --num_envs 1024 --max_iterations 1500
+
+# Resume latest checkpoint in a run
+env SIMULATOR=genesis WANDB_MODE=disabled \
+  .venv/bin/python -m legged_gym.scripts.train \
+  --task go2 --headless --resume --load_run <run_dir> --ckpt -1
+
+# Play/evaluate a checkpoint
+env SIMULATOR=genesis WANDB_MODE=disabled \
+  .venv/bin/python -m legged_gym.scripts.play \
+  --task go2 --headless --load_run <run_dir> --ckpt -1
+```
+
 ### IsaacSim/IsaacLab (Python 3.11)
 ```bash
 conda create -n lr_lab python=3.11

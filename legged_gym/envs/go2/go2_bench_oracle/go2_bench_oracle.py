@@ -7,12 +7,21 @@ from legged_gym.envs.go2.go2 import GO2
 
 class Go2BenchOracle(GO2):
     """Oracle policy env: appends the TRUE (privileged) physics parameters to the
-    actor observation, noise-free. This is the ceiling for the adaptation study --
-    'if identification were perfect'. The appended vector
+    actor observation, noise-free. This is the performance ceiling for the
+    adaptation study -- 'if identification were perfect'. The appended vector
         P = [friction(1), added_mass(1), com_bias(3)]  (= 5 dims)
-    is the SAME target RMA/estimator methods will regress and the SAME label the
-    linear probes use -- one single source of truth. Must match
-    num_observations = 45 + 5 in Go2BenchOracleCfg.
+    is normalised by dr_normalize using the oracle's OWN (widened) DR ranges
+    [0.1, 2.5] / [-2.0, 5.0], which cover the entire eval-sweep grid.  Training
+    over the full sweep range ensures the oracle is competent -- and its
+    privileged labels are never clamp-saturated -- at every eval grid point,
+    including points that are OOD for the band-trained estimator/RMA methods.
+
+    WARNING -- decoupled normalisation scale: the oracle's P is NOT on the same
+    normalisation scale as the regression target or linear-probe labels produced
+    by the band-trained methods (which use the narrow [0.5, 1.25] / [-1, 1]
+    ranges).  Do NOT assume the oracle shares a normalisation scale with any
+    other method's privileged vector.  Must match num_observations = 45 + 5 in
+    Go2BenchOracleCfg.
 
     Only compute_observations is overridden: the 45-dim proprio block and its noise
     are identical to GO2; the 5-dim privileged block is appended without noise.
@@ -32,6 +41,9 @@ class Go2BenchOracle(GO2):
         if self.add_noise:
             base += (2 * torch.rand_like(base) - 1) * self.noise_scale_vec[:base.shape[1]]
         # privileged physics params -- NOISE-FREE (the oracle knows the truth)
+
+
+        # ground/ robot contact friction, added base mass, base COM bias
         privileged = torch.cat((
             self.simulator.dr_friction_values.view(self.num_envs, -1),      # 1
             self.simulator.dr_added_base_mass.view(self.num_envs, -1),      # 1
