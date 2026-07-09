@@ -80,6 +80,9 @@ def override_configs(env_cfg, args, task_type):
         
         
     env_cfg.env.debug = True
+    # disable automatic reset on failure/timeout for interactive viewing - respawn is
+    # triggered manually instead (e.g. via the viser "Respawn" button)
+    env_cfg.env.auto_reset = False
     env_cfg.commands.zero_cmd_prob = 0.0 # for testing, use non-zero commands all the time
     env_cfg.commands.ranges.lin_vel_x = [0.5, 0.5]
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
@@ -144,9 +147,11 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         joystick = Joystick(joystick_type=args.joystick_type)
     
     frame_dt = 1 / 60.0 # 30Hz
-    # interaction loop
-    for i in range(10*int(env.max_episode_length)):
-        
+    # interaction loop - runs indefinitely so the viewer stays up continuously
+    # instead of the whole simulator being torn down and rebuilt every ~10 episodes
+    i = 0
+    while True:
+
         t_start = time.perf_counter()
         # update commands from joystick
         if args.use_joystick:
@@ -229,6 +234,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         remaining = frame_dt - elapsed
         if remaining > 0:
             time.sleep(remaining)
+        i += 1
 
 def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
     """export the policy as jit script according to different task types
@@ -295,6 +301,10 @@ def play(args):
     viser_viewer = None
     if args.viewer == 'viser':
         viser_viewer = create_viser_viewer(env, port=args.viser_port)
+        robot_index = 0  # which robot the viewer tracks / respawns, matches interaction_loop
+        viser_viewer.set_respawn_callback(
+            lambda: env.reset_idx(torch.tensor([robot_index], device=env.device))
+        )
         print(f"Viser web viewer started at http://localhost:{args.viser_port}")
     
     interaction_loop(env, policy, args, task_type, viser_viewer=viser_viewer)

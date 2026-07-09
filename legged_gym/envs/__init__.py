@@ -124,3 +124,18 @@ task_registry.register( "tron1pf_ee", TRON1PF_EE, TRON1PF_EECfg(), TRON1PF_EECfg
 task_registry.register( "tron1sf", TRON1SF, TRON1SFCfg(), TRON1SFCfgPPO())
 # task_registry.register( "go2_sysid", GO2SysID, GO2SysIDCfg(), GO2CfgPPO())
 # task_registry.register( "bipedal_walker", BipedalWalker, BipedalWalkerCfg(), BipedalWalkerCfgPPO())
+# ---------------------------------------------------------------------------
+# go2_benchmark: adaptation study family (frozen flat substrate + frozen DR,
+# all inherit Go2BenchmarkCommonCfg). No-DR MLP (floor) / DR-MLP (baseline) /
+# Oracle (ceiling). Added additively; existing "go2" (simple_rl) is untouched.
+# ---------------------------------------------------------------------------
+from legged_gym.envs.go2.go2_bench_mlp.go2_bench_mlp import Go2BenchMlp
+from legged_gym.envs.go2.go2_bench_mlp.go2_bench_mlp_config import Go2BenchMlpCfg, Go2BenchCfgPPO
+from legged_gym.envs.go2.go2_bench_nodr.go2_bench_nodr import Go2BenchNoDR
+from legged_gym.envs.go2.go2_bench_nodr.go2_bench_nodr_config import Go2BenchNoDRCfg, Go2BenchNoDRCfgPPO
+from legged_gym.envs.go2.go2_bench_oracle.go2_bench_oracle import Go2BenchOracle
+from legged_gym.envs.go2.go2_bench_oracle.go2_bench_oracle_config import Go2BenchOracleCfg, Go2BenchOracleCfgPPO
+
+task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
+task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
+task_registry.register("go2_bench_oracle", Go2BenchOracle, Go2BenchOracleCfg(), Go2BenchOracleCfgPPO())

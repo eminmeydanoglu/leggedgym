@@ -68,7 +68,8 @@ class LeggedRobotNav(BaseTask):
         self.check_termination()
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
-        self.reset_idx(env_ids)
+        if self.cfg.env.auto_reset:
+            self.reset_idx(env_ids)
         self.simulator.update_sensors()
         self.compute_observations()  # in some cases a simulation step might be required to refresh some obs (for example body positions)
         
@@ -91,7 +92,7 @@ class LeggedRobotNav(BaseTask):
             self.feet_max_force_z = self.simulator.link_contact_forces[:, self.simulator.feet_contact_indices, 2]
         fail_buf = torch.any(self.terminated_bodies_force_norm > 10.0, dim=1)
         fail_buf |= self.simulator.projected_gravity[:, 2] > self.cfg.env.max_projected_gravity
-        self.fail_buf += fail_buf
+        self.fail_buf = torch.where(fail_buf, self.fail_buf + 1, torch.zeros_like(self.fail_buf))
         self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
         self.reset_buf = (
             (self.fail_buf > self.cfg.env.fail_to_terminal_time_s / self.dt)

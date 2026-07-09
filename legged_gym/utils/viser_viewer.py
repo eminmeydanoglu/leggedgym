@@ -307,9 +307,16 @@ class MjcfKinematicModel:
             mesh.apply_transform(T_geom)
             
             if geom.rgba is not None:
-                color = (np.clip(geom.rgba, 0, 1) * 255).astype(np.uint8)
-                mesh.visual = trimesh.visual.ColorVisuals(
-                    vertex_colors=np.tile(color, (len(mesh.vertices), 1))
+                # use a matte (non-metallic, fully rough) PBR material instead of
+                # vertex colors - otherwise the mesh picks up the environment map's
+                # default glossy reflectance and looks washed out / overexposed
+                base_color = np.clip(geom.rgba, 0, 1).astype(np.float64)
+                mesh.visual = trimesh.visual.TextureVisuals(
+                    material=trimesh.visual.material.PBRMaterial(
+                        baseColorFactor=tuple(base_color),
+                        metallicFactor=0.0,
+                        roughnessFactor=1.0,
+                    )
                 )
             
             if geom.body_name not in body_meshes:
@@ -425,7 +432,7 @@ class ViserViewer:
                 )
                 self._body_handles[(env_idx, body_name)] = handle
 
-        self.server.scene.add_grid(
+        self._grid_handle = self.server.scene.add_grid(
             "/ground",
             infinite_grid=True,
             fade_distance=50.0,
@@ -433,12 +440,35 @@ class ViserViewer:
             plane_opacity=0.4,
         )
 
+        # viser's built-in default lights are on by default and were washing out
+        # the robot's materials regardless of environment map / added light
+        # intensity - disable them and light the scene explicitly instead
+        self.server.scene.configure_default_lights(enabled=False)
+
+        # use the HDRI only for lighting (reflections/shading on the robot's
+        # materials) - background=False keeps the studio backdrop (walls, floor,
+        # light stands) from being rendered, so we get a plain black sky instead
+        self.server.scene.configure_environment_map(
+            hdri="studio",
+            background=False,
+            environment_intensity=0.5,
+        )
+        self.server.scene.set_background_image(np.zeros((2, 2, 3), dtype=np.uint8))
+        self.server.scene.add_light_directional(
+            "/sun",
+            color=(255, 255, 255),
+            intensity=1.5,
+            cast_shadow=True,
+            position=(3.0, -3.0, 5.0),
+        )
+
         self._setup_camera()
         self._setup_camera_gui()
         self._setup_command_sliders()
+        self._setup_respawn_button()
 
     def _setup_camera(self) -> None:
-        self._camera_offset = np.array([2.0, 2.0, 1.5])
+        self._camera_offset = np.array([1.3, 1.3, 0.9])
         self._camera_look_at_offset = np.array([0.0, 0.0, 0.3])
 
         @self.server.on_client_connect
@@ -503,6 +533,22 @@ class ViserViewer:
                 initial_value=0.0,
             )
 
+    def _setup_respawn_button(self) -> None:
+        """Add a manual "Respawn" button that triggers self._respawn_callback."""
+        self._respawn_callback: Optional[object] = None
+
+        with self.server.gui.add_folder("Reset", expand_by_default=True):
+            respawn_button = self.server.gui.add_button("Respawn")
+
+            @respawn_button.on_click
+            def _(_) -> None:
+                if self._respawn_callback is not None:
+                    self._respawn_callback()
+
+    def set_respawn_callback(self, callback) -> None:
+        """Register a callback invoked when the "Respawn" button is clicked."""
+        self._respawn_callback = callback
+
     def get_command(self) -> np.ndarray:
         """Get current velocity command from sliders.
 
@@ -531,6 +577,8 @@ class ViserViewer:
             cast_shadow=True,
             receive_shadow=True,
         )
+        if hasattr(self, '_grid_handle') and self._grid_handle is not None:
+            self._grid_handle.visible = False
 
     def set_terrain_from_heightfield(
         self,

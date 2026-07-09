@@ -192,7 +192,7 @@ class OnPolicyRunner:
                 self.log(locals())
             if it % self.save_interval == 0:
                 assert self.log_dir is not None
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), iteration=it)
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
@@ -301,17 +301,20 @@ class OnPolicyRunner:
         self,
         path: str,
         infos: Optional[Dict[str, Any]] = None,
+        iteration: Optional[int] = None,
     ) -> None:
         """Save the model checkpoint to disk.
 
         Args:
             path: File path to save the checkpoint.
             infos: Optional additional information to save with the checkpoint.
+            iteration: Iteration count to store in the checkpoint. Defaults to
+                self.current_learning_iteration.
         """
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
-            'iter': self.current_learning_iteration,
+            'iter': iteration if iteration is not None else self.current_learning_iteration,
             'infos': infos,
         }, path)
 

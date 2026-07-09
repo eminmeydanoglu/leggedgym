@@ -16,6 +16,7 @@ class LeggedRobotCfg(BaseConfig):
         episode_length_s: int = 20 # episode length in seconds
         env_spacing: float = 2.0 # spacing between envs in the scene, only for plane
         fail_to_terminal_time_s: float = 0.1 # time before a fail state leads to environment reset, refer to https://github.com/limxdynamics/tron1-rl-isaacgym/tree/master
+        auto_reset: bool = True # automatically reset envs whose reset_buf is set; disable for manual/interactive respawn control (e.g. play.py viewer)
         debug: bool = False # enable debug drawings in the simulator
         debug_draw_height_points_around_base: bool = False # obtain height measurements around the base
         debug_draw_height_points_around_feet: bool = False # obtain height measurements around the feet (9 points around each foot, see terrain.measured_points_x/y)

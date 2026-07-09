@@ -33,10 +33,10 @@
   </default>
 
   <asset>
-    <material name="metal" rgba=".9 .95 .95 1" />
+    <material name="metal" rgba="0.55 0.57 0.60 1" />
     <material name="black" rgba="0 0 0 1" />
     <material name="white" rgba="1 1 1 1" />
-    <material name="gray" rgba="0.671705 0.692426 0.774270 1" />
+    <material name="gray" rgba="0.35 0.36 0.40 1" />
 
     <mesh name="base_visual" file="base.stl" />
     <mesh name="hip" file="hip.stl" />

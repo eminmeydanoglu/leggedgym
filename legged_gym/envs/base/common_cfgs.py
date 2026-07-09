@@ -340,3 +340,97 @@ class K1FlatCommonCfg(LeggedRobotCfg):
             0.0478125, 0.0339552, 0.0282528, 0.095625, 0.0282528*2, 0.0282528*2,
             0.0478125, 0.0339552, 0.0282528, 0.095625, 0.0282528*2, 0.0282528*2
         ]
+
+# ============================================================================
+# Benchmark substrate for the online-estimation / adaptive-RL study.
+# EVERY benchmark method (No-DR MLP, DR-MLP, LSTM, HIM, RMA, DreamWaQ, SysID,
+# Oracle) MUST inherit from this class. It freezes: flat terrain, the in-dist
+# DR set + ranges, reward scales, obs base, control. Only the method "head"
+# (encoder / estimator / privileged input) may differ. Touch with care -- every
+# comparison in the study depends on these being identical across methods.
+# ============================================================================
+class Go2BenchmarkCommonCfg(Go2FlatCommonCfg):
+    class env(Go2FlatCommonCfg.env):
+        num_envs = 4096
+        num_observations = 45    
+        num_privileged_obs = None
+        num_actions = 12
+        episode_length_s = 20
+
+
+    class commands(Go2FlatCommonCfg.commands):
+        curriculum = True
+        max_curriculum = 1.0
+        num_commands = 4
+        resampling_time = 10.
+        heading_command = True
+        class ranges(Go2FlatCommonCfg.commands.ranges):
+            lin_vel_x = [-0.5, 0.5]
+            lin_vel_y = [-1.0, 1.0]
+            ang_vel_yaw = [-1.0, 1.0]
+            heading = [-3.14, 3.14]
+
+    class rewards(Go2FlatCommonCfg.rewards):
+        soft_dof_pos_limit = 0.9
+        base_height_target = 0.36
+        foot_clearance_target = 0.05
+        foot_height_offset = 0.022
+        foot_clearance_tracking_sigma = 0.01
+        only_positive_rewards = True
+        class scales(Go2FlatCommonCfg.rewards.scales):
+            dof_pos_limits = -1.0
+            collision = -1.0
+            tracking_lin_vel = 1.0
+            tracking_ang_vel = 0.5
+            lin_vel_z = -0.5
+            base_height = -2.0
+            ang_vel_xy = -0.05
+            orientation = -1.0
+            dof_vel = -5.e-4
+            dof_acc = -2.e-7
+            action_rate = -0.01
+            action_smoothness = -0.01
+            torques = -2.e-4
+            feet_air_time = 1.0
+            foot_clearance = 0.5
+
+    # ========================================================================
+    # DOMAIN RANDOMIZATION -- FROZEN. Single source of truth for all methods.
+    #
+    #  IN-DISTRIBUTION (randomized during training; these ARE the latent
+    #  physics the adaptive methods try to identify):
+    #     - friction        [0.5, 1.25]
+    #     - base added mass  [-1.0, 1.0] kg
+    #     - CoM displacement +/- 0.03 m per axis
+    #     - base push        every 8 s, <= 1.0 m/s   (disturbance, not a latent)
+    #
+    #  Canonical privileged parameter vector P (oracle input = probe label =
+    #  RMA/estimator regression target) = [friction, added_mass, com_bias] (5).
+    #  Push is a transient disturbance, NOT part of P.
+    #
+    #  HELD-OUT for structural OOD (KEEP FALSE here -- introduced only at eval):
+    #     - PD-gain scale, control latency (ctrl_delay), joint armature/
+    #       friction/damping, restitution, rough terrain, motor failure.
+    #  This keeps the "adaptive methods trained without a concept of X collapse
+    #  on X" hypothesis testable.
+    # ========================================================================
+    class domain_rand(Go2FlatCommonCfg.domain_rand):
+        randomize_friction = True
+        friction_range = [0.5, 1.25]
+        randomize_base_mass = True
+        added_mass_range = [-1.0, 1.0]
+        randomize_com_displacement = True
+        com_pos_x_range = [-0.03, 0.03]
+        com_pos_y_range = [-0.03, 0.03]
+        com_pos_z_range = [-0.03, 0.03]
+        push_robots = True
+        push_interval_s = 8
+        max_push_vel_xy = 1.0
+        # --- held-out (structural OOD): keep disabled during training ---
+        randomize_pd_gain = False
+        randomize_ctrl_delay = False
+        randomize_restitution = False
+        randomize_joint_armature = False
+        randomize_joint_friction = False
+        randomize_joint_damping = False
+        push_links = False

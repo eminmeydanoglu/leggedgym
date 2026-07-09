@@ -195,7 +195,8 @@ class LeggedRobot(BaseTask):
         self.check_termination()
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
-        self.reset_idx(env_ids)
+        if self.cfg.env.auto_reset:
+            self.reset_idx(env_ids)
         self.simulator.update_sensors()
         self.compute_observations()  # in some cases a simulation step might be required to refresh some obs (for example body positions)
         
@@ -230,7 +231,9 @@ class LeggedRobot(BaseTask):
         # print(f"contact termination: {fail_buf}")
         fail_buf |= self.simulator.projected_gravity[:, 2] > self.cfg.env.max_projected_gravity
         # print(f"gravity termination: {self.simulator.projected_gravity[:, 2] > self.cfg.env.max_projected_gravity}")
-        self.fail_buf += fail_buf
+        # fail_buf must reset on any good step, otherwise non-consecutive bad ticks
+        # accumulate over the whole episode instead of tracking consecutive failures
+        self.fail_buf = torch.where(fail_buf, self.fail_buf + 1, torch.zeros_like(self.fail_buf))
         self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
         # print(f"time out: {self.time_out_buf}")
         self.reset_buf = (
