@@ -19,3 +19,12 @@ class Go2BenchCfgPPO(LeggedRobotCfgPPO):
         run_name = 'bench_mlp' + get_simulator_suffix()
         save_interval = 200
         max_iterations = 3000
+        # --- in-distribution eval + best.pt (shared by all benchmark methods) ---
+        # Frozen, deterministic eval on the training distribution: logs Eval/* and
+        # writes best.pt (argmax mean_return, hard-demoted if fall_rate > guard).
+        # Same protocol for nodr/mlp/oracle so best.pt selection stays fair.
+        eval_interval = 200      # iters between evals (0 disables); aligns with save_interval
+        eval_steps = 1100        # >= max_episode_length+1 (1001) so returns are complete
+        eval_warmup = 50         # unrecorded settling steps
+        eval_seed = 12345        # fixed -> comparable across checkpoints within a run
+        eval_fall_guard = 0.25   # fall_rate above this demotes a checkpoint for best.pt

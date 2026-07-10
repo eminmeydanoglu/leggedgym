@@ -87,6 +87,17 @@ class OnPolicyRunner:
         self._init_agent_and_algo()
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.save_interval: int = self.cfg["save_interval"]
+
+        # In-distribution eval / best.pt selection (opt-in via runner cfg).
+        # eval_interval == 0 disables it entirely (default), preserving legacy
+        # behavior for tasks that don't configure eval.
+        self.eval_interval: int = self.cfg.get("eval_interval", 0)
+        self.eval_steps: int = self.cfg.get("eval_steps", 1100)
+        self.eval_warmup: int = self.cfg.get("eval_warmup", 50)
+        self.eval_seed: int = self.cfg.get("eval_seed", 12345)
+        self.eval_fall_guard: float = self.cfg.get("eval_fall_guard", 0.25)
+        self.best_eval_score: float = -float("inf")
+
         self._init_storage()
 
         # Log
@@ -193,6 +204,19 @@ class OnPolicyRunner:
             if it % self.save_interval == 0:
                 assert self.log_dir is not None
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), iteration=it)
+
+            # Periodic in-distribution eval -> Eval/* logging + best.pt selection.
+            # The eval rollout resets the env, so we refresh obs/critic_obs and the
+            # training-only reward/length bookkeeping before resuming rollout.
+            if self.eval_interval > 0 and it % self.eval_interval == 0:
+                self._run_eval(it)
+                obs = self.env.get_observations().to(self.device)
+                privileged_obs = self.env.get_privileged_observations()
+                critic_obs = (privileged_obs if privileged_obs is not None else obs).to(self.device)
+                cur_reward_sum.zero_()
+                cur_episode_length.zero_()
+                self.alg.actor_critic.train()
+
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
@@ -296,6 +320,46 @@ class OnPolicyRunner:
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
         print(log_string)
+
+    def _run_eval(self, it: int) -> Dict[str, float]:
+        """Run one in-distribution eval, log `Eval/*`, and update `best.pt`.
+
+        Uses the deterministic inference policy (mean action) under the frozen
+        in-dist protocol (see `legged_gym.scripts.eval.indist`). `best.pt` is
+        selected by `selection_score` (maximize return, hard-demote checkpoints
+        whose fall_rate exceeds `eval_fall_guard`). Leaves the env freshly reset;
+        the caller refreshes its observation handles.
+        """
+        from legged_gym.scripts.eval.indist import run_indist_eval, selection_score
+
+        self.alg.actor_critic.eval()
+        metrics = run_indist_eval(
+            self.env,
+            self.alg.actor_critic.act_inference,
+            steps=self.eval_steps,
+            warmup=self.eval_warmup,
+            seed=self.eval_seed,
+        )
+        self.alg.actor_critic.train()
+
+        if self.writer is not None:
+            for key, val in metrics.items():
+                self.writer.add_scalar('Eval/' + key, val, it)
+
+        score = selection_score(metrics, self.eval_fall_guard)
+        print(f"[eval] it={it} return={metrics['mean_return']:.2f} "
+              f"fall_rate={metrics['fall_rate']:.3f} ep_len={metrics['mean_ep_len']:.1f} "
+              f"lin_err={metrics['tracking_lin_err']:.3f} score={score:.2f} "
+              f"(best={self.best_eval_score:.2f})")
+
+        if score > self.best_eval_score and self.log_dir is not None:
+            self.best_eval_score = score
+            if self.writer is not None:
+                self.writer.add_scalar('Eval/best_score', score, it)
+            self.save(os.path.join(self.log_dir, 'best.pt'), iteration=it,
+                      infos={'eval_metrics': metrics, 'eval_score': score, 'eval_it': it})
+            print(f"[eval] new best.pt @ it={it} (score={score:.2f})")
+        return metrics
 
     def save(
         self,

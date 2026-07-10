@@ -205,6 +205,10 @@ class LeggedRobotCfg(BaseConfig):
         ctrl_delay_step_range: List[int] = [0, 1] # number of control steps
         # randomize PD gains by a scale factor
         randomize_pd_gain: bool = False
+        # draw ONE gain scale per env and broadcast to all DOF (vs per-DOF draws),
+        # so the applied scale is a single number the oracle can expose as a clean
+        # 1-dim privileged label via simulator.dr_kp_scale.
+        pd_gain_scalar: bool = False
         kp_range: List[float] = [0.8, 1.2]
         kd_range: List[float] = [0.8, 1.2]
         # ! Randomizing joint armature/friction/damping in Genesis require batching dofs/links info, 

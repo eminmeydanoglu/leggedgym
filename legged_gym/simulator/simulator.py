@@ -673,6 +673,22 @@ class Simulator(ABC):
         return torch.stack([com_bias_x, com_bias_y, com_bias_z], dim=-1)
 
     @property
+    def dr_kp_scale_scalar(self):
+        """Returns the per-env SCALAR pd-gain scale (a clean 1-dim label).
+
+        Distinct from `dr_kp_scale`, which is the (num_envs, num_dof) per-DOF
+        tensor other envs consume. When `pd_gain_scalar` is set, `_kp_scale_scalar`
+        holds the single draw broadcast to all DOF; otherwise it is the per-env
+        mean of the per-DOF draw. Used by the rich-P oracle's privileged vector.
+
+        Returns:
+            Tensor((num_envs, 1)): normalized per-env pd-gain scale.
+        """
+        return dr_normalize(self._kp_scale_scalar,
+                            self._cfg.domain_rand.kp_range[0],
+                            self._cfg.domain_rand.kp_range[1])
+
+    @property
     def dr_joint_armature(self):
         """Returns the joint armature for domain randomization.
 

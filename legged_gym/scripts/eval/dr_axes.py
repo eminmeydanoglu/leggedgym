@@ -90,6 +90,15 @@ def _set_com_bias(env, values):
     sim._robot.set_COM_shift(disp, sim._base_link_index, env_ids)
 
 
+def _set_com_component(component: int):
+    """Build an isolated CoM-axis setter; non-swept components stay nominal."""
+    def setter(env, values: torch.Tensor):
+        xyz = torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float)
+        xyz[:, component] = values
+        _set_com_bias(env, xyz)
+    return setter
+
+
 @dataclass
 class Axis:
     name: str
@@ -122,6 +131,18 @@ AXES = {
         nominal=0.0,          # no added mass
         default_grid=[-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
         unit="kg",
+    ),
+    "com_x": Axis(
+        name="com_x", setter=_set_com_component(0), in_dist=(-0.03, 0.03),
+        nominal=0.0, default_grid=[-0.08, -0.05, -0.03, 0.0, 0.03, 0.05, 0.08], unit="m",
+    ),
+    "com_y": Axis(
+        name="com_y", setter=_set_com_component(1), in_dist=(-0.03, 0.03),
+        nominal=0.0, default_grid=[-0.08, -0.05, -0.03, 0.0, 0.03, 0.05, 0.08], unit="m",
+    ),
+    "com_z": Axis(
+        name="com_z", setter=_set_com_component(2), in_dist=(-0.03, 0.03),
+        nominal=0.0, default_grid=[-0.08, -0.05, -0.03, 0.0, 0.03, 0.05, 0.08], unit="m",
     ),
 }
 
@@ -157,7 +178,9 @@ _PRIVILEGED_PARAMS = {
 _AXIS_TO_PRIV = {
     "friction":   "friction",
     "added_mass": "added_mass",
-    # com_bias is currently not a sweep axis; add it here if it ever becomes one.
+    "com_x":      "com_bias",
+    "com_y":      "com_bias",
+    "com_z":      "com_bias",
 }
 
 

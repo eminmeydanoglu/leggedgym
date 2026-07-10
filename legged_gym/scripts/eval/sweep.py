@@ -43,7 +43,7 @@ def parse_args():
     p.add_argument("--ckpt", type=int, default=-1, help="checkpoint iteration (-1 = latest)")
     p.add_argument("--axis", type=str, default="friction", help="OOD axis name (see dr_axes.AXES)")
     p.add_argument("--grid", type=float, nargs="+", default=None, help="override the axis grid values")
-    p.add_argument("--per_point", type=int, default=256, help="envs (== seeds) per grid point")
+    p.add_argument("--per_point", type=int, default=256, help="parallel env replicas per grid point")
     p.add_argument("--steps", type=int, default=2000,
                    help="measured steps. NOTE: timeout fires at max_episode_length+1 "
                         "(1001 for the 20s/0.02dt default), so a full-survival policy "
@@ -53,6 +53,8 @@ def parse_args():
                         "return/fall distributions).")
     p.add_argument("--warmup", type=int, default=100, help="unrecorded settling steps before measuring")
     p.add_argument("--command_vx", type=float, default=0.5, help="fixed forward command [m/s]")
+    p.add_argument("--command_vy", type=float, default=0.0, help="fixed lateral command [m/s]")
+    p.add_argument("--command_yaw", type=float, default=0.0, help="fixed yaw-rate command [rad/s]")
     p.add_argument("--seed", type=int, default=1, help="global seed (repeat runs to add more seeds)")
     p.add_argument("--cpu", action="store_true", default=False)
     p.add_argument("--out", type=str, default=None, help="output .npz path")
@@ -143,7 +145,7 @@ def make_registry_args(cli):
     )
 
 
-def override_cfg_for_eval(env_cfg, cli, num_envs, vx):
+def override_cfg_for_eval(env_cfg, cli, num_envs):
     """Freeze everything except the swept axis; fix a forward command."""
     env_cfg.env.num_envs = num_envs
     env_cfg.env.auto_reset = True
@@ -164,9 +166,9 @@ def override_cfg_for_eval(env_cfg, cli, num_envs, vx):
     env_cfg.commands.curriculum = False
     env_cfg.commands.heading_command = False
     env_cfg.commands.zero_cmd_prob = 0.0
-    env_cfg.commands.ranges.lin_vel_x = [vx, vx]
-    env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
-    env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
+    env_cfg.commands.ranges.lin_vel_x = [cli.command_vx, cli.command_vx]
+    env_cfg.commands.ranges.lin_vel_y = [cli.command_vy, cli.command_vy]
+    env_cfg.commands.ranges.ang_vel_yaw = [cli.command_yaw, cli.command_yaw]
     if hasattr(env_cfg.commands.ranges, "heading"):
         env_cfg.commands.ranges.heading = [0.0, 0.0]
 
@@ -196,7 +198,7 @@ def main():
         gs.init(backend=gs.cpu if cli.cpu else gs.gpu, logging_level="warning")  # noqa: F405
 
     env_cfg, train_cfg = task_registry.get_cfgs(name=cli.task)
-    override_cfg_for_eval(env_cfg, cli, num_envs, cli.command_vx)
+    override_cfg_for_eval(env_cfg, cli, num_envs)
 
     # resolve the checkpoint BEFORE building anything, restricted to this task's
     # run_name so a sibling method's model can never be loaded by accident.
@@ -245,7 +247,16 @@ def main():
         w = env.simulator.base_ang_vel
         lin_err = torch.norm(cmd[:, :2] - v[:, :2], dim=1)
         ang_err = torch.abs(cmd[:, 2] - w[:, 2])
-        acc.update(rew, dones, env.time_out_buf, lin_err, ang_err)
+        acc.update(
+            rew, dones, env.time_out_buf, lin_err, ang_err,
+            tilt=torch.norm(env.simulator.projected_gravity[:, :2], dim=1),
+            torques=env.simulator.torques,
+            dof_vel=env.simulator.dof_vel,
+            actions=env.actions,
+            last_actions=env.last_actions,
+            feet_vel=env.simulator.feet_vel,
+            feet_contact=env.feet_max_force_z > 1.0,
+        )
 
     per_env = acc.compute()
     agg = aggregate(per_env, num_points, cli.per_point)
@@ -256,7 +267,8 @@ def main():
     np.savez(
         out, axis=cli.axis, grid=grid, in_dist=np.asarray(axis.in_dist),
         unit=axis.unit, label=label, per_point=cli.per_point, steps=cli.steps,
-        command_vx=cli.command_vx, seed=cli.seed, **meta, **agg,
+        command_vx=cli.command_vx, command_vy=cli.command_vy,
+        command_yaw=cli.command_yaw, seed=cli.seed, **meta, **agg,
     )
 
     # human-readable summary to stdout

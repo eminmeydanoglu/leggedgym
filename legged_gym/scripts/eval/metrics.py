@@ -26,7 +26,7 @@ class MetricAccumulator:
     harness actually ran (used for right-censoring envs that never terminated).
     """
 
-    def __init__(self, num_envs: int, device):
+    def __init__(self, num_envs: int, device, lin_err_threshold: float = 0.25):
         self.num_envs = num_envs
         self.device = device
         z = lambda dtype=torch.float: torch.zeros(num_envs, dtype=dtype, device=device)
@@ -45,10 +45,22 @@ class MetricAccumulator:
         # step-level accumulators (averaged over all steps)
         self._lin_err_sum = z()               # |cmd_xy - v_xy| summed over steps
         self._ang_err_sum = z()               # |cmd_yaw - w_yaw| summed over steps
+        self._lin_err_sq_sum = z()            # squared tracking error (RMS / spikes)
+        self._lin_err_bad_sum = z()           # steps above an explicit tolerance
+        self._tilt_sum = z()                   # ||projected_gravity_xy|| (sine tilt)
+        self._torque_sq_sum = z()              # mean_j torque^2
+        self._mech_power_sum = z()             # sum_j |torque * joint_velocity|
+        self._action_rate_sum = z()            # mean_j |a_t - a_(t-1)|
+        self._foot_slip_sum = z()              # contact-foot horizontal speed
+        self.lin_err_threshold = float(lin_err_threshold)
         self._steps = 0                       # global step counter (same for all envs)
 
     @torch.no_grad()
-    def update(self, rew, reset_buf, time_out_buf, lin_err, ang_err):
+    def update(
+        self, rew, reset_buf, time_out_buf, lin_err, ang_err, *,
+        tilt=None, torques=None, dof_vel=None, actions=None, last_actions=None,
+        feet_vel=None, feet_contact=None,
+    ):
         """Ingest one env step.
 
         Args:
@@ -66,6 +78,22 @@ class MetricAccumulator:
         self._return_run += rew
         self._lin_err_sum += lin_err
         self._ang_err_sum += ang_err
+        self._lin_err_sq_sum += lin_err.square()
+        self._lin_err_bad_sum += (lin_err > self.lin_err_threshold).float()
+        if tilt is not None:
+            self._tilt_sum += tilt
+        if torques is not None:
+            self._torque_sq_sum += torques.square().mean(dim=1)
+        if torques is not None and dof_vel is not None:
+            self._mech_power_sum += (torques * dof_vel).abs().sum(dim=1)
+        if actions is not None and last_actions is not None:
+            self._action_rate_sum += (actions - last_actions).abs().mean(dim=1)
+        if feet_vel is not None and feet_contact is not None:
+            slip_xy = torch.norm(feet_vel[..., :2], dim=-1)
+            contact = feet_contact.float()
+            self._foot_slip_sum += (
+                (slip_xy * contact).sum(dim=1) / contact.sum(dim=1).clamp(min=1.0)
+            )
         self._steps += 1
 
         # book a finished episode wherever `done`
@@ -111,4 +139,11 @@ class MetricAccumulator:
             "mean_return": self._ep_return_sum / ep,
             "tracking_lin_err": self._lin_err_sum / steps,
             "tracking_ang_err": self._ang_err_sum / steps,
+            "tracking_lin_rmse": torch.sqrt(self._lin_err_sq_sum / steps),
+            "tracking_lin_bad_frac": self._lin_err_bad_sum / steps,
+            "tilt_mean": self._tilt_sum / steps,
+            "torque_sq_mean": self._torque_sq_sum / steps,
+            "mech_power_abs": self._mech_power_sum / steps,
+            "action_rate_mean": self._action_rate_sum / steps,
+            "foot_slip_mean": self._foot_slip_sum / steps,
         }

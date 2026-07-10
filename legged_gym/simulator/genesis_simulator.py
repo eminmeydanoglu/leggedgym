@@ -753,6 +753,17 @@ class GenesisSimulator(Simulator):
             self._num_envs, self._num_dof, dtype=torch.float, device=self._device, requires_grad=False)
         self._kd_scale = torch.ones(
             self._num_envs, self._num_dof, dtype=torch.float, device=self._device, requires_grad=False)
+        # per-env SCALAR pd-gain draw (broadcast to all DOF in _randomize_pd_gain).
+        # Kept as a clean 1-dim privileged label for the oracle's P vector; inits
+        # to nominal 1.0 so dr_kp_scale is safe even when randomize_pd_gain is off.
+        self._kp_scale_scalar = torch.ones(
+            self._num_envs, 1, dtype=torch.float, device=self._device, requires_grad=False)
+        # always-present control-delay buffer (int steps). The build path re-inits
+        # this when randomize_ctrl_delay is on; default 0 keeps dr_ctrl_delay safe
+        # for tasks that never enable delay randomization.
+        if not hasattr(self, "_action_delay"):
+            self._action_delay = torch.zeros(
+                self._num_envs, dtype=torch.long, device=self._device, requires_grad=False)
 
     def _randomize_friction(self, env_ids=None):
         ''' Randomize friction of all links'''
@@ -828,10 +839,26 @@ class GenesisSimulator(Simulator):
             damping, self._dof_indices, envs_idx=env_ids)
 
     def _randomize_pd_gain(self, env_ids):
-        self._kp_scale[env_ids] = torch_rand_float(
-                self._cfg.domain_rand.kp_range[0], self._cfg.domain_rand.kp_range[1], (len(env_ids), self._num_actions), device=self._device)
-        self._kd_scale[env_ids] = torch_rand_float(
-                self._cfg.domain_rand.kd_range[0], self._cfg.domain_rand.kd_range[1], (len(env_ids), self._num_actions), device=self._device)
+        n = len(env_ids)
+        kp_lo, kp_hi = self._cfg.domain_rand.kp_range
+        kd_lo, kd_hi = self._cfg.domain_rand.kd_range
+        # `pd_gain_scalar` (opt-in, default off): draw ONE scalar per env and
+        # broadcast it to every DOF, so the applied gain scale is a single number
+        # the oracle can expose as a clean 1-dim privileged label (dr_kp_scale).
+        # Default behaviour (per-DOF independent draw) is preserved for every task
+        # that does not opt in.
+        if getattr(self._cfg.domain_rand, "pd_gain_scalar", False):
+            kp = torch_rand_float(kp_lo, kp_hi, (n, 1), device=self._device)
+            kd = torch_rand_float(kd_lo, kd_hi, (n, 1), device=self._device)
+            self._kp_scale[env_ids] = kp.expand(-1, self._num_dof)
+            self._kd_scale[env_ids] = kd.expand(-1, self._num_dof)
+            self._kp_scale_scalar[env_ids] = kp
+        else:
+            self._kp_scale[env_ids] = torch_rand_float(
+                    kp_lo, kp_hi, (n, self._num_actions), device=self._device)
+            self._kd_scale[env_ids] = torch_rand_float(
+                    kd_lo, kd_hi, (n, self._num_actions), device=self._device)
+            self._kp_scale_scalar[env_ids] = self._kp_scale[env_ids].mean(dim=1, keepdim=True)
     
     def _update_depth_camera(self):
         """ Renders the depth camera and retrieves the depth images

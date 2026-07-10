@@ -135,7 +135,21 @@ from legged_gym.envs.go2.go2_bench_nodr.go2_bench_nodr import Go2BenchNoDR
 from legged_gym.envs.go2.go2_bench_nodr.go2_bench_nodr_config import Go2BenchNoDRCfg, Go2BenchNoDRCfgPPO
 from legged_gym.envs.go2.go2_bench_oracle.go2_bench_oracle import Go2BenchOracle
 from legged_gym.envs.go2.go2_bench_oracle.go2_bench_oracle_config import Go2BenchOracleCfg, Go2BenchOracleCfgPPO
+from legged_gym.envs.go2.go2_bench_oracle_id.go2_bench_oracle_id import Go2BenchOracleID
+from legged_gym.envs.go2.go2_bench_oracle_id.go2_bench_oracle_id_config import Go2BenchOracleIDCfg, Go2BenchOracleIDCfgPPO
+from legged_gym.envs.go2.go2_bench_mlp_wide.go2_bench_mlp_wide import Go2BenchMlpWide
+from legged_gym.envs.go2.go2_bench_mlp_wide.go2_bench_mlp_wide_config import Go2BenchMlpWideCfg, Go2BenchMlpWideCfgPPO
+# --- Wave-2 rich-P cell (pd_gain + ctrl_delay added to P); isolated from the
+#     frozen 5-task factorial above, trained separately. ---
+from legged_gym.envs.go2.go2_bench_mlp_rich.go2_bench_mlp_rich_config import Go2BenchMlpRichCfg, Go2BenchMlpRichCfgPPO
+from legged_gym.envs.go2.go2_bench_oracle_rich.go2_bench_oracle_rich import Go2BenchOracleRich
+from legged_gym.envs.go2.go2_bench_oracle_rich.go2_bench_oracle_rich_config import Go2BenchOracleRichCfg, Go2BenchOracleRichCfgPPO
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
 task_registry.register("go2_bench_oracle", Go2BenchOracle, Go2BenchOracleCfg(), Go2BenchOracleCfgPPO())
+task_registry.register("go2_bench_oracle_id", Go2BenchOracleID, Go2BenchOracleIDCfg(), Go2BenchOracleIDCfgPPO())
+task_registry.register("go2_bench_mlp_wide", Go2BenchMlpWide, Go2BenchMlpWideCfg(), Go2BenchMlpWideCfgPPO())
+# mlp_rich reuses the plain Go2BenchMlp env (no P); only its config differs.
+task_registry.register("go2_bench_mlp_rich", Go2BenchMlp, Go2BenchMlpRichCfg(), Go2BenchMlpRichCfgPPO())
+task_registry.register("go2_bench_oracle_rich", Go2BenchOracleRich, Go2BenchOracleRichCfg(), Go2BenchOracleRichCfgPPO())
