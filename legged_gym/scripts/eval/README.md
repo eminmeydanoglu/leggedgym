@@ -10,6 +10,10 @@ single policy.
 - **OOD sweep** (`sweep.py`): fixed forward command, ONE physics axis swept out of
   the training band, all other DR pinned to nominal -> degradation curve. The
   thesis headline.
+- **Transient scenarios** (`transient.py`): time-resolved probes that expose the
+  *recovery* the steady-state sweep averages away (see "Transient scenarios"
+  below). A single-axis, constant-command sweep measures local sensitivity; these
+  measure how fast the policy re-converges after a command change or a shove.
 - **In-distribution** (`indist.py`): deterministic policy over the FULL command set
   and the in-dist DR band the policy trained on -> "how good is the learned gait".
   Shares the rollout code with the in-training eval, so `Eval/*` (TensorBoard) and
@@ -48,6 +52,63 @@ Only the swept axis varies across envs; every other physics axis is pinned to
 nominal (`dr_axes.pin_others_to_nominal`) so the curve is purely that axis's
 effect. `auto_reset` stays ON, so each env yields many episodes -> real
 distributions.
+
+## Transient scenarios (`transient.py`)
+
+The sweep holds one command and one physics point and reports a distribution over
+auto-reset episodes -- deliberately averaging away the transient. Online adaptation
+is supposed to help precisely there: re-converge faster after a disturbance even
+when steady-state tracking looks identical. `transient.py` adds two time-resolved
+probes (`--scenario {step_response,push_recovery}`) as a sibling of `sweep.py`,
+reusing its scaffolding verbatim (`resolve_load_run` checkpoint isolation,
+`make_registry_args`, `override_cfg_for_eval` physics/command freeze, and the
+warmup + `episode_length_buf.zero_()` clock reset). It imports those from `sweep.py`
+rather than duplicating them, so `sweep.py` stays the single source of truth.
+
+Unlike the sweep, a transient run measures a SINGLE time window per env and tiles it
+across `per_point` independent replicas (== seeds); per-env transient metrics are
+then aggregated to mean/std/p25/p50/p75 across replicas (same stats as
+`sweep.aggregate`). Each run writes an `.npz` with the same provenance block plus the
+scenario params, command schedule / push params, and the mean tracking-error and
+tilt time series for the plotter.
+
+- **`step_response`**: drives a deterministic COMMAND schedule identical for every
+  env -- `stand -> forward(vx) -> reverse(-vx) -> lateral(vy) -> stop`, each phase
+  `--phase_steps` long, values clamped to the training range (`|vx|<=0.5`,
+  `|vy|<=1.0`, `|yaw|<=1.0`). The command is overwritten on `env.commands[:, :3]`
+  each step (in-episode resampling is disabled by pushing `resampling_time` past the
+  window; curriculum/heading are already off from `override_cfg_for_eval`). Metrics:
+  whole-schedule tracking-error integral, per-phase settling time (steps until error
+  drops below `--tol_lin` and stays), per-phase/peak error, peak tilt, fall rate.
+- **`push_recovery`** (deterministic, RNG-matched): holds a fixed forward command,
+  warms up, then at a PRE-SCHEDULED step applies the SAME fixed velocity impulse
+  `(--dvx, --dvy)` to EVERY env's base -- a constant delta on `dofs_vel[:, 0:2]`
+  (the base is a 6-DOF free joint; [0:3] are base world lin vel), mirroring
+  `genesis_simulator.push_robots()` but WITHOUT the random draw. This determinism is
+  load-bearing, not cosmetic: methods have different obs dims (45 vs 50) and consume
+  a different number of RNG draws per forward pass, so a *random* push would draw
+  from desynchronised streams and hand each method a different shove -- confounding
+  "recovers better" with "got a smaller push". A fixed impulse at a fixed step is
+  identical across methods by construction. Metrics over the post-push window:
+  recovery-error integral, recovery time (steps to settle below `--tol_lin`), peak
+  tilt / peak deviation, and fall rate within the window. Pass `--axis added_mass
+  --axis_value 5.0` (any `dr_axes` axis) to run the impulse at an off-nominal physics
+  point and ask "does a heavy robot recover worse, and does the oracle recover
+  better?".
+
+```bash
+# smoke test (small, short) -- both scenarios
+python legged_gym/scripts/eval/transient.py --scenario step_response \
+    --task go2_bench_mlp --load_run <run> --per_point 64 --out logs/eval/step_mlp.npz
+python legged_gym/scripts/eval/transient.py --scenario push_recovery \
+    --task go2_bench_mlp --load_run <run> --per_point 64 --dvy 1.0 \
+    --out logs/eval/push_mlp.npz
+
+# overlay several methods' transients (same scenario) -> tracking-error / tilt vs step
+python legged_gym/scripts/eval/plot_transient.py \
+    logs/eval/push_nodr.npz logs/eval/push_mlp.npz logs/eval/push_oracle.npz \
+    --out logs/eval/push_recovery.png
+```
 
 ## Metrics (`metrics.py`)
 
@@ -102,8 +163,9 @@ The default command is `(vx, vy, yaw) = (0.5, 0, 0)`. Use `--command_vy` and
 `--command_yaw` for in-range lateral/turning stress tests. Keep confirmatory
 commands inside the shared training range; command-OOD probes are diagnostic and
 must be labelled as such. A single-axis, constant-command sweep measures local
-sensitivity, not the full value of online adaptation. Add transient command and
-fixed-impulse recovery scenarios before making the final estimator comparison.
+sensitivity, not the full value of online adaptation. The transient command and
+fixed-impulse recovery scenarios that complement it live in `transient.py` (see
+"Transient scenarios" above); run them before making the final estimator comparison.
 
 ## Known caveats
 

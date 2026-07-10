@@ -209,7 +209,13 @@ class OnPolicyRunner:
             # The eval rollout resets the env, so we refresh obs/critic_obs and the
             # training-only reward/length bookkeeping before resuming rollout.
             if self.eval_interval > 0 and it % self.eval_interval == 0:
-                self._run_eval(it)
+                # The training rollout above ran under torch.inference_mode(), so
+                # the env's step/reset buffers are inference tensors. The eval
+                # rollout reset()s and steps the same env, which are in-place
+                # updates -> must also run inside inference_mode or PyTorch raises
+                # "Inplace update to inference tensor outside InferenceMode".
+                with torch.inference_mode():
+                    self._run_eval(it)
                 obs = self.env.get_observations().to(self.device)
                 privileged_obs = self.env.get_privileged_observations()
                 critic_obs = (privileged_obs if privileged_obs is not None else obs).to(self.device)
