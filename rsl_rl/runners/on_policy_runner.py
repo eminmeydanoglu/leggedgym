@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import time
 import os
+import math
 from collections import deque
 import statistics
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -98,6 +99,21 @@ class OnPolicyRunner:
         self.eval_fall_guard: float = self.cfg.get("eval_fall_guard", 0.25)
         self.best_eval_score: float = -float("inf")
 
+        # Iteration-based command schedule (opt-in via runner cfg). A list of
+        # {"start_iteration": int, "lin_vel_x": [lo, hi]} stages: at each boundary
+        # the whole population's lin_vel_x range switches, decoupling the command
+        # distribution from policy performance so every method sees the same
+        # commands at the same training stage (see codex_plan.md sec. 2). None
+        # (default) preserves legacy performance-based curriculum behaviour.
+        self.command_schedule: Optional[List[Dict[str, Any]]] = self.cfg.get("command_schedule", None)
+        self._active_schedule_start: Optional[int] = None
+        self._active_schedule_range: Optional[List[float]] = None
+
+        # Training seed, carried into checkpoints so the seed travels with the
+        # weights (statistical unit of replication). Sourced from train_cfg.seed.
+        seed = self.all_cfg.get("seed")
+        self.training_seed: Optional[int] = int(seed) if seed is not None else None
+
         self._init_storage()
 
         # Log
@@ -148,6 +164,11 @@ class OnPolicyRunner:
             init_at_random_ep_len: Whether to initialize episode lengths randomly.
         """
         self._pre_learn(init_at_random_ep_len)
+        if self.training_seed is not None:
+            print(f"[train] seed={self.training_seed} "
+                  f"start_iter={self.current_learning_iteration}")
+        # land on the correct schedule stage for the (possibly resumed) start iter
+        self._apply_command_schedule(self.current_learning_iteration)
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
@@ -163,6 +184,8 @@ class OnPolicyRunner:
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            # advance the command schedule if this iteration crosses a stage boundary
+            self._apply_command_schedule(it)
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -228,6 +251,54 @@ class OnPolicyRunner:
         self.current_learning_iteration += num_learning_iterations
         assert self.log_dir is not None
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
+    @staticmethod
+    def command_stage_for_iter(
+        schedule: Optional[List[Dict[str, Any]]],
+        it: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the active command-schedule stage for iteration ``it``.
+
+        The active stage is the one with the largest ``start_iteration`` that is
+        still ``<= it``. Returns ``None`` for an empty schedule or an iteration
+        before the first stage. Pure function -> unit-testable without an env.
+        """
+        if not schedule:
+            return None
+        active: Optional[Dict[str, Any]] = None
+        for stage in sorted(schedule, key=lambda s: s["start_iteration"]):
+            if it >= stage["start_iteration"]:
+                active = stage
+            else:
+                break
+        return active
+
+    def _apply_command_schedule(self, it: int) -> None:
+        """Switch the env's ``lin_vel_x`` command range to stage active at ``it``.
+
+        No-op unless a ``command_schedule`` is configured. Only re-applies when the
+        active stage actually changes (so a resume lands on the correct stage and
+        mid-training boundaries fire exactly once). Disables the performance-based
+        command curriculum (the schedule is the single source of truth) and
+        re-samples every env's command so the new range takes effect immediately.
+        """
+        stage = self.command_stage_for_iter(self.command_schedule, it)
+        if stage is None:
+            return
+        if stage["start_iteration"] == self._active_schedule_start:
+            return
+        self._active_schedule_start = stage["start_iteration"]
+        rng = list(stage["lin_vel_x"])
+        self._active_schedule_range = rng
+        # the schedule owns the command distribution -> turn off perf curriculum
+        self.env.cfg.commands.curriculum = False
+        if hasattr(self.env, "command_ranges") and "lin_vel_x" in self.env.command_ranges:
+            self.env.command_ranges["lin_vel_x"] = list(rng)
+        # re-sample all envs under the new range so the switch is immediate
+        if hasattr(self.env, "_resample_commands"):
+            all_ids = torch.arange(self.env.num_envs, device=self.env.device)
+            self.env._resample_commands(all_ids)
+        print(f"[schedule] it={it} stage_start={stage['start_iteration']} lin_vel_x={rng}")
 
     def _pre_learn(self, init_at_random_ep_len: bool) -> None:
         """Prepare for training by initializing logging and episode buffers.
@@ -385,8 +456,35 @@ class OnPolicyRunner:
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'iter': iteration if iteration is not None else self.current_learning_iteration,
+            # Keep eval selection state with the training checkpoint so resume
+            # cannot treat an already-evaluated run as having no best model.
+            'best_eval_score': self.best_eval_score,
+            # Provenance travelling with the weights (see codex_plan.md sec. 2):
+            # the training seed and the active command-schedule stage.
+            'training_seed': self.training_seed,
+            'schedule_stage_start': self._active_schedule_start,
+            'schedule_lin_vel_x': self._active_schedule_range,
             'infos': infos,
         }, path)
+
+    @staticmethod
+    def _checkpoint_eval_score(checkpoint: Dict[str, Any]) -> Optional[float]:
+        """Return the persisted eval score from a checkpoint, if available.
+
+        ``infos['eval_score']`` is supported for checkpoints written before
+        ``best_eval_score`` became a top-level field (notably ``best.pt``).
+        """
+        score = checkpoint.get('best_eval_score')
+        if score is None:
+            infos = checkpoint.get('infos') or {}
+            score = infos.get('eval_score')
+        if isinstance(score, torch.Tensor):
+            score = score.item()
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            return None
+        return None if math.isnan(score) else score
 
     def load(
         self,
@@ -407,6 +505,19 @@ class OnPolicyRunner:
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
         self.current_learning_iteration = loaded_dict['iter']
+
+        # Restore the score carried by the resumed checkpoint. For checkpoints
+        # saved before this field existed, and for a model checkpoint saved just
+        # before an eval updated best.pt, recover the score from the sibling
+        # best.pt when possible. Taking the maximum preserves the actual best
+        # selection state across both old and new checkpoint formats.
+        scores = [self._checkpoint_eval_score(loaded_dict)]
+        best_path = os.path.join(os.path.dirname(path), 'best.pt')
+        if os.path.abspath(best_path) != os.path.abspath(path) and os.path.isfile(best_path):
+            best_dict = torch.load(best_path, map_location='cpu', weights_only=False)
+            scores.append(self._checkpoint_eval_score(best_dict))
+        persisted_scores = [score for score in scores if score is not None]
+        self.best_eval_score = max(persisted_scores, default=-float('inf'))
         return loaded_dict['infos']
 
     def get_inference_policy(

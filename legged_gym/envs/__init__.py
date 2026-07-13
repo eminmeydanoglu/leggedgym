@@ -144,6 +144,15 @@ from legged_gym.envs.go2.go2_bench_mlp_wide.go2_bench_mlp_wide_config import Go2
 from legged_gym.envs.go2.go2_bench_mlp_rich.go2_bench_mlp_rich_config import Go2BenchMlpRichCfg, Go2BenchMlpRichCfgPPO
 from legged_gym.envs.go2.go2_bench_oracle_rich.go2_bench_oracle_rich import Go2BenchOracleRich
 from legged_gym.envs.go2.go2_bench_oracle_rich.go2_bench_oracle_rich_config import Go2BenchOracleRichCfg, Go2BenchOracleRichCfgPPO
+# --- Phase 2: implicit/explicit adaptation methods rebound onto the frozen flat
+#     benchmark substrate (Go2BenchmarkCommonCfg). RMA (implicit z), DreamWaQ
+#     (VAE latent + explicit lin_vel), Explicit SysID (regress base_lin_vel + P). ---
+from legged_gym.envs.go2.go2_bench_rma.go2_bench_rma import Go2BenchRMA
+from legged_gym.envs.go2.go2_bench_rma.go2_bench_rma_config import Go2BenchRMACfg, Go2BenchRMACfgPPO
+from legged_gym.envs.go2.go2_bench_dreamwaq.go2_bench_dreamwaq import Go2BenchDreamwaq
+from legged_gym.envs.go2.go2_bench_dreamwaq.go2_bench_dreamwaq_config import Go2BenchDreamwaqCfg, Go2BenchDreamwaqCfgPPO
+from legged_gym.envs.go2.go2_bench_sysid.go2_bench_sysid import Go2BenchSysID
+from legged_gym.envs.go2.go2_bench_sysid.go2_bench_sysid_config import Go2BenchSysIDCfg, Go2BenchSysIDCfgPPO
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
@@ -153,3 +162,7 @@ task_registry.register("go2_bench_mlp_wide", Go2BenchMlpWide, Go2BenchMlpWideCfg
 # mlp_rich reuses the plain Go2BenchMlp env (no P); only its config differs.
 task_registry.register("go2_bench_mlp_rich", Go2BenchMlp, Go2BenchMlpRichCfg(), Go2BenchMlpRichCfgPPO())
 task_registry.register("go2_bench_oracle_rich", Go2BenchOracleRich, Go2BenchOracleRichCfg(), Go2BenchOracleRichCfgPPO())
+# Phase 2: implicit/explicit adaptation methods on the frozen flat substrate
+task_registry.register("go2_bench_rma",      Go2BenchRMA,      Go2BenchRMACfg(),      Go2BenchRMACfgPPO())
+task_registry.register("go2_bench_dreamwaq", Go2BenchDreamwaq, Go2BenchDreamwaqCfg(), Go2BenchDreamwaqCfgPPO())
+task_registry.register("go2_bench_sysid",    Go2BenchSysID,    Go2BenchSysIDCfg(),    Go2BenchSysIDCfgPPO())

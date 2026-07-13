@@ -102,13 +102,21 @@ class TaskRegistry():
         # override cfg from args (if specified)
         _, train_cfg = update_cfg_from_args(None, train_cfg, args)
 
+        # benchmark runs carry the training seed in the folder name so the seed is
+        # the statistical unit of replication (see codex_plan.md). Opt-in: only when
+        # --seed is explicitly passed, so legacy run names are unchanged otherwise.
+        run_name = train_cfg.runner.run_name
+        seed = getattr(args, "seed", None)
+        if seed is not None:
+            run_name = f"{run_name}_seed{seed}"
+
         if log_root=="default":
             log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
-            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
+            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + run_name)
         elif log_root is None:
             log_dir = None
         else:
-            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
+            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + run_name)
         
         train_cfg_dict = class_to_dict(train_cfg)
         sim_device = "cpu" if args.cpu else "cuda"

@@ -88,6 +88,17 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         env_cfg : updated environment configuration
         cfg_train : updated training configuration
     """
+    # single source of truth for the training seed: a CLI --seed override flows
+    # into BOTH train_cfg.seed and env_cfg.seed (task_registry also copies
+    # train_cfg.seed -> env_cfg.seed, but make_env resolves env_cfg before
+    # make_alg_runner touches train_cfg, so set it on whichever cfg we were given).
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        if env_cfg is not None:
+            env_cfg.seed = seed
+        if cfg_train is not None:
+            cfg_train.seed = seed
+
     # environment parameters
     if env_cfg is not None:
         # num envs
@@ -131,6 +142,7 @@ def get_args():
         epilog="For more information, visit: https://github.com/lupinjia/LeggedGym-Ex"
     )
     parser.add_argument('--task',           type=str, default='go2', help="task name")
+    parser.add_argument('--seed',           type=int, default=None, help="training seed; overrides train_cfg.seed and env_cfg.seed (single source)")
     parser.add_argument('--headless',       action='store_true', default=False, help="enable visualization by default")
     parser.add_argument('--cpu',            action='store_true', default=False, help="use CPU instead of CUDA")
     parser.add_argument('--num_envs',       type=int, default=None, help="number of parallel environments")

@@ -842,16 +842,16 @@ class GenesisSimulator(Simulator):
         n = len(env_ids)
         kp_lo, kp_hi = self._cfg.domain_rand.kp_range
         kd_lo, kd_hi = self._cfg.domain_rand.kd_range
-        # `pd_gain_scalar` (opt-in, default off): draw ONE scalar per env and
-        # broadcast it to every DOF, so the applied gain scale is a single number
-        # the oracle can expose as a clean 1-dim privileged label (dr_kp_scale).
-        # Default behaviour (per-DOF independent draw) is preserved for every task
-        # that does not opt in.
+        # `pd_gain_scalar` (opt-in, default off): draw ONE scalar per env from
+        # kp_range and apply it to BOTH kp and kd, broadcast to every DOF, so the
+        # applied gain scale is a single number the oracle can expose as a clean
+        # 1-dim privileged label (dr_kp_scale). kd_range is unused in this mode.
+        # Default behaviour (per-DOF independent kp/kd draws) is preserved for
+        # every task that does not opt in.
         if getattr(self._cfg.domain_rand, "pd_gain_scalar", False):
             kp = torch_rand_float(kp_lo, kp_hi, (n, 1), device=self._device)
-            kd = torch_rand_float(kd_lo, kd_hi, (n, 1), device=self._device)
             self._kp_scale[env_ids] = kp.expand(-1, self._num_dof)
-            self._kd_scale[env_ids] = kd.expand(-1, self._num_dof)
+            self._kd_scale[env_ids] = kp.expand(-1, self._num_dof)
             self._kp_scale_scalar[env_ids] = kp
         else:
             self._kp_scale[env_ids] = torch_rand_float(
