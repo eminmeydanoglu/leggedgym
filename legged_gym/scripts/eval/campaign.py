@@ -112,11 +112,34 @@ def _expected_raw_relpaths(cfg: Dict[str, Any]) -> List[str]:
     return paths
 
 
+def _validation_relpath(model: str, seed: int, iteration: int) -> str:
+    return _cell_path("validation", model, seed, f"model_{iteration}") + ".npz"
+
+
+def _expected_validation_relpaths(cfg: Dict[str, Any]) -> List[str]:
+    """Checkpoint-validation artifacts discovered from the declared run folders."""
+    paths = []
+    for model in cfg["models"]:
+        for seed in cfg["training_seeds"]:
+            run = _run_dir(model, seed)
+            candidates = sorted(run.glob("model_*.pt"), key=_checkpoint_iter)
+            if not candidates and cfg.get("smoke_only"):
+                candidates = [run / "best.pt"]
+            if not candidates:
+                # Selection itself gives the detailed fail-loud diagnostic.
+                continue
+            paths.extend(_validation_relpath(model["label"], seed, _checkpoint_iter(path))
+                         for path in candidates)
+    return paths
+
+
 def _write_campaign_state(cfg: Dict[str, Any]) -> None:
     """Materialize reproducibility inventory after every execution-stage command."""
     root = artifact_root(cfg); root.mkdir(parents=True, exist_ok=True)
     (root / "campaign.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-    expected = _expected_raw_relpaths(cfg)
+    expected_final = _expected_raw_relpaths(cfg)
+    expected_validation = _expected_validation_relpaths(cfg)
+    expected = expected_validation + expected_final
     cells = []
     for rel in expected:
         path = root / "raw" / rel
@@ -124,6 +147,8 @@ def _write_campaign_state(cfg: Dict[str, Any]) -> None:
         cells.append(dict(path=f"raw/{rel}", complete=exists,
                           sha256=sha256_file(str(path)) if exists else None))
     manifest = dict(campaign=cfg["campaign"], generated_at=datetime.now(timezone.utc).isoformat(),
+                    expected_validation_artifacts=len(expected_validation),
+                    expected_final_artifacts=len(expected_final),
                     expected_raw_artifacts=len(expected), completed_raw_artifacts=sum(c["complete"] for c in cells),
                     complete=all(c["complete"] for c in cells), cells=cells)
     (root / "manifest.json").write_text(_json(manifest), encoding="utf-8")
@@ -429,7 +454,8 @@ def cmd_plan(cfg: Dict[str, Any], suite: str) -> int:
 
 def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
     """Selection is deliberately conservative: this command will not silently use best.pt."""
-    root = artifact_root(cfg); rows = []; protocol = cfg["protocol"]["validation"]
+    root = artifact_root(cfg); root.mkdir(parents=True, exist_ok=True)
+    rows = []; protocol = cfg["protocol"]["validation"]
     work = [(model, seed) for model in cfg["models"] for seed in cfg["training_seeds"]]
     assigned = shard_items(work, shard)
     print(f"[selection] shard={shard[0]}/{shard[1]} runs={len(assigned)} "
@@ -459,16 +485,37 @@ def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
         for candidate_index, ckpt in enumerate(candidates, start=1):
             # Re-use the V2 deterministic ID bank but force this exact model file.
             spec = "best" if ckpt.name == "best.pt" else _checkpoint_iter(ckpt)
+            iteration = _checkpoint_iter(ckpt)
+            rel = _validation_relpath(model["label"], seed, iteration)
             print(f"[selection] {model['label']} seed={seed} checkpoint "
                   f"{candidate_index}/{len(candidates)} iter={spec}", flush=True)
-            _load_actor(session.actor, ckpt, session.env.device)
-            vals = rollout(session, commands, warmup=protocol["warmup"], steps=protocol["steps"], seed=protocol["seed"])
+            artifact = root / "raw" / rel
+            expected_sha = sha256_file(str(ckpt))
+            if _artifact_valid(artifact):
+                with np.load(artifact, allow_pickle=False) as z:
+                    recorded_sha = str(_npz_scalar(z, "checkpoint_sha256"))
+                    if recorded_sha != expected_sha:
+                        raise RuntimeError(f"{artifact}: checkpoint SHA mismatch; refusing stale validation")
+                    vals = {key: np.asarray(z[key]) for key in METRICS}
+                print(f"[selection] resume {artifact.name}", flush=True)
+            else:
+                _load_actor(session.actor, ckpt, session.env.device)
+                session.checkpoint = ckpt
+                vals = rollout(session, commands, warmup=protocol["warmup"], steps=protocol["steps"], seed=protocol["seed"])
+                payload = _meta(session, "validation", "checkpoint_selection", protocol["seed"],
+                                protocol["warmup"], protocol["steps"])
+                payload.update(campaign=cfg["campaign"], checkpoint_spec=spec,
+                               tracking_score=float(.5 * (vals["tracking_lin"].mean() / np.sqrt(2.)
+                                                     + vals["tracking_yaw"].mean())),
+                               command_matrix=commands,
+                               scenario_hash=hashlib.sha256(commands.tobytes()).hexdigest(),
+                               validation_bank="stratified_v1", replicas=1, **vals)
+                _save_cell(root, rel[:-4], payload)
             lin, yaw, fall = (float(vals[k].mean()) for k in ("tracking_lin", "tracking_yaw", "fall_rate"))
-            rows.append(dict(model=model["label"], training_seed=seed, path=str(ckpt), checkpoint=spec, iteration=_checkpoint_iter(ckpt), sha256=sha256_file(str(ckpt)),
+            rows.append(dict(model=model["label"], training_seed=seed, path=str(ckpt), checkpoint=spec, iteration=iteration, sha256=expected_sha,
                 tracking_lin=lin, tracking_yaw=yaw, fall_rate=fall, tracking_score=.5 * (lin / np.sqrt(2.) + yaw), protocol=protocol))
     selected = [selection_order([r for r in rows if r["model"] == model["label"] and r["training_seed"] == seed])
                 for model, seed in shard_items(work, shard)]
-    root.mkdir(parents=True, exist_ok=True)
     part = root / f"checkpoint_selection.shard_{shard[0]}_of_{shard[1]}.json"
     part.write_text(_json(dict(campaign=cfg["campaign"], shard=f"{shard[0]}/{shard[1]}", fall_threshold=.05,
                                selections=selected)), encoding="utf-8")
