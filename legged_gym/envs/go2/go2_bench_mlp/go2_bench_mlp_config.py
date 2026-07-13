@@ -7,7 +7,9 @@ class Go2BenchMlpCfg(Go2BenchmarkCommonCfg):
     """DR + MLP baseline -- the main comparison point ('saf DR')."""
     class env(Go2BenchmarkCommonCfg.env):
         num_observations = 45
-        num_privileged_obs = None
+        # Asymmetric critic gets the true base linear velocity, while the
+        # deployable MLP actor remains strictly proprioceptive.
+        num_privileged_obs = 45 + 3
         num_actions = 12
 
 
@@ -19,6 +21,16 @@ class Go2BenchCfgPPO(LeggedRobotCfgPPO):
         run_name = 'bench_mlp' + get_simulator_suffix()
         save_interval = 200
         max_iterations = 3000
+        # --- iteration-based command schedule (shared by all benchmark methods) ---
+        # Replaces the performance-based curriculum (commands.curriculum=False).
+        # Every method sees the SAME lin_vel_x distribution at the SAME training
+        # stage, so the P5 advantage cannot be confounded by curriculum timing.
+        #   it 0-499   : lin_vel_x in [-0.5, 0.5]
+        #   it 500-end : lin_vel_x in [-1.0, 1.0]  (== validation field)
+        command_schedule = [
+            {"start_iteration": 0,   "lin_vel_x": [-0.5, 0.5]},
+            {"start_iteration": 500, "lin_vel_x": [-1.0, 1.0]},
+        ]
         # --- in-distribution eval + best.pt (shared by all benchmark methods) ---
         # Frozen, deterministic eval on the training distribution: logs Eval/* and
         # writes best.pt (argmax mean_return, hard-demoted if fall_rate > guard).

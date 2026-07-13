@@ -359,13 +359,22 @@ class Go2BenchmarkCommonCfg(Go2FlatCommonCfg):
 
 
     class commands(Go2FlatCommonCfg.commands):
-        curriculum = True
+        # Performance-based curriculum is OFF for the whole benchmark family: the
+        # command distribution is driven by an iteration-based command_schedule on
+        # the runner instead (see Go2BenchCfgPPO.runner.command_schedule and
+        # codex_plan.md sec. 2), so every method sees the same command distribution
+        # at the same training stage regardless of its performance.
+        curriculum = False
         max_curriculum = 1.0
         num_commands = 4
         resampling_time = 10.
         heading_command = True
         class ranges(Go2FlatCommonCfg.commands.ranges):
-            lin_vel_x = [-0.5, 0.5]
+            # FULL validation command field. best.pt / in-dist eval pin lin_vel_x to
+            # this range (curriculum-independent), so checkpoint selection is done on
+            # the same [-1, 1] field the schedule ends on. The narrower early-training
+            # range [-0.5, 0.5] lives only in the runner's command_schedule.
+            lin_vel_x = [-1.0, 1.0]
             lin_vel_y = [-1.0, 1.0]
             ang_vel_yaw = [-1.0, 1.0]
             heading = [-3.14, 3.14]

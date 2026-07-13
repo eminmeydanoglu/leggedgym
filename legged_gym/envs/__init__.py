@@ -137,6 +137,9 @@ from legged_gym.envs.go2.go2_bench_oracle.go2_bench_oracle import Go2BenchOracle
 from legged_gym.envs.go2.go2_bench_oracle.go2_bench_oracle_config import Go2BenchOracleCfg, Go2BenchOracleCfgPPO
 from legged_gym.envs.go2.go2_bench_oracle_id.go2_bench_oracle_id import Go2BenchOracleID
 from legged_gym.envs.go2.go2_bench_oracle_id.go2_bench_oracle_id_config import Go2BenchOracleIDCfg, Go2BenchOracleIDCfgPPO
+# oracle_id + true base_lin_vel(3): oracle ceiling of what RMA/DreamWaQ/SysID estimate
+from legged_gym.envs.go2.go2_bench_oracle_id_vel.go2_bench_oracle_id_vel import Go2BenchOracleIDVel
+from legged_gym.envs.go2.go2_bench_oracle_id_vel.go2_bench_oracle_id_vel_config import Go2BenchOracleIDVelCfg, Go2BenchOracleIDVelCfgPPO
 from legged_gym.envs.go2.go2_bench_mlp_wide.go2_bench_mlp_wide import Go2BenchMlpWide
 from legged_gym.envs.go2.go2_bench_mlp_wide.go2_bench_mlp_wide_config import Go2BenchMlpWideCfg, Go2BenchMlpWideCfgPPO
 # --- Wave-2 rich-P cell (pd_gain + ctrl_delay added to P); isolated from the
@@ -158,6 +161,8 @@ task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
 task_registry.register("go2_bench_oracle", Go2BenchOracle, Go2BenchOracleCfg(), Go2BenchOracleCfgPPO())
 task_registry.register("go2_bench_oracle_id", Go2BenchOracleID, Go2BenchOracleIDCfg(), Go2BenchOracleIDCfgPPO())
+# oracle_id + true base_lin_vel appended to the obs (matched to oracle_id otherwise)
+task_registry.register("go2_bench_oracle_id_vel", Go2BenchOracleIDVel, Go2BenchOracleIDVelCfg(), Go2BenchOracleIDVelCfgPPO())
 task_registry.register("go2_bench_mlp_wide", Go2BenchMlpWide, Go2BenchMlpWideCfg(), Go2BenchMlpWideCfgPPO())
 # mlp_rich reuses the plain Go2BenchMlp env (no P); only its config differs.
 task_registry.register("go2_bench_mlp_rich", Go2BenchMlp, Go2BenchMlpRichCfg(), Go2BenchMlpRichCfgPPO())
