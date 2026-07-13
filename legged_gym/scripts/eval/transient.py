@@ -53,13 +53,21 @@ from legged_gym.utils import task_registry
 import numpy as np
 import torch
 
+from legged_gym.scripts.eval.ckpt_utils import parse_ckpt_cli
 from legged_gym.scripts.eval.dr_axes import get_axis, pin_others_to_nominal
+from legged_gym.scripts.eval.provenance import atomic_savez, collect_eval_meta
+from legged_gym.scripts.eval.schedule_utils import (
+    DEFAULT_PHASE_STEPS,
+    DEFAULT_STEP_VX,
+    DEFAULT_STEP_VY,
+    DEFAULT_STEP_YAW,
+    build_step_schedule,
+)
 # Reuse sweep.py's scaffolding rather than duplicating the (subtle) checkpoint
 # isolation / registry-arg / eval-freeze logic. Importing keeps a single source of
 # truth so sweep.py stays byte-identical and any future fix lands in both places.
 from legged_gym.scripts.eval.sweep import (
     resolve_load_run,
-    git_commit,
     make_registry_args,
     override_cfg_for_eval,
 )
@@ -77,7 +85,8 @@ def parse_args():
     # --- shared loading / isolation scaffolding (mirrors sweep.py) ---
     p.add_argument("--task", type=str, required=True, help="registered benchmark task, e.g. go2_bench_mlp")
     p.add_argument("--load_run", type=str, default=None, help="run dir to load (default: latest)")
-    p.add_argument("--ckpt", type=int, default=-1, help="checkpoint iteration (-1 = latest)")
+    p.add_argument("--ckpt", type=parse_ckpt_cli, default=-1,
+                   help="checkpoint: 'best', 'latest'/-1, or iteration int (e.g. 3000)")
     p.add_argument("--per_point", type=int, default=64,
                    help="parallel env replicas == independent seeds; transient metrics "
                         "are aggregated (mean/std/quantiles) across them")
@@ -89,6 +98,8 @@ def parse_args():
     p.add_argument("--tol_lin", type=float, default=0.25,
                    help="lin-vel tracking tolerance [m/s]: error must fall below this to "
                         "count as 'settled'/'recovered' (matches metrics.lin_err_threshold)")
+    p.add_argument("--tol_ang", type=float, default=0.25,
+                   help="yaw-rate tracking tolerance [rad/s] for angular settling time")
 
     # --- optional physics point (run the scenario off-nominal) ---
     p.add_argument("--axis", type=str, default=None,
@@ -97,15 +108,15 @@ def parse_args():
     p.add_argument("--axis_value", type=float, default=None,
                    help="value for --axis (required if --axis is set)")
 
-    # --- step_response schedule ---
-    p.add_argument("--phase_steps", type=int, default=150,
+    # --- step_response schedule (campaign defaults: vx=1.0, vy=0.75, yaw=0.75) ---
+    p.add_argument("--phase_steps", type=int, default=DEFAULT_PHASE_STEPS,
                    help="steps per command phase in step_response")
-    p.add_argument("--step_vx", type=float, default=0.5,
-                   help="forward command magnitude [m/s]; |vx|<=0.5 stays in training range")
-    p.add_argument("--step_vy", type=float, default=0.5,
+    p.add_argument("--step_vx", type=float, default=DEFAULT_STEP_VX,
+                   help="forward command magnitude [m/s]; training command field is [-1,1]")
+    p.add_argument("--step_vy", type=float, default=DEFAULT_STEP_VY,
                    help="lateral command magnitude [m/s]; |vy|<=1.0 stays in training range")
-    p.add_argument("--step_yaw", type=float, default=0.0,
-                   help="yaw-rate command [rad/s] for any yaw phase; |yaw|<=1.0 in range")
+    p.add_argument("--step_yaw", type=float, default=DEFAULT_STEP_YAW,
+                   help="yaw-rate command [rad/s] for the yaw phase; written to commands[:,2]")
 
     # --- push_recovery schedule ---
     p.add_argument("--command_vx", type=float, default=0.5, help="held forward command [m/s] during push_recovery")
@@ -130,26 +141,16 @@ def build_command_schedule(cli):
     measured step. phase_bounds: list of (name, start_step) marking each command
     change so per-phase metrics can be sliced out.
 
-    Phases (each `phase_steps` long): stand -> forward -> reverse -> lateral -> stop.
-    Values are clamped to the benchmark training range so the probe stays
-    confirmatory (|vx|<=0.5, |vy|<=1.0, |yaw|<=1.0); use larger magnitudes only as an
-    explicitly-labelled command-OOD diagnostic.
+    Phases (each `phase_steps` long):
+      stand → forward → reverse → lateral → yaw → stop
+    Yaw is written to channel 2 (``env.commands[:, 2]``).
     """
-    ps = cli.phase_steps
-    phases = [
-        ("stand",   (0.0,          0.0,         0.0)),
-        ("forward", (cli.step_vx,  0.0,         0.0)),
-        ("reverse", (-cli.step_vx, 0.0,         0.0)),
-        ("lateral", (0.0,          cli.step_vy, 0.0)),
-        ("stop",    (0.0,          0.0,         0.0)),
-    ]
-    schedule = np.zeros((len(phases) * ps, 3), dtype=np.float64)
-    bounds = []
-    for i, (name, cmd) in enumerate(phases):
-        s = i * ps
-        schedule[s:s + ps] = cmd
-        bounds.append((name, s))
-    return schedule, bounds
+    return build_step_schedule(
+        phase_steps=cli.phase_steps,
+        step_vx=cli.step_vx,
+        step_vy=cli.step_vy,
+        step_yaw=cli.step_yaw,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -208,36 +209,52 @@ class TransientRecorder:
         return self.lin_err[lo:hi].sum(dim=0) * dt
 
     @torch.no_grad()
+    def ang_error_integral(self, dt: float, lo: int = 0, hi: int = None) -> torch.Tensor:
+        """Integral of yaw-rate tracking error over [lo, hi) steps, per env."""
+        hi = self.T if hi is None else hi
+        return self.ang_err[lo:hi].sum(dim=0) * dt
+
+    @torch.no_grad()
     def peak_error(self, lo: int = 0, hi: int = None) -> torch.Tensor:
         hi = self.T if hi is None else hi
         return self.lin_err[lo:hi].max(dim=0).values
+
+    @torch.no_grad()
+    def peak_ang_error(self, lo: int = 0, hi: int = None) -> torch.Tensor:
+        hi = self.T if hi is None else hi
+        return self.ang_err[lo:hi].max(dim=0).values
 
     @torch.no_grad()
     def peak_tilt(self, lo: int = 0, hi: int = None) -> torch.Tensor:
         hi = self.T if hi is None else hi
         return self.tilt[lo:hi].max(dim=0).values
 
-    @torch.no_grad()
-    def settling_time(self, tol: float, lo: int, hi: int = None) -> torch.Tensor:
-        """Steps after `lo` until lin-error first drops below `tol` and STAYS below.
+    def _settling_time_on(self, err_buf: torch.Tensor, tol: float, lo: int, hi: int = None) -> torch.Tensor:
+        """Steps after `lo` until error first drops below `tol` and STAYS below.
 
-        We require the error to be below tol at the found step AND for the rest of
-        the window, so a single lucky dip during a wild transient doesn't count as
-        settled. Envs that never settle in [lo, hi) are right-censored to (hi - lo).
+        Envs that never settle in [lo, hi) are right-censored to (hi - lo).
         """
         hi = self.T if hi is None else hi
-        win = self.lin_err[lo:hi]                       # (L, num_envs)
+        win = err_buf[lo:hi]                            # (L, num_envs)
         L = win.shape[0]
         below = win < tol                               # (L, num_envs)
-        # "stays below from here on": suffix-AND. reverse-cummin over a bool as int.
         stays = torch.flip(torch.cummin(torch.flip(below.int(), dims=[0]), dim=0).values, dims=[0]).bool()
-        # first index where it stays below for the rest of the window
         idx = torch.where(
             stays.any(dim=0),
-            stays.float().argmax(dim=0),                # first True
-            torch.full((self.num_envs,), float(L), device=self.device),  # censored
+            stays.float().argmax(dim=0),
+            torch.full((self.num_envs,), float(L), device=self.device),
         )
         return idx.float()
+
+    @torch.no_grad()
+    def settling_time(self, tol: float, lo: int, hi: int = None) -> torch.Tensor:
+        """Linear-error settling time (see ``_settling_time_on``)."""
+        return self._settling_time_on(self.lin_err, tol, lo, hi)
+
+    @torch.no_grad()
+    def ang_settling_time(self, tol: float, lo: int, hi: int = None) -> torch.Tensor:
+        """Angular (yaw-rate) error settling time."""
+        return self._settling_time_on(self.ang_err, tol, lo, hi)
 
     @torch.no_grad()
     def fall_rate(self, at: int = None) -> torch.Tensor:
@@ -264,7 +281,7 @@ def agg_stats(vec: torch.Tensor) -> dict:
 # --------------------------------------------------------------------------- #
 def build_env_and_policy(cli, num_envs):
     """Mirror sweep.main()'s build path exactly (isolation + freeze), minus the
-    grid tiling. Returns (env, policy, chosen_run, ckpt_path)."""
+    grid tiling. Returns (env, policy, chosen_run, ckpt_path, log_root)."""
     if SIMULATOR == "genesis":  # noqa: F405
         gs.init(backend=gs.cpu if cli.cpu else gs.gpu, logging_level="warning")  # noqa: F405
 
@@ -288,8 +305,18 @@ def build_env_and_policy(cli, num_envs):
     # sibling method's model can never be loaded by accident (sweep.resolve_load_run).
     log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", train_cfg.runner.experiment_name)  # noqa: F405
     chosen_run = resolve_load_run(log_root, train_cfg.runner.run_name, cli.load_run)
+    from legged_gym.scripts.eval.provenance import verify_run_identity
+    import re
+    _sm = re.search(r"_seed(\d+)$", chosen_run)
+    verify_run_identity(
+        os.path.join(log_root, chosen_run),
+        expected_task=cli.task,
+        expected_run_name=train_cfg.runner.run_name,
+        expected_training_seed=int(_sm.group(1)) if _sm else None,
+    )
     from legged_gym.utils.helpers import get_load_path
     ckpt_path = get_load_path(log_root, load_run=chosen_run, checkpoint=cli.ckpt)
+    print(f"[eval] loading checkpoint: {ckpt_path} (spec={cli.ckpt!r})")
 
     cli.load_run = chosen_run
     reg_args = make_registry_args(cli)
@@ -314,7 +341,7 @@ def build_env_and_policy(cli, num_envs):
         axis = get_axis("friction")
         axis.setter(env, torch.full((env.num_envs,), 1.0, device=env.device))
 
-    return env, policy, chosen_run, ckpt_path
+    return env, policy, chosen_run, ckpt_path, log_root
 
 
 def warmup_and_reset_clock(env, policy, cli, hold_cmd):
@@ -361,7 +388,9 @@ def run_step_response(env, policy, cli):
     # global metrics over the whole schedule
     per_env = {
         "err_integral": rec.error_integral(dt),
+        "ang_err_integral": rec.ang_error_integral(dt),
         "peak_err": rec.peak_error(),
+        "peak_ang_err": rec.peak_ang_error(),
         "peak_tilt": rec.peak_tilt(),
         "fall": rec.fall_rate(),
     }
@@ -371,13 +400,19 @@ def run_step_response(env, policy, cli):
         stop = bounds[i + 1][1] if i + 1 < len(bounds) else T
         per_env[f"settle_{name}"] = rec.settling_time(cli.tol_lin, lo=start, hi=stop)
         per_env[f"peakerr_{name}"] = rec.peak_error(lo=start, hi=stop)
+        # Angular metrics (critical for the yaw phase; also recorded for all phases)
+        per_env[f"ang_settle_{name}"] = rec.ang_settling_time(cli.tol_ang, lo=start, hi=stop)
+        per_env[f"peak_angerr_{name}"] = rec.peak_ang_error(lo=start, hi=stop)
+        per_env[f"ang_err_integral_{name}"] = rec.ang_error_integral(dt, lo=start, hi=stop)
 
     extra = dict(
         schedule=schedule, phase_names=np.asarray(phase_names),
         phase_bounds=np.asarray([b for _, b in bounds]),
         phase_steps=cli.phase_steps, T=T,
+        step_vx=cli.step_vx, step_vy=cli.step_vy, step_yaw=cli.step_yaw,
         # per-step mean tracking-error time series (across envs) for the plotter
         lin_err_ts=rec.lin_err.mean(dim=1).cpu().numpy(),
+        ang_err_ts=rec.ang_err.mean(dim=1).cpu().numpy(),
         tilt_ts=rec.tilt.mean(dim=1).cpu().numpy(),
     )
     return per_env, extra
@@ -459,19 +494,28 @@ def run_push_recovery(env, policy, cli):
 # --------------------------------------------------------------------------- #
 # Provenance + save
 # --------------------------------------------------------------------------- #
-def collect_run_meta(cli, chosen_run, ckpt_path):
-    try:
-        genesis_version = gs.__version__  # noqa: F405
-    except Exception:
-        genesis_version = "unknown"
-    return dict(
-        scenario=cli.scenario, warmup=cli.warmup, load_run=chosen_run,
-        ckpt_path=ckpt_path, ckpt=cli.ckpt, simulator=str(SIMULATOR),  # noqa: F405
-        git_commit=git_commit(), python_version=sys.version.split()[0],
-        torch_version=torch.__version__, numpy_version=np.__version__,
-        genesis_version=str(genesis_version), seed=cli.seed, per_point=cli.per_point,
-        tol_lin=cli.tol_lin, axis="" if cli.axis is None else cli.axis,
-        axis_value=float("nan") if cli.axis_value is None else cli.axis_value,
+def collect_run_meta(cli, chosen_run, ckpt_path, log_root):
+    return collect_eval_meta(
+        task=cli.task,
+        method=cli.label or cli.task,
+        chosen_run=chosen_run,
+        log_root=log_root,
+        ckpt_spec=cli.ckpt,
+        ckpt_path=ckpt_path,
+        seed=cli.seed,
+        warmup=cli.warmup,
+        per_point=cli.per_point,
+        extra=dict(
+            scenario=cli.scenario,
+            seed=cli.seed,
+            tol_lin=cli.tol_lin,
+            tol_ang=getattr(cli, "tol_ang", 0.25),
+            axis="" if cli.axis is None else cli.axis,
+            axis_value=float("nan") if cli.axis_value is None else cli.axis_value,
+            command_vx=getattr(cli, "command_vx", float("nan")),
+            command_vy=getattr(cli, "command_vy", float("nan")),
+            command_yaw=getattr(cli, "command_yaw", float("nan")),
+        ),
     )
 
 
@@ -480,7 +524,7 @@ def main():
     label = cli.label or cli.task
     num_envs = cli.per_point   # one window per env; per_point replicas == seeds
 
-    env, policy, chosen_run, ckpt_path = build_env_and_policy(cli, num_envs)
+    env, policy, chosen_run, ckpt_path, log_root = build_env_and_policy(cli, num_envs)
 
     if cli.scenario == "step_response":
         per_env, extra = run_step_response(env, policy, cli)
@@ -495,10 +539,9 @@ def main():
 
     out = cli.out or os.path.join(
         LEGGED_GYM_ROOT_DIR, "logs", "eval", f"{cli.scenario}_{label}.npz")  # noqa: F405
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    meta = collect_run_meta(cli, chosen_run, ckpt_path)
-    np.savez(out, label=label, **meta, **extra,
-             **{k: np.asarray(v) for k, v in agg.items()})
+    meta = collect_run_meta(cli, chosen_run, ckpt_path, log_root)
+    atomic_savez(out, label=label, **meta, **extra,
+                 **{k: np.asarray(v) for k, v in agg.items()})
 
     # --- human-readable summary ---
     print(f"\n=== {label} | scenario={cli.scenario} | {cli.per_point} envs (seeds) ===")
@@ -506,12 +549,17 @@ def main():
         print(f"physics point: {cli.axis} = {cli.axis_value}")
     if cli.scenario == "step_response":
         print(f"schedule: stand->forward(vx={cli.step_vx})->reverse(vx={-cli.step_vx})"
-              f"->lateral(vy={cli.step_vy})->stop, {cli.phase_steps} steps/phase")
-        print(f"\n{'metric':>20} {'mean':>9} {'std':>9} {'p50':>9}")
-        order = ["err_integral", "peak_err", "peak_tilt", "fall"]
-        order += [f"settle_{n}" for n in ["stand", "forward", "reverse", "lateral", "stop"]]
+              f"->lateral(vy={cli.step_vy})->yaw(yaw={cli.step_yaw})->stop, "
+              f"{cli.phase_steps} steps/phase")
+        print(f"\n{'metric':>24} {'mean':>9} {'std':>9} {'p50':>9}")
+        order = ["err_integral", "ang_err_integral", "peak_err", "peak_ang_err",
+                 "peak_tilt", "fall"]
+        order += [f"settle_{n}" for n in ["stand", "forward", "reverse", "lateral", "yaw", "stop"]]
+        order += [f"ang_settle_{n}" for n in ["yaw"]]
+        order += [f"peak_angerr_{n}" for n in ["yaw"]]
+        order += [f"ang_err_integral_{n}" for n in ["yaw"]]
         for key in order:
-            print(f"{key:>20} {agg[key+'_mean']:9.3f} {agg[key+'_std']:9.3f} {agg[key+'_p50']:9.3f}")
+            print(f"{key:>24} {agg[key+'_mean']:9.3f} {agg[key+'_std']:9.3f} {agg[key+'_p50']:9.3f}")
     else:
         print(f"held command: (vx,vy,yaw)=({cli.command_vx},{cli.command_vy},{cli.command_yaw})")
         print(f"DETERMINISTIC impulse (identical across ALL envs & methods): "

@@ -209,7 +209,17 @@ def _build_and_eval(cli):
 
     log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", train_cfg.runner.experiment_name)
     chosen_run = resolve_load_run(log_root, train_cfg.runner.run_name, cli.load_run)
+    from legged_gym.scripts.eval.provenance import verify_run_identity
+    import re
+    _sm = re.search(r"_seed(\d+)$", chosen_run)
+    verify_run_identity(
+        os.path.join(log_root, chosen_run),
+        expected_task=cli.task,
+        expected_run_name=train_cfg.runner.run_name,
+        expected_training_seed=int(_sm.group(1)) if _sm else None,
+    )
     ckpt_path = get_load_path(log_root, load_run=chosen_run, checkpoint=cli.ckpt)
+    print(f"[eval] loading checkpoint: {ckpt_path} (spec={cli.ckpt!r})")
 
     reg_args = SimpleNamespace(
         task=cli.task, headless=True, cpu=cli.cpu, num_envs=None, max_iterations=None,
@@ -224,16 +234,20 @@ def _build_and_eval(cli):
     policy = ppo_runner.get_inference_policy(device=env.device)
 
     metrics = run_indist_eval(env, policy, steps=cli.steps, warmup=cli.warmup, seed=cli.seed)
-    return metrics, chosen_run, ckpt_path
+    return metrics, chosen_run, ckpt_path, log_root, int(env.num_obs)
 
 
 def main():
     import argparse
 
+    from legged_gym.scripts.eval.ckpt_utils import parse_ckpt_cli
+    from legged_gym.scripts.eval.provenance import atomic_savez, collect_eval_meta
+
     p = argparse.ArgumentParser(description="In-distribution eval for the benchmark harness")
     p.add_argument("--task", type=str, required=True, help="registered task, e.g. go2_bench_mlp")
     p.add_argument("--load_run", type=str, default=None, help="run dir to load (default: latest matching)")
-    p.add_argument("--ckpt", type=int, default=-1, help="checkpoint iteration (-1 = latest)")
+    p.add_argument("--ckpt", type=parse_ckpt_cli, default=-1,
+                   help="checkpoint: 'best', 'latest'/-1, or iteration int (e.g. 3000)")
     p.add_argument("--num_envs", type=int, default=None, help="override env count (default: cfg value)")
     p.add_argument("--steps", type=int, default=2000,
                    help="measured steps (>= max_episode_length+1; default 2000 for tight distributions)")
@@ -241,17 +255,30 @@ def main():
     p.add_argument("--seed", type=int, default=12345, help="fixed eval seed")
     p.add_argument("--cpu", action="store_true", default=False)
     p.add_argument("--out", type=str, default=None, help="output .npz path")
+    p.add_argument("--label", type=str, default=None, help="method label (default: task)")
     cli = p.parse_args()
 
-    metrics, chosen_run, ckpt_path = _build_and_eval(cli)
+    metrics, chosen_run, ckpt_path, log_root, num_obs = _build_and_eval(cli)
 
     from legged_gym import LEGGED_GYM_ROOT_DIR
     out = cli.out or os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "eval", f"indist_{cli.task}.npz")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    np.savez(out, task=cli.task, load_run=chosen_run, ckpt_path=ckpt_path,
-             steps=cli.steps, seed=cli.seed, **metrics)
+    meta = collect_eval_meta(
+        task=cli.task,
+        method=cli.label or cli.task,
+        chosen_run=chosen_run,
+        log_root=log_root,
+        ckpt_spec=cli.ckpt,
+        ckpt_path=ckpt_path,
+        seed=cli.seed,
+        warmup=cli.warmup,
+        steps=cli.steps,
+        per_point=cli.num_envs,
+        extra=dict(num_obs=num_obs, seed=cli.seed),
+    )
+    atomic_savez(out, **meta, **metrics)
 
     print(f"\n=== in-dist eval | {cli.task} | run={chosen_run} | {cli.steps} steps ===")
+    print(f"ckpt: {ckpt_path}")
     for k in ("mean_return", "fall_rate", "falls_per_1k", "mean_ep_len",
               "tracking_lin_err", "tracking_ang_err", "never_fell"):
         print(f"{k:>18}: {metrics[k]:.4f}")

@@ -1,8 +1,13 @@
-"""Runtime obs-layout check for go2_bench_oracle_id_vel (GPU/genesis).
+"""Runtime actor/critic observation-layout check for the benchmark baselines.
 
-Builds the env, steps a few times, and asserts the observation is exactly
-[ proprio(45), P(5), base_lin_vel(3) ] = 53 with the appended blocks matching
-the raw simulator quantities. Cheap (few steps) -- run before the real training.
+Builds one task, steps a few times, and verifies that actor proprio remains noisy
+while the asymmetric critic's proprio block is clean.  It also checks the P5 and
+velocity blocks against the simulator quantities.
+
+Run one of:
+  TASK=go2_bench_mlp SIMULATOR=genesis .venv/bin/python tests/_vel_obs_check.py
+  TASK=go2_bench_oracle_id SIMULATOR=genesis .venv/bin/python tests/_vel_obs_check.py
+  TASK=go2_bench_oracle_id_vel SIMULATOR=genesis .venv/bin/python tests/_vel_obs_check.py
 """
 import os, types
 os.environ.setdefault("SIMULATOR", "genesis")
@@ -12,10 +17,18 @@ import genesis as gs
 import legged_gym.envs  # noqa: F401
 from legged_gym.utils import task_registry
 
-TASK = "go2_bench_oracle_id_vel"
+TASK = os.environ.get("TASK", "go2_bench_oracle_id_vel")
+
+EXPECTED_DIMS = {
+    "go2_bench_mlp": (45, 48),
+    "go2_bench_oracle_id": (50, 53),
+    "go2_bench_oracle_id_vel": (53, 53),
+}
 
 
 def main():
+    if TASK not in EXPECTED_DIMS:
+        raise ValueError(f"unsupported task: {TASK}")
     gs.init(backend=gs.gpu, logging_level="warning")
     args = types.SimpleNamespace(
         task=TASK, seed=1, headless=True, cpu=False, num_envs=16, max_iterations=None,
@@ -32,8 +45,25 @@ def main():
         obs, _, _, _, _ = env.step(policy(obs.detach()))
         obs = obs.to(env.device)
 
-    checks = {}
-    checks["obs_dim_53"] = (obs.shape[1] == 53)
+    actor_dim, critic_dim = EXPECTED_DIMS[TASK]
+    critic = env.get_privileged_observations()
+    checks = {
+        "actor_obs_dim": obs.shape[1] == actor_dim,
+        "critic_obs_dim": critic.shape[1] == critic_dim,
+    }
+
+    clean_proprio = torch.cat((
+        env.commands[:, :3] * env.commands_scale,
+        env.simulator.projected_gravity,
+        env.simulator.base_ang_vel * env.obs_scales.ang_vel,
+        (env.simulator.dof_pos - env.simulator.default_dof_pos) * env.obs_scales.dof_pos,
+        env.simulator.dof_vel * env.obs_scales.dof_vel,
+        env.actions,
+    ), dim=-1)
+    checks["critic_proprio_clean"] = torch.allclose(
+        critic[:, :45], clean_proprio.to(critic.dtype), atol=1e-4)
+    checks["actor_proprio_noisy"] = not torch.allclose(
+        obs[:, :45], clean_proprio.to(obs.dtype), atol=1e-4)
 
     # recompute the appended blocks straight from the simulator
     P = torch.cat((
@@ -43,10 +73,20 @@ def main():
     ), dim=-1)
     vel = env.simulator.base_lin_vel * env.obs_scales.lin_vel
 
-    checks["P_block_matches"] = torch.allclose(obs[:, 45:50], P.to(obs.dtype), atol=1e-4)
-    checks["vel_block_matches"] = torch.allclose(obs[:, 50:53], vel.to(obs.dtype), atol=1e-4)
+    if TASK != "go2_bench_mlp":
+        checks["actor_P_block_matches"] = torch.allclose(
+            obs[:, 45:50], P.to(obs.dtype), atol=1e-4)
+        checks["critic_P_block_matches"] = torch.allclose(
+            critic[:, 45:50], P.to(critic.dtype), atol=1e-4)
+
+    vel_start = 45 if TASK == "go2_bench_mlp" else 50
+    checks["critic_vel_block_matches"] = torch.allclose(
+        critic[:, vel_start:vel_start + 3], vel.to(critic.dtype), atol=1e-4)
+    if TASK == "go2_bench_oracle_id_vel":
+        checks["actor_vel_block_matches"] = torch.allclose(
+            obs[:, 50:53], vel.to(obs.dtype), atol=1e-4)
     # velocity should actually be nonzero after settling (sanity: it is a real state)
-    checks["vel_nonzero"] = bool((obs[:, 50:53].abs().sum() > 0).item())
+    checks["vel_nonzero"] = bool((vel.abs().sum() > 0).item())
 
     print("[VEL OBS CHECK]")
     for k, v in checks.items():

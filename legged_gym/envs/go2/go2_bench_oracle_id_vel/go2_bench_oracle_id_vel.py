@@ -20,8 +20,9 @@ class Go2BenchOracleIDVel(Go2BenchOracle):
     state too -- not just the static physics params.
 
     Design choices so the comparison against Go2BenchOracleID is clean:
-      * The first 50 dims are byte-identical to Go2BenchOracleID (proprio + P), so
-        the ONLY difference is the appended velocity block.
+      * The first 50 actor dims are byte-identical to Go2BenchOracleID
+        (noisy proprio + P), so the ONLY actor difference is the appended velocity
+        block. Both variants' critics use clean proprio.
       * base_lin_vel is scaled by obs_scales.lin_vel -- the SAME scaling the
         RMA/DreamWaQ/SysID envs use for their velocity label.
       * The velocity block is NOISE-FREE (oracle truth), like the P block.
@@ -33,7 +34,7 @@ class Go2BenchOracleIDVel(Go2BenchOracle):
 
     def compute_observations(self):
         # 45-dim proprio base -- identical to GO2 / Go2BenchOracle
-        base = torch.cat((
+        clean_proprio = torch.cat((
             self.commands[:, :3] * self.commands_scale,                     # 3
             self.simulator.projected_gravity,                               # 3
             self.simulator.base_ang_vel * self.obs_scales.ang_vel,          # 3
@@ -42,9 +43,12 @@ class Go2BenchOracleIDVel(Go2BenchOracle):
             self.simulator.dof_vel * self.obs_scales.dof_vel,               # 12
             self.actions,                                                   # 12
         ), dim=-1)
-        # proprio noise, same scales as GO2 (noise_scale_vec[:45] holds them)
+        # The deployable actor gets noisy proprio; preserve the clean version for
+        # the asymmetric critic, as in MLP / OracleID / the adaptation methods.
+        actor_proprio = clean_proprio.clone()
         if self.add_noise:
-            base += (2 * torch.rand_like(base) - 1) * self.noise_scale_vec[:base.shape[1]]
+            actor_proprio += (2 * torch.rand_like(actor_proprio) - 1) * \
+                self.noise_scale_vec[:actor_proprio.shape[1]]
 
         # privileged physics params P (5) -- NOISE-FREE (oracle knows the truth)
         # [friction, added_base_mass, com_x, com_y, com_z]
@@ -57,8 +61,6 @@ class Go2BenchOracleIDVel(Go2BenchOracle):
         # true base linear velocity (3) -- NOISE-FREE, scaled like the estimators
         base_lin_vel = self.simulator.base_lin_vel * self.obs_scales.lin_vel  # 3
 
-        self.obs_buf = torch.cat((base, privileged, base_lin_vel), dim=-1)
-        # The actor already sees the complete privileged state; keep a separate
-        # critic buffer so the runner takes the same asymmetric-critic path as
-        # the other benchmark variants.
-        self.privileged_obs_buf = self.obs_buf
+        self.obs_buf = torch.cat((actor_proprio, privileged, base_lin_vel), dim=-1)
+        self.privileged_obs_buf = torch.cat(
+            (clean_proprio, privileged, base_lin_vel), dim=-1)

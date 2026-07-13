@@ -32,15 +32,18 @@ from legged_gym.utils import task_registry
 import numpy as np
 import torch
 
+from legged_gym.scripts.eval.ckpt_utils import parse_ckpt_cli
 from legged_gym.scripts.eval.dr_axes import get_axis, pin_others_to_nominal
 from legged_gym.scripts.eval.metrics import MetricAccumulator
+from legged_gym.scripts.eval.provenance import atomic_savez, collect_eval_meta
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="OOD single-axis sweep for the eval harness")
     p.add_argument("--task", type=str, required=True, help="registered benchmark task, e.g. go2_bench_mlp")
     p.add_argument("--load_run", type=str, default=None, help="run dir to load (default: latest)")
-    p.add_argument("--ckpt", type=int, default=-1, help="checkpoint iteration (-1 = latest)")
+    p.add_argument("--ckpt", type=parse_ckpt_cli, default=-1,
+                   help="checkpoint: 'best', 'latest'/-1, or iteration int (e.g. 3000)")
     p.add_argument("--axis", type=str, default="friction", help="OOD axis name (see dr_axes.AXES)")
     p.add_argument("--grid", type=float, nargs="+", default=None, help="override the axis grid values")
     p.add_argument("--per_point", type=int, default=256, help="parallel env replicas per grid point")
@@ -86,9 +89,11 @@ def resolve_load_run(root, run_name, load_run):
                 f"--load_run '{load_run}' not found in {root}. Available: {runs}"
             )
         if run_name not in load_run:
-            print(f"[warn] --load_run '{load_run}' does not carry this task's "
-                  f"run_name '{run_name}'. Loading another method's checkpoint will "
-                  f"fail on an obs-size mismatch -- double-check this is intentional.")
+            # Fail-loud: silent cross-task loads corrupt obs-dim / wrong-model evals.
+            raise ValueError(
+                f"--load_run '{load_run}' does not contain this task's run_name "
+                f"'{run_name}'. Refusing cross-task checkpoint load."
+            )
         return load_run
 
     matching = [d for d in runs if run_name in d]
@@ -114,23 +119,43 @@ def git_commit():
         return "unknown"
 
 
-def collect_run_meta(cli, chosen_run, ckpt_path):
+def collect_run_meta(cli, chosen_run, ckpt_path, log_root):
     """Provenance for the published artifact: what exactly produced these numbers."""
-    try:
-        genesis_version = gs.__version__  # noqa: F405
-    except Exception:
-        genesis_version = "unknown"
-    return dict(
-        warmup=cli.warmup,
-        load_run=chosen_run,
+    axis = get_axis(cli.axis)
+    return collect_eval_meta(
+        task=cli.task,
+        method=cli.label or cli.task,
+        chosen_run=chosen_run,
+        log_root=log_root,
+        ckpt_spec=cli.ckpt,
         ckpt_path=ckpt_path,
-        ckpt=cli.ckpt,
-        simulator=str(SIMULATOR),  # noqa: F405
-        git_commit=git_commit(),
-        python_version=sys.version.split()[0],
-        torch_version=torch.__version__,
-        numpy_version=np.__version__,
-        genesis_version=str(genesis_version),
+        seed=cli.seed,
+        warmup=cli.warmup,
+        steps=cli.steps,
+        per_point=cli.per_point,
+        extra=dict(
+            axis=cli.axis,
+            command_vx=cli.command_vx,
+            command_vy=cli.command_vy,
+            command_yaw=cli.command_yaw,
+            in_dist=np.asarray(axis.in_dist),
+            unit=axis.unit,
+        ),
+    )
+
+
+def build_sweep_save_payload(meta, agg, *, grid, label, seed):
+    """Single dict for atomic_savez — each key appears once (no **meta/kwargs clash).
+
+    Fields already present in ``meta`` (axis, command_*, in_dist, unit, steps,
+    per_point, …) must not be re-passed as separate kwargs.
+    """
+    from legged_gym.scripts.eval.provenance import merge_npz_payload
+
+    return merge_npz_payload(
+        meta,
+        agg,
+        {"grid": grid, "label": label, "seed": seed},
     )
 
 
@@ -204,8 +229,18 @@ def main():
     # run_name so a sibling method's model can never be loaded by accident.
     log_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", train_cfg.runner.experiment_name)  # noqa: F405
     chosen_run = resolve_load_run(log_root, train_cfg.runner.run_name, cli.load_run)
+    from legged_gym.scripts.eval.provenance import verify_run_identity
+    import re
+    _sm = re.search(r"_seed(\d+)$", chosen_run)
+    verify_run_identity(
+        os.path.join(log_root, chosen_run),
+        expected_task=cli.task,
+        expected_run_name=train_cfg.runner.run_name,
+        expected_training_seed=int(_sm.group(1)) if _sm else None,
+    )
     from legged_gym.utils.helpers import get_load_path
     ckpt_path = get_load_path(log_root, load_run=chosen_run, checkpoint=cli.ckpt)
+    print(f"[eval] loading checkpoint: {ckpt_path} (spec={cli.ckpt!r})")
 
     cli.load_run = chosen_run  # feed the resolved folder into the registry args
     reg_args = make_registry_args(cli)
@@ -262,14 +297,11 @@ def main():
     agg = aggregate(per_env, num_points, cli.per_point)
 
     out = cli.out or os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "eval", f"{cli.axis}_{label}.npz")  # noqa: F405
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    meta = collect_run_meta(cli, chosen_run, ckpt_path)
-    np.savez(
-        out, axis=cli.axis, grid=grid, in_dist=np.asarray(axis.in_dist),
-        unit=axis.unit, label=label, per_point=cli.per_point, steps=cli.steps,
-        command_vx=cli.command_vx, command_vy=cli.command_vy,
-        command_yaw=cli.command_yaw, seed=cli.seed, **meta, **agg,
+    meta = collect_run_meta(cli, chosen_run, ckpt_path, log_root)
+    payload = build_sweep_save_payload(
+        meta, agg, grid=grid, label=label, seed=cli.seed,
     )
+    atomic_savez(out, **payload)
 
     # human-readable summary to stdout
     print(f"\n=== {label} | axis={cli.axis} | {cli.per_point} envs/pt x {cli.steps} steps ===")

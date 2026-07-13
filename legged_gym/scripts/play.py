@@ -10,7 +10,39 @@ from legged_gym.utils.viser_viewer import create_viser_viewer
 import numpy as np
 import torch
 from legged_gym.scripts.joystick import Joystick
-    
+
+
+def configure_play_terrain(env_cfg, terrain_mode):
+    """Apply a visual-playback terrain override without changing task training cfgs."""
+    if terrain_mode == "flat":
+        env_cfg.terrain.mesh_type = "plane"
+        env_cfg.terrain.curriculum = False
+        env_cfg.terrain.selected = False
+        env_cfg.terrain.terrain_kwargs = None
+        return
+
+    if terrain_mode != "bumpy":
+        raise ValueError(f"Unsupported play terrain mode: {terrain_mode}")
+
+    # Genesis currently validates heightfields, while the other backends use the
+    # same selected terrain through their trimesh path.
+    env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+    env_cfg.terrain.num_rows = 1
+    env_cfg.terrain.num_cols = 1
+    env_cfg.terrain.terrain_length = 8.0
+    env_cfg.terrain.terrain_width = 8.0
+    env_cfg.terrain.border_size = 2.0
+    env_cfg.terrain.curriculum = False
+    env_cfg.terrain.selected = True
+    env_cfg.terrain.terrain_kwargs = {
+        "type": "terrain_utils.random_uniform_terrain",
+        "min_height": -0.025,
+        "max_height": 0.025,
+        "step": 0.005,
+        "downsampled_scale": 0.25,
+    }
+
+
 def override_configs(env_cfg, args, task_type):
     """Override some environment configuration parameters for testing
 
@@ -28,57 +60,14 @@ def override_configs(env_cfg, args, task_type):
         env_cfg.env.num_envs = 1 # for depth observation, only support num_envs=1 for now
         env_cfg.env.num_camera_envs = 1
     env_cfg.viewer.rendered_envs_idx = list(range(env_cfg.env.num_envs))
-    # adjust parameters according to terrain type
+
+    configure_play_terrain(env_cfg, args.terrain)
+
+    # Keep selected non-flat terrain compact and deterministic for interactive play.
     if env_cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
-        env_cfg.terrain.num_rows = 1
-        env_cfg.terrain.num_cols = 1
-        env_cfg.terrain.border_size = 2.0
-        env_cfg.terrain.curriculum = False
-        env_cfg.terrain.selected = True
         env_cfg.env.debug_draw_terrain_height_points = False
         env_cfg.domain_rand.push_robots = False
-        
-        
-        # random uniform terrain
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.random_uniform_terrain", 
-        #                                   "min_height" : -0.05, "max_height": 0.05, 
-        #                                   "step":0.005, "downsampled_scale" : 0.2}
-        # slope
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.pyramid_sloped_terrain",
-        #                                   "slope": -0.4, "platform_size": 3.0}
-        # stairs
-        env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.pyramid_stairs_terrain",
-                                        "step_width": 0.4, "step_height": -0.1, "platform_size": 3.0}
-        # discrete obstacles
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.discrete_obstacles_terrain",
-        #                                   "max_height": 0.2,
-        #                                   "min_size": 1.0,
-        #                                   "max_size": 2.0,
-        #                                   "num_rects": 20,
-        #                                   "platform_size": 3.0}
-        # wave terrain
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.wave_terrain", 
-        #                                   "amplitude": 0.1, "num_waves": 2}
-        # stepping stones
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.stepping_stones_terrain",
-        #                                   "stone_length": 1.0, "stone_width": 0.5, "max_height": 0.0,
-        #                                   "stone_distance_x": 1.0, "stone_distance_y": 0.3, "platform_size": 3.0}
-        # gap terrain
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.gap_terrain", 
-        #                                   "gap_size": 0.8, "platform_size": 4.0}
-        # pit terrain
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.pit_terrain", 
-        #                                   "depth": 0.5, "platform_size": 4.0}
-        # multiple pits terrain
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.multiple_high_platforms_terrain",
-        #                                   "high_platform_height": 0.5, "high_platform_length": 0.5, "high_platform_width": 2.0,
-        #                                   "high_platform_interval": 1.8, "platform_size": 3.0}
-        # high_platform_gaps_terrain
-        # env_cfg.terrain.terrain_kwargs = {"type": "terrain_utils.high_platform_gaps_terrain",
-        #                                   "high_platform_height": 0.5, "high_platform_length": 1.6, "high_platform_width": 1.0,
-        #                                   "high_platform_distance_y": 2.0, "gap_size": 0.6, "platform_size": 4.0}
-        
-        
+
     env_cfg.env.debug = True
     # disable automatic reset on failure/timeout for interactive viewing - respawn is
     # triggered manually instead (e.g. via the viser "Respawn" button)

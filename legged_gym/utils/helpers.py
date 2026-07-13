@@ -52,28 +52,29 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 def get_load_path(root, load_run=-1, checkpoint=-1):
+    """Resolve a checkpoint path under an experiment log root.
+
+    ``checkpoint`` accepts:
+      * ``-1`` / ``"latest"`` — highest ``model_<iter>.pt``
+      * ``"best"`` — ``best.pt``
+      * integer / digit string — ``model_<iter>.pt``
+    """
     try:
         runs = os.listdir(root)
         #TODO sort by date to handle change of month
         runs.sort()
         if 'exported' in runs: runs.remove('exported')
         last_run = os.path.join(root, runs[-1])
-    except:
+    except Exception:
         raise ValueError("No runs in this directory: " + root)
-    if load_run==-1:
-        load_run = last_run
+    if load_run == -1 or load_run is None:
+        run_dir = last_run
     else:
-        load_run = os.path.join(root, load_run)
+        run_dir = load_run if os.path.isabs(str(load_run)) else os.path.join(root, load_run)
 
-    if checkpoint==-1:
-        models = [file for file in os.listdir(load_run) if 'model' in file]
-        models.sort(key=lambda m: '{0:0>15}'.format(m))
-        model = models[-1]
-    else:
-        model = "model_{}.pt".format(checkpoint) 
-
-    load_path = os.path.join(load_run, model)
-    return load_path
+    # Prefer the shared resolver so eval CLI strings and training ints share one path.
+    from legged_gym.scripts.eval.ckpt_utils import resolve_checkpoint_path
+    return resolve_checkpoint_path(run_dir, checkpoint)
 
 def update_cfg_from_args(env_cfg, cfg_train, args):
     """Override some configuration parameters from command line arguments
@@ -159,6 +160,8 @@ def get_args():
     parser.add_argument('--viewer',         type=str, default='native', choices=['native', 'viser'], 
                         help="viewer backend: 'native' for simulator viewer, 'viser' for web-based 3D viewer")
     parser.add_argument('--viser_port',     type=int, default=8080, help="port for viser web server (only used with --viewer viser)")
+    parser.add_argument('--terrain',        type=str, default='flat', choices=['flat', 'bumpy'],
+                        help="play terrain override: flat plane or mildly bumpy heightfield (used by play.py)")
     parser.add_argument('--motion_file',    type=str, 
                         default=None, 
                         help="motion file to load, under resources/reference_motion")

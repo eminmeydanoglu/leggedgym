@@ -6,7 +6,13 @@
 # Node artifact files
 node_modules/
 dist/
-scripts/
+# Repo-root ad-hoc scripts only — do NOT use bare `scripts/` (that also hides
+# untracked files under legged_gym/scripts/eval/, breaking Altay harness patches).
+/scripts/*
+!/scripts/benchmark_tripler_orchestrator.py
+!/scripts/benchmark_tripler_aggregate.py
+!/scripts/run_eval_sweeps.sh
+!/scripts/probe_speed.sh
 # Compiled Java class files
 *.class
 
