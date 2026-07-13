@@ -95,8 +95,11 @@ class GenesisSimulator(Simulator):
         if self._cfg.domain_rand.randomize_ctrl_delay:
             self._action_queue[env_ids] *= 0.
             self._action_queue[env_ids] = 0.
-            self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
-                                                       self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
+            # Eval V2 needs a fixed delay over resets.  Keep the established
+            # randomization behaviour for every normal training configuration.
+            if not getattr(self._cfg.domain_rand, "eval_fixed_ctrl_delay", False):
+                self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
+                                                           self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
 
         # reset depth image tensors
         # find common ids between env_ids and camera env ids

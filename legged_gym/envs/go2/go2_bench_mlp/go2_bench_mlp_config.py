@@ -31,12 +31,12 @@ class Go2BenchCfgPPO(LeggedRobotCfgPPO):
             {"start_iteration": 0,   "lin_vel_x": [-0.5, 0.5]},
             {"start_iteration": 500, "lin_vel_x": [-1.0, 1.0]},
         ]
-        # --- in-distribution eval + best.pt (shared by all benchmark methods) ---
+        # --- in-distribution eval + best_tracking.pt (shared by all methods) ---
         # Frozen, deterministic eval on the training distribution: logs Eval/* and
-        # writes best.pt (argmax mean_return, hard-demoted if fall_rate > guard).
-        # Same protocol for nodr/mlp/oracle so best.pt selection stays fair.
+        # writes best_tracking.pt (V2 safety-first tracking selection).
+        # Same protocol for nodr/mlp/oracle so checkpoint selection stays fair.
         eval_interval = 200      # iters between evals (0 disables); aligns with save_interval
         eval_steps = 1100        # >= max_episode_length+1 (1001) so returns are complete
         eval_warmup = 50         # unrecorded settling steps
         eval_seed = 12345        # fixed -> comparable across checkpoints within a run
-        eval_fall_guard = 0.25   # fall_rate above this demotes a checkpoint for best.pt
+        eval_fall_guard = 0.05   # V2 safe fixed-window fall-rate threshold

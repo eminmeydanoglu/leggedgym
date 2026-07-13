@@ -63,6 +63,24 @@ class Terrain:
         # edge mask to indicate the edge points of the terrain, for use in rewards
         self.edge_mask = np.zeros((self.tot_rows, self.tot_cols), dtype=bool)
         self.terrain_meshes = []
+        # Eval V2 can supply a deterministic height map.  This avoids baking an
+        # evaluator-specific terrain generator into the simulator and guarantees
+        # that severity levels differ only by amplitude, not by a fresh RNG draw.
+        # It is intentionally heightfield-only; trimesh follows a different
+        # conversion path and is not supported by Genesis in this repository.
+        override = getattr(cfg, "height_field_raw_override", None)
+        if override is not None:
+            if self.type != "heightfield":
+                raise ValueError("height_field_raw_override requires mesh_type='heightfield'")
+            raw = np.asarray(override, dtype=np.int16)
+            expected = (self.tot_rows, self.tot_cols)
+            if raw.shape != expected:
+                raise ValueError(
+                    f"height_field_raw_override shape {raw.shape} != terrain shape {expected}"
+                )
+            self.height_field_raw = raw.copy()
+            self.heightsamples = self.height_field_raw
+            return
         if cfg.curriculum and cfg.selected:
             raise ValueError("Curriculum and selected terrain cannot be both True.")
         if cfg.curriculum:

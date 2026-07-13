@@ -10,8 +10,8 @@ It exists for two consumers, both driving off the SAME rollout code so their
 numbers mean the same thing:
 
   1. `OnPolicyRunner` calls `run_indist_eval` periodically during training to log
-     `Eval/*` and pick `best.pt` on a deterministic score (not the noisy,
-     curriculum-drifting `Train/mean_reward`).
+     `Eval/*` and pick `best_tracking.pt` with the deterministic tracking and
+     safety rule used by Eval V2 (not noisy, curriculum-drifting reward).
   2. `main()` here is the standalone after-training harness (the in-dist sibling
      of `sweep.py`): load a checkpoint, run the same eval, save an `.npz`.
 
@@ -88,8 +88,9 @@ def run_indist_eval(
         command_ranges: override the pinned ranges (default: `in_dist_command_ranges`).
 
     Returns:
-        dict of scalar metrics: fall_rate, never_fell, mean_ep_len, falls_per_1k,
-        mean_return, tracking_lin_err, tracking_ang_err (each a mean over envs).
+        dict of scalar metrics. ``fall_rate`` is the V2 fixed-window event rate
+        (an environment counts once if it falls at least once); the legacy
+        completed-episode rate remains available as ``episode_fall_rate``.
     """
     device = env.device
 
@@ -148,6 +149,10 @@ def run_indist_eval(
 
         per_env = acc.compute()
         metrics = {k: float(t.mean().item()) for k, t in per_env.items()}
+        # Eval V2 defines safety over the entire fixed observation window rather
+        # than over a policy-dependent number of auto-reset episodes.
+        metrics["episode_fall_rate"] = metrics["fall_rate"]
+        metrics["fall_rate"] = metrics["ever_fell"]
     finally:
         # restore training state no matter what
         for k, v in saved_ranges.items():
@@ -164,16 +169,35 @@ def run_indist_eval(
     return metrics
 
 
-def selection_score(metrics: Dict[str, float], fall_guard: float) -> float:
-    """Scalar used to pick `best.pt`: maximize return, but hard-demote any
-    checkpoint whose fall_rate exceeds `fall_guard`.
+def tracking_score(metrics: Dict[str, float]) -> float:
+    """Eval V2 tracking score for the shared [-1, 1] command field.
 
-    The 1e4 penalty is far larger than any achievable return, so *any* checkpoint
-    under the guard beats *any* over it, and within each group ranking is by
-    return. Keeps a single comparable scalar while never letting a high-return but
-    fall-prone policy win.
+    The linear error is normalized by the maximum planar command magnitude
+    ``sqrt(2)`` and yaw error by its unit maximum. Lower is better.
     """
-    return metrics["mean_return"] - 1e4 * max(0.0, metrics["fall_rate"] - fall_guard)
+    return 0.5 * (float(metrics["tracking_lin_err"]) / np.sqrt(2.0)
+                  + float(metrics["tracking_ang_err"]))
+
+
+def tracking_selection_key(
+    metrics: Dict[str, float], iteration: int, fall_threshold: float,
+) -> tuple[float, ...]:
+    """Lexicographic Eval V2 checkpoint key (lower is better).
+
+    Safe checkpoints always win. Among safe candidates tracking is decisive;
+    if none are safe, minimize fall rate then tracking. Earlier iterations make
+    a deterministic final tie-breaker.
+    """
+    fall = float(metrics["fall_rate"])
+    score = tracking_score(metrics)
+    if fall <= float(fall_threshold):
+        return (0.0, score, float(iteration))
+    return (1.0, fall, score, float(iteration))
+
+
+def selection_score(metrics: Dict[str, float], fall_guard: float) -> float:
+    """Backward-compatible scalar diagnostic; do not use for V2 selection."""
+    return -tracking_score(metrics) - 1e4 * max(0.0, metrics["fall_rate"] - fall_guard)
 
 
 # =============================================================================

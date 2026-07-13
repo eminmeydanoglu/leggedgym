@@ -3,7 +3,8 @@
 Pure helpers (filesystem + optional torch load of metadata only). Unit-testable
 without a simulator. Supports:
 
-  * ``best``     -> ``best.pt``
+  * ``best_tracking`` -> ``best_tracking.pt``
+  * ``best``     -> ``best_tracking.pt`` when present, otherwise legacy ``best.pt``
   * ``latest`` / ``-1`` -> highest ``model_<iter>.pt``
   * integer / digit string -> ``model_<iter>.pt``
 """
@@ -18,7 +19,7 @@ CkptSpec = Union[int, str]
 
 
 def normalize_ckpt_spec(checkpoint: CkptSpec) -> Union[int, str]:
-    """Normalize a CLI / config checkpoint spec to int or 'best'/'latest'."""
+    """Normalize a CLI / config checkpoint spec to int or a named checkpoint."""
     if isinstance(checkpoint, bool):  # bool is a subclass of int; reject
         raise TypeError(f"Invalid checkpoint spec: {checkpoint!r}")
     if isinstance(checkpoint, int):
@@ -26,23 +27,23 @@ def normalize_ckpt_spec(checkpoint: CkptSpec) -> Union[int, str]:
     if isinstance(checkpoint, str):
         s = checkpoint.strip()
         low = s.lower()
-        if low in ("best", "latest"):
+        if low in ("best", "best_tracking", "latest"):
             return low
         try:
             return int(s)
         except ValueError as e:
             raise ValueError(
                 f"Invalid checkpoint spec {checkpoint!r}: "
-                "expected 'best', 'latest', or an integer iteration"
+                "expected 'best_tracking', 'best', 'latest', or an integer iteration"
             ) from e
     raise TypeError(f"Invalid checkpoint spec type: {type(checkpoint)!r}")
 
 
 def ckpt_kind(checkpoint: CkptSpec) -> str:
-    """Short label for artifact metadata: 'best' | 'latest' | '<iter>'."""
+    """Short label for artifact metadata: named kind or '<iter>'."""
     spec = normalize_ckpt_spec(checkpoint)
-    if spec == "best":
-        return "best"
+    if spec in ("best", "best_tracking"):
+        return str(spec)
     if spec == "latest" or spec == -1:
         return "latest"
     return str(int(spec))
@@ -69,8 +70,11 @@ def resolve_checkpoint_path(run_dir: str, checkpoint: CkptSpec = -1) -> str:
 
     spec = normalize_ckpt_spec(checkpoint)
 
-    if spec == "best":
-        path = os.path.join(run_dir, "best.pt")
+    if spec == "best_tracking":
+        path = os.path.join(run_dir, "best_tracking.pt")
+    elif spec == "best":
+        tracking = os.path.join(run_dir, "best_tracking.pt")
+        path = tracking if os.path.isfile(tracking) else os.path.join(run_dir, "best.pt")
     elif spec == "latest" or spec == -1:
         models = []
         for f in os.listdir(run_dir):
@@ -130,7 +134,7 @@ def extract_ckpt_meta(path: str) -> Dict[str, Any]:
 
 
 def parse_ckpt_cli(value: str) -> Union[int, str]:
-    """argparse type for --ckpt: 'best' | 'latest' | int."""
+    """argparse type for --ckpt: best_tracking | best | latest | int."""
     try:
         return normalize_ckpt_spec(value)
     except (ValueError, TypeError) as e:

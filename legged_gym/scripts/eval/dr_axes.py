@@ -28,7 +28,7 @@ P, you MUST add it here -- otherwise eval will silently read stale labels.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import numpy as np
 import torch
@@ -99,6 +99,44 @@ def _set_com_component(component: int):
     return setter
 
 
+def _set_pd_gain_scale(env, values: torch.Tensor):
+    """Apply one fixed gain scale to both Kp and Kd for every joint per env."""
+    sim = env.simulator
+    scales = values.reshape(-1, 1).to(device=env.device, dtype=torch.float)
+    if scales.shape[0] != env.num_envs:
+        raise ValueError(f"pd_gain_scale expects {env.num_envs} values, got {scales.shape[0]}")
+    sim._kp_scale[:] = scales.expand(-1, sim._kp_scale.shape[1])
+    sim._kd_scale[:] = scales.expand(-1, sim._kd_scale.shape[1])
+    if hasattr(sim, "_kp_scale_scalar"):
+        sim._kp_scale_scalar[:] = scales
+
+
+def _prepare_control_delay_cfg(env_cfg, max_delay: int = 6):
+    """Allocate Genesis's action queue, while keeping eval delay deterministic."""
+    env_cfg.domain_rand.randomize_ctrl_delay = True
+    env_cfg.domain_rand.ctrl_delay_step_range = [0, int(max_delay)]
+    # GenesisSimulator reads this optional flag on reset.  It deliberately does
+    # not change any training task's default random-delay behaviour.
+    env_cfg.domain_rand.eval_fixed_ctrl_delay = True
+
+
+def _set_control_delay(env, values: torch.Tensor):
+    """Set a fixed, per-env control delay and clear all queued actions."""
+    sim = env.simulator
+    if not hasattr(sim, "_action_queue"):
+        raise RuntimeError("control_delay was not prepared before build; action queue is absent")
+    delay = values.reshape(-1).to(device=env.device, dtype=torch.long)
+    if delay.shape[0] != env.num_envs:
+        raise ValueError(f"control_delay expects {env.num_envs} values, got {delay.shape[0]}")
+    if delay.min().item() < 0 or delay.max().item() >= sim._action_queue.shape[1]:
+        raise ValueError(
+            f"control_delay values must be in [0, {sim._action_queue.shape[1] - 1}], "
+            f"got [{delay.min().item()}, {delay.max().item()}]"
+        )
+    sim._action_queue.zero_()
+    sim._action_delay[:] = delay
+
+
 @dataclass
 class Axis:
     name: str
@@ -107,9 +145,34 @@ class Axis:
     nominal: float            # value at which this axis is "off"/neutral
     default_grid: List[float] = field(default_factory=list)
     unit: str = ""
+    prepare_cfg_fn: Optional[Callable[[object], None]] = None
+    readback: Optional[Callable[[object], torch.Tensor]] = None
 
     def grid(self) -> np.ndarray:
         return np.asarray(self.default_grid, dtype=np.float64)
+
+    def prepare_cfg(self, env_cfg) -> None:
+        if self.prepare_cfg_fn is not None:
+            self.prepare_cfg_fn(env_cfg)
+
+    def apply(self, env, values: torch.Tensor) -> None:
+        self.setter(env, values)
+
+    def pin_nominal(self, env) -> None:
+        self.setter(env, torch.full((env.num_envs,), self.nominal, device=env.device))
+
+    def validate(self, env, requested: torch.Tensor, atol: float = 1e-6) -> torch.Tensor:
+        """Return actual values and fail loudly if Genesis did not retain them."""
+        if self.readback is None:
+            raise RuntimeError(f"axis {self.name!r} has no simulator readback")
+        actual = self.readback(env).reshape(-1).to(requested.dtype)
+        expected = requested.reshape(-1).to(actual.device)
+        if actual.shape != expected.shape or not torch.allclose(actual, expected, atol=atol, rtol=0.0):
+            raise RuntimeError(
+                f"axis {self.name!r} readback mismatch: requested={expected[:4].tolist()} "
+                f"actual={actual[:4].tolist()}"
+            )
+        return actual
 
 
 # --- registry -------------------------------------------------------------
@@ -123,6 +186,7 @@ AXES = {
         # spans well below and well above the training band to expose OOD collapse
         default_grid=[0.1, 0.25, 0.4, 0.5, 0.7, 0.9, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5],
         unit="ratio",
+        readback=lambda env: env.simulator._friction_values[:, 0],
     ),
     "added_mass": Axis(
         name="added_mass",
@@ -131,18 +195,33 @@ AXES = {
         nominal=0.0,          # no added mass
         default_grid=[-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
         unit="kg",
+        readback=lambda env: env.simulator._added_base_mass[:, 0],
     ),
     "com_x": Axis(
         name="com_x", setter=_set_com_component(0), in_dist=(-0.03, 0.03),
         nominal=0.0, default_grid=[-0.08, -0.05, -0.03, 0.0, 0.03, 0.05, 0.08], unit="m",
+        readback=lambda env: env.simulator._base_com_bias[:, 0],
     ),
     "com_y": Axis(
         name="com_y", setter=_set_com_component(1), in_dist=(-0.03, 0.03),
         nominal=0.0, default_grid=[-0.08, -0.05, -0.03, 0.0, 0.03, 0.05, 0.08], unit="m",
+        readback=lambda env: env.simulator._base_com_bias[:, 1],
     ),
     "com_z": Axis(
         name="com_z", setter=_set_com_component(2), in_dist=(-0.03, 0.03),
         nominal=0.0, default_grid=[-0.08, -0.05, -0.03, 0.0, 0.03, 0.05, 0.08], unit="m",
+        readback=lambda env: env.simulator._base_com_bias[:, 2],
+    ),
+    "pd_gain_scale": Axis(
+        name="pd_gain_scale", setter=_set_pd_gain_scale, in_dist=(1.0, 1.0), nominal=1.0,
+        default_grid=[0.5, 0.65, 0.8, 1.0, 1.2, 1.35, 1.5], unit="scale",
+        readback=lambda env: env.simulator._kp_scale_scalar[:, 0],
+    ),
+    "control_delay": Axis(
+        name="control_delay", setter=_set_control_delay, in_dist=(0.0, 0.0), nominal=0.0,
+        default_grid=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], unit="control_step",
+        prepare_cfg_fn=lambda cfg: _prepare_control_delay_cfg(cfg, max_delay=6),
+        readback=lambda env: env.simulator._action_delay,
     ),
 }
 

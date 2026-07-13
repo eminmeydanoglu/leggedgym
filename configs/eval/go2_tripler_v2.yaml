@@ -1,0 +1,59 @@
+# Eval V2 frozen campaign definition.  The three local seed-2 folders allow the
+# GPU smoke protocol; replace the TODO folders with the nine archived Altay runs
+# before invoking select-checkpoints or a full campaign.
+campaign: go2_tripler_v2
+artifact_root: logs/eval/go2_tripler_v2
+simulator: genesis
+training_seeds: [1, 2, 3]
+models:
+  - label: MLP
+    task: go2_bench_mlp
+    checkpoint: best
+    run_folders:
+      1: Jul13_09-47-39_bench_mlp_genesis_seed1
+      2: Jul13_09-48-03_bench_mlp_genesis_seed2
+      3: Jul13_09-48-28_bench_mlp_genesis_seed3
+  - label: P5
+    task: go2_bench_oracle_id
+    checkpoint: best
+    run_folders:
+      1: Jul13_09-48-26_bench_oracle_id_genesis_seed1
+      2: Jul13_09-48-51_bench_oracle_id_genesis_seed2
+      3: Jul13_09-49-17_bench_oracle_id_genesis_seed3
+  - label: P5+V
+    task: go2_bench_oracle_id_vel
+    checkpoint: best
+    run_folders:
+      1: Jul13_10-34-00_bench_oracle_id_vel_genesis_seed1
+      2: Jul13_10-34-29_bench_oracle_id_vel_genesis_seed2
+      3: Jul13_10-35-00_bench_oracle_id_vel_genesis_seed3
+protocol:
+  validation: {seed: 31001, num_envs: 768, warmup: 100, steps: 1100}
+  id: {seed: 41001, num_envs: 768, warmup: 100, steps: 2000}
+  axes:
+    seed: 41001
+    warmup: 100
+    steps: 2000
+    replicas: 64
+    magnitudes: [0.5, 1.0, 1.5, 2.0]
+  hard:
+    seed: 41001
+    warmup: 100
+    steps: 2000
+    terrain_replicas: 256
+    kick_replicas: 256
+    step_replicas: 256
+    terrain_cm: [0, 2.5, 5, 7.5, 10]
+    lateral_kick_mps: [0, 0.5, 1, 1.5, 2, 2.5, 3]
+    kick_step: 50
+    recovery_steps: 250
+    step_amplitudes: [1.0, 2.0]
+    phase_steps: 150
+axes:
+  added_mass: {grid: [-2, -1, 0, 1, 2, 3, 4, 5], in_distribution: [-1, 1], unit: kg}
+  friction: {grid: [0.1, 0.25, 0.4, 0.5, 0.7, 0.9, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5], in_distribution: [0.5, 1.25], unit: ratio}
+  com_x: {grid: [-0.08, -0.05, -0.03, 0, 0.03, 0.05, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  com_y: {grid: [-0.08, -0.05, -0.03, 0, 0.03, 0.05, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  com_z: {grid: [-0.08, -0.05, -0.03, 0, 0.03, 0.05, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  pd_gain_scale: {grid: [0.5, 0.65, 0.8, 1.0, 1.2, 1.35, 1.5], in_distribution: [1.0, 1.0], unit: scale}
+  control_delay: {grid: [0, 1, 2, 3, 4, 5, 6], in_distribution: [0, 0], unit: control_step}

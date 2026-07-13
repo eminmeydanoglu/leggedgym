@@ -47,6 +47,7 @@ from legged_gym.utils.helpers import get_load_path  # noqa: E402
 class TestNormalizeCkptSpec(unittest.TestCase):
     def test_best_latest_int(self):
         self.assertEqual(normalize_ckpt_spec("best"), "best")
+        self.assertEqual(normalize_ckpt_spec("best_tracking"), "best_tracking")
         self.assertEqual(normalize_ckpt_spec("BEST"), "best")
         self.assertEqual(normalize_ckpt_spec("latest"), "latest")
         self.assertEqual(normalize_ckpt_spec(-1), -1)
@@ -62,6 +63,7 @@ class TestNormalizeCkptSpec(unittest.TestCase):
 
     def test_ckpt_kind_labels(self):
         self.assertEqual(ckpt_kind("best"), "best")
+        self.assertEqual(ckpt_kind("best_tracking"), "best_tracking")
         self.assertEqual(ckpt_kind("latest"), "latest")
         self.assertEqual(ckpt_kind(-1), "latest")
         self.assertEqual(ckpt_kind(3000), "3000")
@@ -95,6 +97,16 @@ class TestResolveCheckpointPath(unittest.TestCase):
             m1 = resolve_checkpoint_path(run, "1000")
             self.assertTrue(m1.endswith("model_1000.pt"))
 
+    def test_best_prefers_tracking_and_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._make_run(tmp)
+            with open(os.path.join(run, "best_tracking.pt"), "wb") as f:
+                f.write(b"tracking")
+            self.assertTrue(resolve_checkpoint_path(run, "best_tracking").endswith("best_tracking.pt"))
+            self.assertTrue(resolve_checkpoint_path(run, "best").endswith("best_tracking.pt"))
+            os.remove(os.path.join(run, "best_tracking.pt"))
+            self.assertTrue(resolve_checkpoint_path(run, "best").endswith("best.pt"))
+
     def test_missing_file_fail_loud(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = os.path.join(tmp, "empty_run")
@@ -118,6 +130,10 @@ class TestResolveCheckpointPath(unittest.TestCase):
             run_name = os.path.basename(run)
             path = get_load_path(exp, load_run=run_name, checkpoint="best")
             self.assertEqual(os.path.basename(path), "best.pt")
+            with open(os.path.join(run, "best_tracking.pt"), "wb") as f:
+                f.write(b"new-best")
+            path_tracking = get_load_path(exp, load_run=run_name, checkpoint="best")
+            self.assertEqual(os.path.basename(path_tracking), "best_tracking.pt")
             path3 = get_load_path(exp, load_run=run_name, checkpoint=3000)
             self.assertEqual(os.path.basename(path3), "model_3000.pt")
             path_lat = get_load_path(exp, load_run=run_name, checkpoint=-1)

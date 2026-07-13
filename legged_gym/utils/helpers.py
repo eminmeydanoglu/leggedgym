@@ -56,7 +56,8 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
 
     ``checkpoint`` accepts:
       * ``-1`` / ``"latest"`` — highest ``model_<iter>.pt``
-      * ``"best"`` — ``best.pt``
+      * ``"best_tracking"`` — ``best_tracking.pt``
+      * ``"best"`` — ``best_tracking.pt`` if present, otherwise legacy ``best.pt``
       * integer / digit string — ``model_<iter>.pt``
     """
     try:
@@ -153,7 +154,8 @@ def get_args():
     parser.add_argument('--export_onnx',    action='store_true', default=False, help="export policy as onnx (besides jit)")
     parser.add_argument('--debug',          action='store_true', default=False, help="enable debug mode")
     parser.add_argument('--load_run',       type=str, default=None, help="run to load, default: last run")
-    parser.add_argument('--ckpt',           type=int, default=-1, help="checkpoint to load, -1 means latest")
+    parser.add_argument('--ckpt',           type=str, default='-1',
+                        help="checkpoint: best_tracking, best, latest, or iteration (-1 = latest)")
     parser.add_argument('--use_joystick',   action='store_true', default=False, help="use joystick to provide commands")
     parser.add_argument('--joystick_type',  type=str, default='xbox', help="type of joystick: xbox, switch")
     parser.add_argument('--follow_robot',   action='store_true', default=False, help="whether the camera follows the robot during play")

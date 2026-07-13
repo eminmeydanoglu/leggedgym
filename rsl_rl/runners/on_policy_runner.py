@@ -89,7 +89,7 @@ class OnPolicyRunner:
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.save_interval: int = self.cfg["save_interval"]
 
-        # In-distribution eval / best.pt selection (opt-in via runner cfg).
+        # In-distribution Eval V2 / best_tracking.pt selection (opt-in via cfg).
         # eval_interval == 0 disables it entirely (default), preserving legacy
         # behavior for tasks that don't configure eval.
         self.eval_interval: int = self.cfg.get("eval_interval", 0)
@@ -97,7 +97,8 @@ class OnPolicyRunner:
         self.eval_warmup: int = self.cfg.get("eval_warmup", 50)
         self.eval_seed: int = self.cfg.get("eval_seed", 12345)
         self.eval_fall_guard: float = self.cfg.get("eval_fall_guard", 0.25)
-        self.best_eval_score: float = -float("inf")
+        self.best_eval_score: float = float("inf")
+        self.best_tracking_key: Optional[Tuple[float, ...]] = None
 
         # Iteration-based command schedule (opt-in via runner cfg). A list of
         # {"start_iteration": int, "lin_vel_x": [lo, hi]} stages: at each boundary
@@ -228,7 +229,7 @@ class OnPolicyRunner:
                 assert self.log_dir is not None
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), iteration=it)
 
-            # Periodic in-distribution eval -> Eval/* logging + best.pt selection.
+            # Periodic in-distribution eval -> Eval/* + best_tracking.pt selection.
             # The eval rollout resets the env, so we refresh obs/critic_obs and the
             # training-only reward/length bookkeeping before resuming rollout.
             if self.eval_interval > 0 and it % self.eval_interval == 0:
@@ -399,15 +400,16 @@ class OnPolicyRunner:
         print(log_string)
 
     def _run_eval(self, it: int) -> Dict[str, float]:
-        """Run one in-distribution eval, log `Eval/*`, and update `best.pt`.
+        """Run one in-distribution eval and update ``best_tracking.pt``.
 
-        Uses the deterministic inference policy (mean action) under the frozen
-        in-dist protocol (see `legged_gym.scripts.eval.indist`). `best.pt` is
-        selected by `selection_score` (maximize return, hard-demote checkpoints
-        whose fall_rate exceeds `eval_fall_guard`). Leaves the env freshly reset;
-        the caller refreshes its observation handles.
+        The exact V2 lexicographic rule is safety first (fixed-window fall rate),
+        then normalized tracking, then earlier iteration. It shares the rollout
+        with the standalone in-distribution evaluator and leaves the env freshly
+        reset; the caller refreshes observation handles.
         """
-        from legged_gym.scripts.eval.indist import run_indist_eval, selection_score
+        from legged_gym.scripts.eval.indist import (
+            run_indist_eval, tracking_score, tracking_selection_key,
+        )
 
         self.alg.actor_critic.eval()
         metrics = run_indist_eval(
@@ -423,19 +425,29 @@ class OnPolicyRunner:
             for key, val in metrics.items():
                 self.writer.add_scalar('Eval/' + key, val, it)
 
-        score = selection_score(metrics, self.eval_fall_guard)
+        score = tracking_score(metrics)
+        key = tracking_selection_key(metrics, it, self.eval_fall_guard)
         print(f"[eval] it={it} return={metrics['mean_return']:.2f} "
               f"fall_rate={metrics['fall_rate']:.3f} ep_len={metrics['mean_ep_len']:.1f} "
-              f"lin_err={metrics['tracking_lin_err']:.3f} score={score:.2f} "
-              f"(best={self.best_eval_score:.2f})")
+              f"lin_err={metrics['tracking_lin_err']:.3f} tracking_score={score:.4f} "
+              f"(best_key={self.best_tracking_key})")
 
-        if score > self.best_eval_score and self.log_dir is not None:
+        if (self.best_tracking_key is None or key < self.best_tracking_key) and self.log_dir is not None:
+            self.best_tracking_key = key
             self.best_eval_score = score
             if self.writer is not None:
-                self.writer.add_scalar('Eval/best_score', score, it)
-            self.save(os.path.join(self.log_dir, 'best.pt'), iteration=it,
-                      infos={'eval_metrics': metrics, 'eval_score': score, 'eval_it': it})
-            print(f"[eval] new best.pt @ it={it} (score={score:.2f})")
+                self.writer.add_scalar('Eval/best_tracking_score', score, it)
+            self.save(os.path.join(self.log_dir, 'best_tracking.pt'), iteration=it,
+                      infos={
+                          'eval_metrics': metrics,
+                          'selection_metric': 'v2_tracking_lexicographic',
+                          'tracking_score': score,
+                          'validation_seed': self.eval_seed,
+                          'fall_threshold': self.eval_fall_guard,
+                          'selected_iteration': it,
+                          'selection_key': list(key),
+                      })
+            print(f"[eval] new best_tracking.pt @ it={it} (key={key})")
         return metrics
 
     def save(
@@ -459,6 +471,7 @@ class OnPolicyRunner:
             # Keep eval selection state with the training checkpoint so resume
             # cannot treat an already-evaluated run as having no best model.
             'best_eval_score': self.best_eval_score,
+            'best_tracking_key': self.best_tracking_key,
             # Provenance travelling with the weights (see codex_plan.md sec. 2):
             # the training seed and the active command-schedule stage.
             'training_seed': self.training_seed,
@@ -469,15 +482,11 @@ class OnPolicyRunner:
 
     @staticmethod
     def _checkpoint_eval_score(checkpoint: Dict[str, Any]) -> Optional[float]:
-        """Return the persisted eval score from a checkpoint, if available.
-
-        ``infos['eval_score']`` is supported for checkpoints written before
-        ``best_eval_score`` became a top-level field (notably ``best.pt``).
-        """
+        """Return a persisted scalar diagnostic from old or new checkpoints."""
         score = checkpoint.get('best_eval_score')
         if score is None:
             infos = checkpoint.get('infos') or {}
-            score = infos.get('eval_score')
+            score = infos.get('tracking_score', infos.get('eval_score'))
         if isinstance(score, torch.Tensor):
             score = score.item()
         try:
@@ -506,18 +515,25 @@ class OnPolicyRunner:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
         self.current_learning_iteration = loaded_dict['iter']
 
-        # Restore the score carried by the resumed checkpoint. For checkpoints
-        # saved before this field existed, and for a model checkpoint saved just
-        # before an eval updated best.pt, recover the score from the sibling
-        # best.pt when possible. Taking the maximum preserves the actual best
-        # selection state across both old and new checkpoint formats.
-        scores = [self._checkpoint_eval_score(loaded_dict)]
-        best_path = os.path.join(os.path.dirname(path), 'best.pt')
-        if os.path.abspath(best_path) != os.path.abspath(path) and os.path.isfile(best_path):
-            best_dict = torch.load(best_path, map_location='cpu', weights_only=False)
-            scores.append(self._checkpoint_eval_score(best_dict))
+        # Restore the full lexicographic selection state from the resumed model
+        # or the sibling best_tracking checkpoint. Legacy best.pt has no V2 key;
+        # it remains loadable, but the next V2 evaluation establishes a new key.
+        choices = [loaded_dict]
+        tracking_path = os.path.join(os.path.dirname(path), 'best_tracking.pt')
+        if os.path.abspath(tracking_path) != os.path.abspath(path) and os.path.isfile(tracking_path):
+            choices.append(torch.load(tracking_path, map_location='cpu', weights_only=False))
+        keys = []
+        for item in choices:
+            key = item.get('best_tracking_key') or (item.get('infos') or {}).get('selection_key')
+            if isinstance(key, (list, tuple)):
+                try:
+                    keys.append(tuple(float(x) for x in key))
+                except (TypeError, ValueError):
+                    pass
+        self.best_tracking_key = min(keys) if keys else None
+        scores = [self._checkpoint_eval_score(item) for item in choices]
         persisted_scores = [score for score in scores if score is not None]
-        self.best_eval_score = max(persisted_scores, default=-float('inf'))
+        self.best_eval_score = min(persisted_scores, default=float('inf'))
         return loaded_dict['infos']
 
     def get_inference_policy(

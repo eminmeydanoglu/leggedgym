@@ -34,6 +34,7 @@ class MetricAccumulator:
         # running (current, not-yet-finished episode)
         self._alive_steps = z(torch.long)     # steps since last reset (our own count)
         self._return_run = z()                # reward sum in current episode
+        self._reward_step_sum = z()           # all rewards, including censored episodes
 
         # completed-episode accumulators
         self._ep_len_sum = z()                # sum of lengths of finished episodes
@@ -41,6 +42,7 @@ class MetricAccumulator:
         self._fall_count = z(torch.long)      # finished episodes ending in a fall
         self._timeout_count = z(torch.long)   # finished episodes ending in a timeout
         self._ep_return_sum = z()             # sum of returns of finished episodes
+        self._ever_fell = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
         # step-level accumulators (averaged over all steps)
         self._lin_err_sum = z()               # |cmd_xy - v_xy| summed over steps
@@ -76,6 +78,7 @@ class MetricAccumulator:
 
         self._alive_steps += 1
         self._return_run += rew
+        self._reward_step_sum += rew
         self._lin_err_sum += lin_err
         self._ang_err_sum += ang_err
         self._lin_err_sq_sum += lin_err.square()
@@ -102,6 +105,7 @@ class MetricAccumulator:
         self._ep_return_sum += torch.where(done, self._return_run, torch.zeros_like(self._return_run))
         self._fall_count += fall.long()
         self._timeout_count += timeout.long()
+        self._ever_fell |= fall
 
         # reset running trackers for envs that just finished
         zero_l = torch.zeros_like(self._alive_steps)
@@ -133,10 +137,14 @@ class MetricAccumulator:
         )
         return {
             "fall_rate": self._fall_count.float() / ep,
+            # V2 headline: a binary event over the fixed measurement window,
+            # never divided by how many episodes auto-reset happened to create.
+            "ever_fell": self._ever_fell.float(),
             "never_fell": (self._fall_count == 0).float(),
             "mean_ep_len": mean_ep_len,
             "falls_per_1k": self._fall_count.float() / steps * 1000.0,
             "mean_return": self._ep_return_sum / ep,
+            "return_per_step": self._reward_step_sum / steps,
             "tracking_lin_err": self._lin_err_sum / steps,
             "tracking_ang_err": self._ang_err_sum / steps,
             "tracking_lin_rmse": torch.sqrt(self._lin_err_sq_sum / steps),

@@ -20,6 +20,19 @@ def _git_commit():
         return None
 
 
+def _git_state():
+    """Return the clean/dirty provenance required by future Eval V2 runs."""
+    try:
+        raw = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=LEGGED_GYM_ROOT_DIR,
+            stderr=subprocess.DEVNULL,
+        )
+        import hashlib
+        return bool(raw.strip()), hashlib.sha256(raw).hexdigest()
+    except Exception:
+        return None, None
+
+
 def _simulator_versions():
     """SIMULATOR name + relevant package versions (best-effort)."""
     import torch
@@ -40,10 +53,13 @@ def write_run_manifest(log_dir, args, env_cfg, train_cfg):
     try:
         dr = env_cfg.domain_rand
         runner = train_cfg.runner
+        git_dirty, git_diff_sha256 = _git_state()
         manifest = {
             "task": args.task,
             "training_seed": train_cfg.seed,
             "git_commit": _git_commit(),
+            "git_dirty": git_dirty,
+            "git_diff_sha256": git_diff_sha256,
             **_simulator_versions(),
             # P5 = [friction, added_base_mass, com_x, com_y, com_z]
             "p5_distribution": {
@@ -57,9 +73,9 @@ def write_run_manifest(log_dir, args, env_cfg, train_cfg):
             "max_iterations": runner.max_iterations,
             "num_envs": env_cfg.env.num_envs,
             "num_observations": env_cfg.env.num_observations,
-            # checkpoint-selection (best.pt) protocol
+            # V2 checkpoint-selection (best_tracking.pt) protocol
             "checkpoint_selection": {
-                "protocol": "in-dist eval, deterministic policy, mean_return + fall guard",
+                "protocol": "v2 tracking lexicographic: safe fall-rate then tracking score",
                 "validation_lin_vel_x": list(env_cfg.commands.ranges.lin_vel_x),
                 "eval_seed": getattr(runner, "eval_seed", None),
                 "eval_steps": getattr(runner, "eval_steps", None),
