@@ -431,34 +431,41 @@ def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
     """Selection is deliberately conservative: this command will not silently use best.pt."""
     root = artifact_root(cfg); rows = []; protocol = cfg["protocol"]["validation"]
     work = [(model, seed) for model in cfg["models"] for seed in cfg["training_seeds"]]
-    for model, seed in shard_items(work, shard):
-            run = _run_dir(model, seed)
-            candidates = sorted(run.glob("model_*.pt"), key=_checkpoint_iter)
-            if not candidates and cfg.get("smoke_only"):
-                candidates = [run / "best.pt"]
-            if not candidates:
-                raise FileNotFoundError(f"{run}: no model_*.pt checkpoints for offline V2 selection")
-            if any(not p.is_file() for p in candidates):
-                raise FileNotFoundError(f"{run}: smoke checkpoint best.pt is missing")
-            # A single Genesis environment serves every checkpoint in this run.
-            # Loading only the actor is strict and avoids paying scene-build cost
-            # 16 times; the deterministic bank/reset seed is reapplied below.
-            first = candidates[0]
-            first_spec = "best" if first.name == "best.pt" else _checkpoint_iter(first)
-            initial = dict(model); initial["checkpoint"] = first_spec
-            from legged_gym import gs
-            if not getattr(cmd_select, "_gs_ready", False):
-                gs.init(backend=gs.gpu, logging_level="warning"); cmd_select._gs_ready = True
-            session = build_session(initial, seed, protocol["num_envs"], protocol["seed"], id_domain_rand=True)
-            commands = _scenario_commands(session.env.num_envs, protocol["seed"])
-            for ckpt in candidates:
-                # Re-use the V2 deterministic ID bank but force this exact model file.
-                spec = "best" if ckpt.name == "best.pt" else _checkpoint_iter(ckpt)
-                _load_actor(session.actor, ckpt, session.env.device)
-                vals = rollout(session, commands, warmup=protocol["warmup"], steps=protocol["steps"], seed=protocol["seed"])
-                lin, yaw, fall = (float(vals[k].mean()) for k in ("tracking_lin", "tracking_yaw", "fall_rate"))
-                rows.append(dict(model=model["label"], training_seed=seed, path=str(ckpt), checkpoint=spec, iteration=_checkpoint_iter(ckpt), sha256=sha256_file(str(ckpt)),
-                    tracking_lin=lin, tracking_yaw=yaw, fall_rate=fall, tracking_score=.5 * (lin / np.sqrt(2.) + yaw), protocol=protocol))
+    assigned = shard_items(work, shard)
+    print(f"[selection] shard={shard[0]}/{shard[1]} runs={len(assigned)} "
+          f"protocol={protocol['num_envs']}env×{protocol['steps']}steps")
+    for run_index, (model, seed) in enumerate(assigned, start=1):
+        run = _run_dir(model, seed)
+        candidates = sorted(run.glob("model_*.pt"), key=_checkpoint_iter)
+        if not candidates and cfg.get("smoke_only"):
+            candidates = [run / "best.pt"]
+        if not candidates:
+            raise FileNotFoundError(f"{run}: no model_*.pt checkpoints for offline V2 selection")
+        if any(not p.is_file() for p in candidates):
+            raise FileNotFoundError(f"{run}: smoke checkpoint best.pt is missing")
+        print(f"[selection] run {run_index}/{len(assigned)} {model['label']} seed={seed} "
+              f"candidates={len(candidates)}")
+        # A single Genesis environment serves every checkpoint in this run.
+        # Loading only the actor is strict and avoids paying scene-build cost
+        # 16 times; the deterministic bank/reset seed is reapplied below.
+        first = candidates[0]
+        first_spec = "best" if first.name == "best.pt" else _checkpoint_iter(first)
+        initial = dict(model); initial["checkpoint"] = first_spec
+        from legged_gym import gs
+        if not getattr(cmd_select, "_gs_ready", False):
+            gs.init(backend=gs.gpu, logging_level="warning"); cmd_select._gs_ready = True
+        session = build_session(initial, seed, protocol["num_envs"], protocol["seed"], id_domain_rand=True)
+        commands = _scenario_commands(session.env.num_envs, protocol["seed"])
+        for candidate_index, ckpt in enumerate(candidates, start=1):
+            # Re-use the V2 deterministic ID bank but force this exact model file.
+            spec = "best" if ckpt.name == "best.pt" else _checkpoint_iter(ckpt)
+            print(f"[selection] {model['label']} seed={seed} checkpoint "
+                  f"{candidate_index}/{len(candidates)} iter={spec}", flush=True)
+            _load_actor(session.actor, ckpt, session.env.device)
+            vals = rollout(session, commands, warmup=protocol["warmup"], steps=protocol["steps"], seed=protocol["seed"])
+            lin, yaw, fall = (float(vals[k].mean()) for k in ("tracking_lin", "tracking_yaw", "fall_rate"))
+            rows.append(dict(model=model["label"], training_seed=seed, path=str(ckpt), checkpoint=spec, iteration=_checkpoint_iter(ckpt), sha256=sha256_file(str(ckpt)),
+                tracking_lin=lin, tracking_yaw=yaw, fall_rate=fall, tracking_score=.5 * (lin / np.sqrt(2.) + yaw), protocol=protocol))
     selected = [selection_order([r for r in rows if r["model"] == model["label"] and r["training_seed"] == seed])
                 for model, seed in shard_items(work, shard)]
     root.mkdir(parents=True, exist_ok=True)
@@ -472,6 +479,8 @@ def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
                      expected_selections=len(work), completed_selections=len(unique),
                      complete=len(unique) == len(work), selections=[unique[k] for k in sorted(unique)])
     (root / "checkpoint_selection.json").write_text(_json(canonical), encoding="utf-8")
+    print(f"[selection] selections={len(selected)} canonical="
+          f"{canonical['completed_selections']}/{canonical['expected_selections']}")
     _write_campaign_state(cfg)
     return 0
 
@@ -608,7 +617,11 @@ def cmd_run(cfg: Dict[str, Any], suite: str, resume: bool, shard: Tuple[int, int
     if SIMULATOR != "genesis": raise RuntimeError(f"SIMULATOR={SIMULATOR!r}; Eval V2 needs genesis")
     gs.init(backend=gs.gpu, logging_level="warning")
     root = artifact_root(cfg); root.mkdir(parents=True, exist_ok=True)
-    for kind, model, seed, name in shard_items(_planned_cells(cfg, suite), shard):
+    assigned = shard_items(_planned_cells(cfg, suite), shard)
+    print(f"[run] suite={suite} shard={shard[0]}/{shard[1]} process_cells={len(assigned)} "
+          f"resume={resume}")
+    for cell_index, (kind, model, seed, name) in enumerate(assigned, start=1):
+        print(f"[run] cell {cell_index}/{len(assigned)} {kind}:{model['label']}:seed{seed}:{name}", flush=True)
         try:
             if kind == "id": _run_id(root, cfg, model, seed, resume=resume)
             elif kind == "axes":
@@ -622,6 +635,7 @@ def cmd_run(cfg: Dict[str, Any], suite: str, resume: bool, shard: Tuple[int, int
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+        print(f"[run] complete {cell_index}/{len(assigned)}", flush=True)
     _write_campaign_state(cfg)
     return 0
 
