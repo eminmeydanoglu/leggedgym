@@ -18,6 +18,7 @@ dist/
 !/scripts/action_quad.sbatch
 !/scripts/action_one.sbatch
 !/scripts/run_him_sysid_v2_on_a115.sh
+!/scripts/run_rma_dreamwaq_v2_on_kotr.sh
 # Compiled Java class files
 *.class
 
