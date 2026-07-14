@@ -156,6 +156,11 @@ from legged_gym.envs.go2.go2_bench_dreamwaq.go2_bench_dreamwaq import Go2BenchDr
 from legged_gym.envs.go2.go2_bench_dreamwaq.go2_bench_dreamwaq_config import Go2BenchDreamwaqCfg, Go2BenchDreamwaqCfgPPO
 from legged_gym.envs.go2.go2_bench_sysid.go2_bench_sysid import Go2BenchSysID
 from legged_gym.envs.go2.go2_bench_sysid.go2_bench_sysid_config import Go2BenchSysIDCfg, Go2BenchSysIDCfgPPO
+# HIM (Hybrid Internal Model): explicit lin_vel + implicit SwAV latent. Unlike
+# RMA/DreamWaQ it keeps the standard single-tensor contract, so it retains the
+# fair command_schedule + Eval-V2 machinery from OnPolicyRunner.
+from legged_gym.envs.go2.go2_bench_him.go2_bench_him import Go2BenchHIM
+from legged_gym.envs.go2.go2_bench_him.go2_bench_him_config import Go2BenchHIMCfg, Go2BenchHIMCfgPPO
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
@@ -171,3 +176,4 @@ task_registry.register("go2_bench_oracle_rich", Go2BenchOracleRich, Go2BenchOrac
 task_registry.register("go2_bench_rma",      Go2BenchRMA,      Go2BenchRMACfg(),      Go2BenchRMACfgPPO())
 task_registry.register("go2_bench_dreamwaq", Go2BenchDreamwaq, Go2BenchDreamwaqCfg(), Go2BenchDreamwaqCfgPPO())
 task_registry.register("go2_bench_sysid",    Go2BenchSysID,    Go2BenchSysIDCfg(),    Go2BenchSysIDCfgPPO())
+task_registry.register("go2_bench_him",      Go2BenchHIM,      Go2BenchHIMCfg(),      Go2BenchHIMCfgPPO())

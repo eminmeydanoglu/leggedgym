@@ -21,7 +21,7 @@ def configure_play_terrain(env_cfg, terrain_mode):
         env_cfg.terrain.terrain_kwargs = None
         return
 
-    if terrain_mode != "bumpy":
+    if terrain_mode not in {"bumpy", "course"}:
         raise ValueError(f"Unsupported play terrain mode: {terrain_mode}")
 
     # Genesis currently validates heightfields, while the other backends use the
@@ -34,13 +34,23 @@ def configure_play_terrain(env_cfg, terrain_mode):
     env_cfg.terrain.border_size = 2.0
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.selected = True
-    env_cfg.terrain.terrain_kwargs = {
-        "type": "terrain_utils.random_uniform_terrain",
-        "min_height": -0.025,
-        "max_height": 0.025,
-        "step": 0.005,
-        "downsampled_scale": 0.25,
-    }
+    if terrain_mode == "bumpy":
+        env_cfg.terrain.terrain_kwargs = {
+            "type": "terrain_utils.random_uniform_terrain",
+            "min_height": -0.025,
+            "max_height": 0.025,
+            "step": 0.005,
+            "downsampled_scale": 0.25,
+        }
+    else:
+        env_cfg.terrain.terrain_kwargs = {
+            "type": "terrain_utils.rough_stairs_course",
+            "min_height": -0.025,
+            "max_height": 0.025,
+            "roughness_step": 0.005,
+            "stair_height": 0.08,
+            "stair_width": 0.45,
+        }
 
 
 def override_configs(env_cfg, args, task_type):
@@ -156,7 +166,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
             env.commands[:, 2] = cmd[2]
         
         # set the viewer camera to follow the first environment by default
-        if args.follow_robot:
+        if args.follow_robot and viser_viewer is None:
             pos = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.pos, dtype=np.float32)
             lookat = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.lookat, dtype=np.float32)
             env.set_viewer_camera(pos, lookat)
@@ -254,6 +264,32 @@ def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
     print('Exported policy as jit script to: ', path)
     if args.export_onnx:
         print('Exported policy as onnx to: ', path)
+
+
+def load_oracle_id_actor_for_playback(alg_runner, train_cfg):
+    """Load the deployable P5 actor without requiring an old critic to match.
+
+    The July P5 checkpoint predates the current velocity-augmented critic.  The
+    critic is never called by play.py; retaining its shape mismatch must not
+    block an otherwise byte-compatible 50-D actor from visual playback.
+    """
+    log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
+    checkpoint_path = get_load_path(
+        log_root,
+        load_run=train_cfg.runner.load_run,
+        checkpoint=train_cfg.runner.checkpoint,
+    )
+    checkpoint = torch.load(checkpoint_path, map_location=alg_runner.device, weights_only=False)
+    state = checkpoint['model_state_dict']
+    actor_state = {
+        name.removeprefix('actor.'): value
+        for name, value in state.items()
+        if name.startswith('actor.')
+    }
+    alg_runner.alg.actor_critic.actor.load_state_dict(actor_state, strict=True)
+    if 'std' in state:
+        alg_runner.alg.actor_critic.std.data.copy_(state['std'])
+    print(f"Loaded playback actor from: {checkpoint_path} (legacy critic skipped)")
     
 
 def play(args):
@@ -279,7 +315,14 @@ def play(args):
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     # load policy
     train_cfg.runner.resume = True
+    # P5's selected July checkpoint has a 50-D critic whereas current code
+    # builds a 53-D critic.  The 50-D actor is unchanged and is all play needs.
+    actor_only_playback = args.task == 'go2_bench_oracle_id'
+    if actor_only_playback:
+        train_cfg.runner.resume = False
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    if actor_only_playback:
+        load_oracle_id_actor_for_playback(ppo_runner, train_cfg)
     policy = ppo_runner.get_inference_policy(device=env.device)
     
     # export policy as a jit module (used to run it from C++ or python)

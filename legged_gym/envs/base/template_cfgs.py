@@ -152,6 +152,23 @@ class LeggedRobotDreamwaqCfgPPO(LeggedRobotCfgPPO):
         algorithm_class_name = "PPO_DreamWaQ"
 
 
+# ----- Template configuration for HIM (Hybrid Internal Model) -----#
+class LeggedRobotHIMCfgPPO(LeggedRobotCfgPPO):
+    runner_class_name = "HIMRunner"
+    class policy( LeggedRobotCfgPPO.policy ):
+        # estimator config (forwarded to HIMEstimator via HIMActorCritic)
+        enc_hidden_dims = [128, 64, 16]   # latent = 16
+        tar_hidden_dims = [128, 64]
+        num_prototype = 32
+        temperature = 3.0
+        learning_rate = 1.e-3             # estimator's own optimizer
+        max_grad_norm = 10.0              # estimator grad clip
+
+    class runner( LeggedRobotCfgPPO.runner ):
+        policy_class_name = "HIMActorCritic"
+        algorithm_class_name = "PPO_HIM"
+
+
 # ----- Template configuration for CaT (Constraints as Termination) -----#
 class LeggedRobotCTSCfg(LeggedRobotCfg):
     class env( LeggedRobotCfg.env ):

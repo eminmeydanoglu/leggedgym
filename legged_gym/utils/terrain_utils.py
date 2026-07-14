@@ -119,6 +119,52 @@ def random_uniform_terrain(terrain : SubTerrain,
     
     return terrain
 
+
+def rough_stairs_course(terrain: SubTerrain,
+                        min_height: float = -0.025,
+                        max_height: float = 0.025,
+                        roughness_step: float = 0.005,
+                        stair_height: float = 0.08,
+                        stair_width: float = 0.45,
+                        terrain_type: str = None) -> SubTerrain:
+    """A compact play-only course: rough ground followed by a central stair lane.
+
+    The robot starts on the rough, mostly flat first half and encounters four
+    ascending steps while walking forward.  It is intentionally heightfield
+    based so Genesis and the viser viewer receive the same world geometry.
+    """
+    if terrain_type in [None, "plane"]:
+        raise ValueError("rough_stairs_course requires heightfield or trimesh terrain")
+
+    random_uniform_terrain(
+        terrain,
+        min_height=min_height,
+        max_height=max_height,
+        step=roughness_step,
+        downsampled_scale=0.25,
+        terrain_type=terrain_type,
+    )
+
+    x_start = int(0.58 * terrain.length)
+    step_width_px = max(1, int(stair_width / terrain.horizontal_scale))
+    step_height_px = int(stair_height / terrain.vertical_scale)
+    lane_margin = int(0.15 * terrain.width)
+    y_start, y_stop = lane_margin, terrain.width - lane_margin
+    base_height = int(np.median(terrain.height_field_raw[
+        max(0, x_start - step_width_px):x_start + 1, y_start:y_stop
+    ]))
+
+    for level in range(1, 5):
+        start = x_start + (level - 1) * step_width_px
+        stop = min(terrain.length, start + step_width_px)
+        if start >= terrain.length:
+            break
+        terrain.height_field_raw[start:stop, y_start:y_stop] = (
+            base_height + level * step_height_px
+        )
+
+    return terrain
+
 def pyramid_sloped_terrain(terrain: SubTerrain, 
                            slope: float = 1, 
                            platform_size: float = 1., 
