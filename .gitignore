@@ -16,6 +16,7 @@ dist/
 !/scripts/run_v2_campaign_on_a100.sh
 !/scripts/run_action_quad.sh
 !/scripts/action_quad.sbatch
+!/scripts/action_one.sbatch
 # Compiled Java class files
 *.class
 
