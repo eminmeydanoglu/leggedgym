@@ -80,15 +80,15 @@ echo "[rma-dw-v2] $(ts) launching $SHARDS parallel run shards"
 pids=()
 for ((i=0; i<SHARDS; i++)); do
   shard_log="$root/shard_${i}_of_${SHARDS}.log"
-  echo "[rma-dw-v2] start shard $i/$SHARDS -> $shard_log"
+  # Spread CPU affinity so shards don't fight on the same cores.
+  base=$(( i * THREADS_PER ))
+  end=$(( base + THREADS_PER - 1 ))
+  echo "[rma-dw-v2] start shard $i/$SHARDS cpus=${base}-${end} -> $shard_log"
   (
     export OMP_NUM_THREADS="$THREADS_PER"
     export MKL_NUM_THREADS="$THREADS_PER"
     export OPENBLAS_NUM_THREADS="$THREADS_PER"
     export TORCH_NUM_THREADS="$THREADS_PER"
-    # Spread CPU affinity so shards don't fight on the same cores.
-    base=$(( i * THREADS_PER ))
-    end=$(( base + THREADS_PER - 1 ))
     if command -v taskset >/dev/null 2>&1; then
       exec taskset -c "${base}-${end}" \
         "$python" -u -m legged_gym.scripts.eval.campaign run \
