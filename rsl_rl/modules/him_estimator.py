@@ -21,7 +21,9 @@ class HIMEstimator(nn.Module):
     The explicit head regresses the next base linear velocity.
 
     Critic-obs layout contract (see Go2BenchHIM.compute_observations):
-        next_critic_obs = [base_lin_vel(3), one_step_obs(num_one_step_obs), P(...)]
+        next_critic_obs starts with the newest frame
+            [base_lin_vel(3), one_step_obs(num_one_step_obs), P(...)]
+        and may contain older critic frames after it,
     so ``vel  = next_critic_obs[:, 0:3]`` and
        ``next_obs = next_critic_obs[:, 3:3 + num_one_step_obs]``.
     """
@@ -94,7 +96,7 @@ class HIMEstimator(nn.Module):
         Args:
             obs_history: stacked history the encoder reads. Shape (B, T*one_step).
             next_critic_obs: critic obs AFTER the env step, laid out as
-                ``[base_lin_vel(3), one_step_obs(num_one_step_obs), P(...)]``.
+                newest-first with ``[base_lin_vel(3), one_step_obs, P]`` first.
             terminated: ``(1 - dones)`` mask, shape (B, 1). Cross-boundary
                 velocity targets are invalid (env resets on done), so the
                 explicit estimation MSE is masked by it.

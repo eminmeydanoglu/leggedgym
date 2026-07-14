@@ -197,8 +197,17 @@ class TestInDistValidationField(unittest.TestCase):
 class TestSweepAxisIsolation(unittest.TestCase):
     def test_registry_covers_p5(self):
         import legged_gym.scripts.eval.dr_axes as dr
-        # every sweep axis maps to a privileged param
+        # Every sweep axis is classified. P-observed physics axes map to their
+        # privileged field; structural OOD axes explicitly map to None.
         self.assertEqual(set(dr._AXIS_TO_PRIV), set(dr.AXES))
+        self.assertEqual(
+            {axis for axis, privileged in dr._AXIS_TO_PRIV.items() if privileged is None},
+            {"control_delay", "pd_gain_scale"},
+        )
+        self.assertTrue(
+            {privileged for privileged in dr._AXIS_TO_PRIV.values() if privileged is not None}
+            <= set(dr._PRIVILEGED_PARAMS)
+        )
         # P5 privileged params = friction, added_mass, com_bias(3)
         self.assertEqual(set(dr._PRIVILEGED_PARAMS), {"friction", "added_mass", "com_bias"})
 
@@ -219,6 +228,21 @@ class TestSweepAxisIsolation(unittest.TestCase):
         # friction is the swept axis -> must NOT be pinned; the others must be
         self.assertNotIn("friction", called)
         self.assertEqual(set(called), {"added_mass", "com_bias"})
+
+    def test_structural_axis_pins_every_p5_field(self):
+        import legged_gym.scripts.eval.dr_axes as dr
+        called = []
+        original = dr._PRIVILEGED_PARAMS
+        dr._PRIVILEGED_PARAMS = {
+            name: ((lambda n: (lambda env, v: called.append(n)))(name), nominal)
+            for name, (setter, nominal) in original.items()
+        }
+        try:
+            fake_env = types.SimpleNamespace(num_envs=4, device="cpu")
+            dr.pin_others_to_nominal(fake_env, "control_delay")
+        finally:
+            dr._PRIVILEGED_PARAMS = original
+        self.assertEqual(set(called), {"friction", "added_mass", "com_bias"})
 
     def test_unknown_axis_raises(self):
         import legged_gym.scripts.eval.dr_axes as dr

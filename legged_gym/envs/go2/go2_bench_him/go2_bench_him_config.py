@@ -6,13 +6,15 @@ from legged_gym.envs.base.common_cfgs import Go2BenchmarkCommonCfg, get_simulato
 class Go2BenchHIMCfg(Go2BenchmarkCommonCfg):
     """HIM on the frozen benchmark substrate. Inherits the frozen flat terrain,
     frozen band DR, reward scales and commands from Go2BenchmarkCommonCfg; adds
-    the HIM history / single-frame-critic obs dims."""
+    the HIM actor-history and shared five-frame critic dims."""
     class env(Go2BenchmarkCommonCfg.env):
         num_envs = 4096                                     # fairness: match the family
         num_one_step_obs = 45                               # single proprio frame
         frame_stack = 6                                     # temporal_steps for the estimator
         num_observations = frame_stack * num_one_step_obs   # 270 (actor obs = history)
-        num_privileged_obs = 3 + num_one_step_obs + 5       # [base_lin_vel, one_step, P] = 53
+        c_frame_stack = 5                                   # match the other adaptive critics
+        num_single_critic_obs = 3 + num_one_step_obs + 5    # [base_lin_vel, one_step, P] = 53
+        num_privileged_obs = c_frame_stack * num_single_critic_obs  # 265
         num_actions = 12
 
 
@@ -48,3 +50,4 @@ class Go2BenchHIMCfgPPO(LeggedRobotHIMCfgPPO):
         eval_warmup = 50         # unrecorded settling steps
         eval_seed = 12345        # fixed -> comparable across checkpoints within a run
         eval_fall_guard = 0.05   # V2 safe fixed-window fall-rate threshold
+        critic_contract = "stacked_5x53_265d"

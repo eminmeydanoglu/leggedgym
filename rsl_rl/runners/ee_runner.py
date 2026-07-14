@@ -74,9 +74,14 @@ class EERunner(OnPolicyRunner):
     
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         self._pre_learn(init_at_random_ep_len)
+        if self.training_seed is not None:
+            print(f"[train] seed={self.training_seed} "
+                  f"start_iter={self.current_learning_iteration}")
+        # land on the correct schedule stage for the (possibly resumed) start iter
+        self._apply_command_schedule(self.current_learning_iteration)
         estimator_features, estimator_labels, privileged_obs= self.env.get_observations()
         critic_obs = privileged_obs if privileged_obs is not None else torch.cat((
-            estimator_features, 
+            estimator_features,
             estimator_labels,
         ), dim=-1
         )
@@ -92,20 +97,22 @@ class EERunner(OnPolicyRunner):
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            # advance the command schedule if this iteration crosses a stage boundary
+            self._apply_command_schedule(it)
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(estimator_features, critic_obs, estimator_labels)
                     estimator_features, estimator_labels, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else torch.cat((
-                        estimator_features, 
+                        estimator_features,
                         estimator_labels,
                         ), dim=-1
                     )
                     estimator_features, estimator_labels, critic_obs, rewards, dones = estimator_features.to(self.device), \
                         estimator_labels.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
-                    
+
                     if self.log_dir is not None:
                         # Book keeping
                         if 'episode' in infos:
@@ -130,12 +137,45 @@ class EERunner(OnPolicyRunner):
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            completed_iteration = self.completed_iteration(it)
+            if completed_iteration % self.save_interval == 0:
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(completed_iteration)),
+                          iteration=completed_iteration)
+
+            # Periodic in-distribution eval -> Eval/* + best_tracking.pt selection,
+            # driven by the deployed estimator+actor policy (feature history only).
+            if self.eval_interval > 0 and completed_iteration % self.eval_interval == 0:
+                with torch.inference_mode():
+                    self._run_eval(completed_iteration)
+                estimator_features, estimator_labels, privileged_obs = self.env.get_observations()
+                critic_obs = privileged_obs if privileged_obs is not None else torch.cat(
+                    (estimator_features, estimator_labels), dim=-1)
+                estimator_features, estimator_labels, critic_obs = (
+                    estimator_features.to(self.device), estimator_labels.to(self.device),
+                    critic_obs.to(self.device),
+                )
+                cur_reward_sum.zero_()
+                cur_episode_length.zero_()
+                self.alg.actor_critic.train()
             ep_infos.clear()
-        
+
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
+    # --- deploy / eval contract overrides (see rsl_rl/runners/eval_adapter.py) ---
+    def _aux_optimizers(self):
+        return {"estimator_optimizer_state_dict": self.alg.estimator_optimizer}
+
+    def deploy_state_prefixes(self):
+        return ("actor.", "estimator.")
+
+    def get_eval_adapter(self, device=None):
+        from rsl_rl.runners.eval_adapter import FeatureHistoryAdapter
+        self.alg.actor_critic.eval()
+        dev = torch.device(device) if device is not None else self.device
+        if device is not None:
+            self.alg.actor_critic.to(device)
+        return FeatureHistoryAdapter(self.alg.actor_critic.act_inference, dev)
 
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs

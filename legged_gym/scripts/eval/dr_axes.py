@@ -241,7 +241,8 @@ def get_axis(name: str) -> Axis:
 # three components.  friction and added_mass are scalars.
 #
 # AXIS_TO_PRIV maps a sweep-axis name to its privileged-param name so
-# pin_others_to_nominal can skip the correct entry.
+# pin_others_to_nominal can skip the correct entry. Structural OOD axes that
+# are not observed in P map to None; sweeping one of them pins every P field.
 #
 # INVARIANT: if you add a new dim to the oracle's P, add it here AND in
 # AXIS_TO_PRIV (if it is also a sweep axis) -- otherwise a sweep will
@@ -260,6 +261,8 @@ _AXIS_TO_PRIV = {
     "com_x":      "com_bias",
     "com_y":      "com_bias",
     "com_z":      "com_bias",
+    "pd_gain_scale": None,
+    "control_delay": None,
 }
 
 
@@ -275,14 +278,16 @@ def pin_others_to_nominal(env, swept: str):
     in _PRIVILEGED_PARAMS.  If a future dimension is not registered here, eval will
     silently read whatever value the simulator left in that buffer.
 
-    Raises KeyError if `swept` is not a recognised sweep axis (fail-loud contract).
+    Structural axes such as control delay have no privileged P dimension, so
+    sweeping them pins the entire privileged vector to nominal. Raises KeyError
+    if `swept` is not a recognised sweep axis (fail-loud contract).
     """
     if swept not in _AXIS_TO_PRIV:
         raise KeyError(
             f"pin_others_to_nominal: '{swept}' is not a known sweep axis. "
             f"Known axes: {list(_AXIS_TO_PRIV)}. "
-            "If you added a new axis, also register it in _AXIS_TO_PRIV (and "
-            "_PRIVILEGED_PARAMS if it has a privileged dimension)."
+            "If you added a new axis, register it in _AXIS_TO_PRIV with None "
+            "(or in _PRIVILEGED_PARAMS too if it has a privileged dimension)."
         )
     swept_priv = _AXIS_TO_PRIV[swept]
 

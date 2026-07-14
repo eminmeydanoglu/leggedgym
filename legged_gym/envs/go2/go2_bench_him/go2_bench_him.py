@@ -23,8 +23,9 @@ class Go2BenchHIM(GO2):
         obs_buf (270)      = noisy one_step history, frame_stack=6, NEWEST-FIRST
                              so obs_buf[:, :45] is the current frame (the actor's
                              current-frame slice; estimator encodes the whole 270)
-        privileged_obs_buf (53) = [base_lin_vel(3), clean one_step_obs(45), P(5)]
-                             single frame; critic value input + estimator target.
+        privileged_obs_buf (265) = 5 newest-first frames of
+                             [base_lin_vel(3), clean one_step_obs(45), P(5)].
+                             The newest 53D frame is also the estimator target.
 
     Canonical P = [dr_friction_values(1), dr_added_base_mass(1),
     dr_base_com_bias(3)] = 5 (normalised band-DR, single source of truth).
@@ -53,9 +54,16 @@ class Go2BenchHIM(GO2):
         ), dim=-1)
         base_lin_vel = self.simulator.base_lin_vel * self.obs_scales.lin_vel  # 3
 
-        # single-frame clean critic obs = [base_lin_vel, one_step_obs, P] = 53
-        # (layout contract consumed by HIMEstimator.update)
-        self.privileged_obs_buf = torch.cat((base_lin_vel, one_step_obs, P), dim=-1)
+        # Clean critic frame = [base_lin_vel, one_step_obs, P] = 53. Stack five
+        # frames newest-first, matching the other adaptive benchmark critics.
+        # HIMEstimator.update consumes the first (current) frame as its target.
+        critic_frame = torch.cat((base_lin_vel, one_step_obs, P), dim=-1)
+        self.critic_history_deque.append(critic_frame)
+        self.privileged_obs_buf = torch.cat(
+            [self.critic_history_deque[self.c_frame_stack - 1 - i]
+             for i in range(self.c_frame_stack)],
+            dim=-1,
+        )
 
         # noisy current frame -> actor history (noise on the actor obs only)
         noisy_obs = one_step_obs.clone()
@@ -87,6 +95,8 @@ class Go2BenchHIM(GO2):
         super()._parse_cfg(cfg)
         self.num_one_step_obs = self.cfg.env.num_one_step_obs
         self.frame_stack = self.cfg.env.frame_stack
+        self.c_frame_stack = self.cfg.env.c_frame_stack
+        self.num_single_critic_obs = self.cfg.env.num_single_critic_obs
 
     def _init_buffers(self):
         super()._init_buffers()
@@ -101,9 +111,21 @@ class Go2BenchHIM(GO2):
                     device=self.device,
                 )
             )
+        self.critic_history_deque = deque(maxlen=self.c_frame_stack)
+        for _ in range(self.c_frame_stack):
+            self.critic_history_deque.append(
+                torch.zeros(
+                    self.num_envs,
+                    self.num_single_critic_obs,
+                    dtype=torch.float,
+                    device=self.device,
+                )
+            )
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
         # clear obs history for the envs that are reset
         for i in range(self.obs_history_deque.maxlen):
             self.obs_history_deque[i][env_ids] *= 0
+        for i in range(self.critic_history_deque.maxlen):
+            self.critic_history_deque[i][env_ids] *= 0

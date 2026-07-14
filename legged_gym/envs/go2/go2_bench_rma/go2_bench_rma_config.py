@@ -44,3 +44,21 @@ class Go2BenchRMACfgPPO(LeggedRobotTSCfgPPO):
         run_name = 'bench_rma' + get_simulator_suffix()
         save_interval = 200
         max_iterations = 3000
+        # --- iteration-based command schedule (shared by all benchmark methods) ---
+        command_schedule = [
+            {"start_iteration": 0,   "lin_vel_x": [-0.5, 0.5]},
+            {"start_iteration": 500, "lin_vel_x": [-1.0, 1.0]},
+        ]
+        # --- in-distribution eval + best_tracking.pt (shared by all methods) ---
+        # Eval runs the DEPLOYED student (history encoder), so the checkpoint is
+        # picked on what ships, not on the privileged teacher (RMA blocker).
+        eval_interval = 200      # iters between evals (0 disables); aligns with save_interval
+        eval_steps = 1100        # >= max_episode_length+1 (1001) so returns are complete
+        eval_warmup = 50         # unrecorded settling steps
+        eval_seed = 12345        # fixed -> comparable across checkpoints within a run
+        eval_fall_guard = 0.05   # V2 safe fixed-window fall-rate threshold
+        # 1.8 critic-contract disclosure: RMA trains on a 5x53=265D stacked
+        # privileged critic (its native design), NOT the 53D single-frame critic
+        # used by MLP/P5/HIM. Recorded so the family is reported as a
+        # method-package comparison, not a controlled single-critic ablation.
+        critic_contract = "stacked_5x53_265d"

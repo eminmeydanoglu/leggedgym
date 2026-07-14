@@ -18,6 +18,7 @@ class ActorCriticEE(nn.Module):
                  num_actions,
                  num_estimator_features,
                  num_estimator_labels,
+                 num_actor_obs=None,
                  actor_hidden_dims=[256, 256, 256],
                  critic_hidden_dims=[256, 256, 256],
                  estimator_hidden_dims=[256, 128],
@@ -32,7 +33,10 @@ class ActorCriticEE(nn.Module):
 
         activation = get_activation(activation)
 
-        mlp_input_dim_a = num_estimator_features + num_estimator_labels
+        self.num_actor_obs = int(num_actor_obs or num_estimator_features)
+        if self.num_actor_obs > num_estimator_features:
+            raise ValueError("num_actor_obs cannot exceed num_estimator_features")
+        mlp_input_dim_a = self.num_actor_obs + num_estimator_labels
         # input of the critic is the concatenation of actor observation and the latent from the privilege encoder
         mlp_input_dim_c = num_critic_obs
 
@@ -114,9 +118,10 @@ class ActorCriticEE(nn.Module):
 
     def update_distribution(self, estimator_features):
         estimator_output = self.estimator(estimator_features)
+        actor_obs = estimator_features[:, -self.num_actor_obs:]
         mean = self.actor(torch.cat(
             (
-            estimator_features, 
+            actor_obs,
             estimator_output
             ), dim=-1))
         self.distribution = Normal(mean, mean*0. + self.std)
@@ -134,9 +139,10 @@ class ActorCriticEE(nn.Module):
     
     def act_inference(self, estimator_features):
         estimator_output = self.estimator(estimator_features)
+        actor_obs = estimator_features[:, -self.num_actor_obs:]
         actions_mean = self.actor(torch.cat(
             (
-            estimator_features, 
+            actor_obs,
             estimator_output
             ), dim=-1))
         return actions_mean

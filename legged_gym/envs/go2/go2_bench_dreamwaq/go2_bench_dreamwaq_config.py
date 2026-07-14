@@ -39,3 +39,15 @@ class Go2BenchDreamwaqCfgPPO(LeggedRobotDreamwaqCfgPPO):
         run_name = 'bench_dreamwaq' + get_simulator_suffix()
         save_interval = 200
         max_iterations = 3000
+        command_schedule = [
+            {"start_iteration": 0, "lin_vel_x": [-0.5, 0.5]},
+            {"start_iteration": 500, "lin_vel_x": [-1.0, 1.0]},
+        ]
+        eval_interval = 200
+        eval_steps = 1100
+        eval_warmup = 50
+        eval_seed = 12345
+        eval_fall_guard = 0.05
+        # Native five-frame critic is intentionally retained. Results are a
+        # method-package comparison, not a controlled single-critic ablation.
+        critic_contract = "stacked_5x53_265d"

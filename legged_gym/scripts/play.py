@@ -43,6 +43,19 @@ def configure_play_terrain(env_cfg, terrain_mode):
             "downsampled_scale": 0.25,
         }
     else:
+        # Quantize the collider dimensions exactly as rough_stairs_course does
+        # when it turns metres into heightfield samples.
+        stair_width = 0.45
+        horizontal_scale = env_cfg.terrain.horizontal_scale
+        env_cfg.terrain.play_stair_collision_spec = {
+            "x_start": int(0.58 * (env_cfg.terrain.terrain_length / horizontal_scale)) * horizontal_scale,
+            "step_width": max(1, int(stair_width / horizontal_scale)) * horizontal_scale,
+            "y_start": int(0.15 * (env_cfg.terrain.terrain_width / horizontal_scale)) * horizontal_scale,
+            "y_stop": (int(env_cfg.terrain.terrain_width / horizontal_scale)
+                       - int(0.15 * (env_cfg.terrain.terrain_width / horizontal_scale))) * horizontal_scale,
+            "step_height": 0.08,
+            "num_steps": 4,
+        }
         env_cfg.terrain.terrain_kwargs = {
             "type": "terrain_utils.rough_stairs_course",
             "min_height": -0.025,
@@ -87,9 +100,10 @@ def override_configs(env_cfg, args, task_type):
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [-1.0, 1.0]
     env_cfg.commands.ranges.heading = [0.0, 0.0]
-    
-    if args.use_joystick:
-        env_cfg.commands.heading_command = False
+    # Interactive controls write a yaw-rate directly to commands[:, 2].  Heading
+    # mode would overwrite that value every physics step from commands[:, 3], so
+    # disable it for both joystick and Viser control.
+    env_cfg.commands.heading_command = False
     
     if args.viewer == "viser":
         args.headless = True

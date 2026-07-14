@@ -1,0 +1,54 @@
+# Local RTX smoke campaign for the four adaptive benchmark contracts. Each
+# model records its own pilot seed so run-manifest validation remains strict.
+campaign: go2_adaptive_smoke
+artifact_root: logs/eval/go2_adaptive_smoke_200
+simulator: genesis
+smoke_only: true
+training_seeds: []
+models:
+  - label: HIM
+    task: go2_bench_him
+    checkpoint: 200
+    training_seeds: [101]
+    run_folders: {101: Jul14_11-02-51_bench_him_genesis_seed101}
+  - label: RMA
+    task: go2_bench_rma
+    checkpoint: 200
+    training_seeds: [102]
+    run_folders: {102: Jul14_11-05-14_bench_rma_genesis_seed102}
+  - label: SysID
+    task: go2_bench_sysid
+    checkpoint: 200
+    training_seeds: [103]
+    run_folders: {103: Jul14_11-07-37_bench_sysid_genesis_seed103}
+  - label: DreamWaQ
+    task: go2_bench_dreamwaq
+    checkpoint: 200
+    training_seeds: [104]
+    run_folders: {104: Jul14_11-09-59_bench_dreamwaq_genesis_seed104}
+protocol:
+  validation: {seed: 31001, num_envs: 8, warmup: 3, steps: 12}
+  id: {seed: 41001, num_envs: 8, warmup: 3, steps: 16}
+  axes: {seed: 41001, warmup: 3, steps: 12, replicas: 1, magnitudes: [0.5, 1.5]}
+  hard:
+    seed: 41001
+    warmup: 3
+    steps: 12
+    terrain_replicas: 8
+    terrain_horizontal_scale: 0.2
+    kick_replicas: 2
+    step_replicas: 2
+    terrain_cm: [5]
+    lateral_kick_mps: [0, 1.0]
+    kick_step: 3
+    recovery_steps: 9
+    step_amplitudes: [1.0, 2.0]
+    phase_steps: 4
+axes:
+  added_mass: {grid: [-2, 5], in_distribution: [-1, 1], unit: kg}
+  friction: {grid: [0.1, 2.5], in_distribution: [0.5, 1.25], unit: ratio}
+  com_x: {grid: [-0.08, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  com_y: {grid: [-0.08, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  com_z: {grid: [-0.08, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  pd_gain_scale: {grid: [0.5, 1.5], in_distribution: [1.0, 1.0], unit: scale}
+  control_delay: {grid: [0, 2], in_distribution: [0, 0], unit: control_step}

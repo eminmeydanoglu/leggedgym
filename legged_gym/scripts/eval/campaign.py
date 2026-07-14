@@ -116,11 +116,21 @@ def _validation_relpath(model: str, seed: int, iteration: int) -> str:
     return _cell_path("validation", model, seed, f"model_{iteration}") + ".npz"
 
 
+def _model_seeds(cfg: Dict[str, Any], model: Dict[str, Any]) -> List[int]:
+    """Return model-local seeds when supplied, otherwise the campaign seeds.
+
+    Adaptive smoke runs are often produced sequentially with distinct seed IDs;
+    allowing a model-local list keeps one campaign config honest without fake
+    run-folder aliases. Full campaigns continue to use the shared global list.
+    """
+    return [int(seed) for seed in model.get("training_seeds", cfg["training_seeds"])]
+
+
 def _expected_validation_relpaths(cfg: Dict[str, Any]) -> List[str]:
     """Checkpoint-validation artifacts discovered from the declared run folders."""
     paths = []
     for model in cfg["models"]:
-        for seed in cfg["training_seeds"]:
+        for seed in _model_seeds(cfg, model):
             run = _run_dir(model, seed)
             candidates = sorted(run.glob("model_*.pt"), key=_checkpoint_iter)
             if not candidates and cfg.get("smoke_only"):
@@ -217,8 +227,8 @@ def _registry_args(task: str, run_folder: str, ckpt: int | str) -> SimpleNamespa
 @dataclass
 class Session:
     env: Any
-    policy: Any
-    actor: Any
+    adapter: Any
+    runner: Any
     checkpoint: Path
     run_dir: Path
     model: Dict[str, Any]
@@ -281,15 +291,15 @@ def build_session(
     run_folder = run_dir.name
     args = _registry_args(model["task"], run_folder, ckpt_spec)
     env, _ = task_registry.make_env(name=model["task"], args=args, env_cfg=env_cfg)
-    # Evaluation consumes only the actor.  Historical local seed-2 checkpoints
-    # predate a critic-observation layout change (45 -> 48); loading the complete
-    # ActorCritic would reject an otherwise exact actor/task/checkpoint match.
-    # Build without runner resume, then load and validate the actor *strictly*.
+    # Build without runner resume, then strictly load every component consumed by
+    # deployed inference. The runner owns the method contract (actor-only for
+    # MLP/P5, actor+history/VAE/estimator for adaptive methods), while critic
+    # layout changes remain irrelevant to evaluation.
     train_cfg.runner.resume = False
     runner, _ = task_registry.make_alg_runner(env=env, name=model["task"], args=args, train_cfg=train_cfg)
-    actor = runner.alg.actor_critic.actor
-    _load_actor(actor, checkpoint, env.device)
-    return Session(env, runner.get_inference_policy(device=env.device), actor, checkpoint, run_dir, model, seed)
+    runner.load_deploy_state(str(checkpoint), map_location=env.device)
+    adapter = runner.get_eval_adapter(device=env.device)
+    return Session(env, adapter, runner, checkpoint, run_dir, model, seed)
 
 
 def _set_nominal(env) -> None:
@@ -328,7 +338,7 @@ def _terrain_hash(raw: np.ndarray) -> str:
 
 @torch.no_grad()
 def rollout(session: Session, commands: np.ndarray, *, warmup: int, steps: int, schedule_every: int = 500, seed: int | None = None) -> Dict[str, np.ndarray]:
-    env, policy = session.env, session.policy
+    env, adapter = session.env, session.adapter
     command_t = torch.as_tensor(commands, device=env.device, dtype=torch.float)
     if command_t.shape != (env.num_envs, 3):
         raise ValueError(f"commands must be ({env.num_envs}, 3), got {tuple(command_t.shape)}")
@@ -336,11 +346,10 @@ def rollout(session: Session, commands: np.ndarray, *, warmup: int, steps: int, 
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    env.reset()
-    obs = env.get_observations()
+    state = adapter.reset(env)
     for _ in range(warmup):
         env.commands[:, :3] = command_t
-        obs, _, _, _, _ = env.step(policy(obs.detach()).detach())
+        state, _, _ = adapter.step(env, adapter.act(state).detach())
     env.episode_length_buf.zero_()
     acc = MetricAccumulator(env.num_envs, env.device)
     for t in range(steps):
@@ -348,7 +357,7 @@ def rollout(session: Session, commands: np.ndarray, *, warmup: int, steps: int, 
             # deterministic circular schedule: no policy-dependent RNG draws.
             command_t = command_t.roll(shifts=1, dims=0)
         env.commands[:, :3] = command_t
-        obs, _, rew, dones, _ = env.step(policy(obs.detach()).detach())
+        state, rew, dones = adapter.step(env, adapter.act(state).detach())
         lin = torch.linalg.vector_norm(env.commands[:, :2] - env.simulator.base_lin_vel[:, :2], dim=1)
         yaw = (env.commands[:, 2] - env.simulator.base_ang_vel[:, 2]).abs()
         acc.update(rew, dones, env.time_out_buf, lin, yaw)
@@ -368,14 +377,14 @@ def _rollout_schedule(
     phase_bounds: List[Tuple[int, int]] | None = None,
 ) -> Dict[str, np.ndarray]:
     """V2 scheduler for hard scenarios, with optional per-env lateral kick."""
-    env, policy = session.env, session.policy
+    env, adapter = session.env, session.adapter
     if command_schedule.ndim != 3 or command_schedule.shape[1:] != (env.num_envs, 3):
         raise ValueError(f"command schedule must be (T,{env.num_envs},3), got {tuple(command_schedule.shape)}")
     warm = torch.as_tensor(warmup_command, dtype=torch.float, device=env.device)
-    env.reset(); obs = env.get_observations()
+    state = adapter.reset(env)
     for _ in range(warmup):
         env.commands[:, :3] = warm
-        obs, _, _, _, _ = env.step(policy(obs.detach()).detach())
+        state, _, _ = adapter.step(env, adapter.act(state).detach())
     env.episode_length_buf.zero_()
     acc = MetricAccumulator(env.num_envs, env.device)
     phase_accs = [MetricAccumulator(env.num_envs, env.device) for _ in (phase_bounds or [])]
@@ -386,7 +395,7 @@ def _rollout_schedule(
             qvel = sim._robot.get_dofs_velocity()
             qvel[:, 1] += dvy
             sim._robot.set_dofs_velocity(qvel)
-        obs, _, rew, dones, _ = env.step(policy(obs.detach()).detach())
+        state, rew, dones = adapter.step(env, adapter.act(state).detach())
         lin = torch.linalg.vector_norm(env.commands[:, :2] - env.simulator.base_lin_vel[:, :2], dim=1)
         yaw = (env.commands[:, 2] - env.simulator.base_ang_vel[:, 2]).abs()
         acc.update(rew, dones, env.time_out_buf, lin, yaw)
@@ -431,7 +440,7 @@ def _planned_cells(cfg: Dict[str, Any], suite: str) -> List[Tuple[str, Dict[str,
     out = []
     suites = ("id", "axes", "hard") if suite == "all" else (suite,)
     for model in cfg["models"]:
-        for seed in cfg["training_seeds"]:
+        for seed in _model_seeds(cfg, model):
             if "id" in suites:
                 out.append(("id", model, seed, "id"))
             if "axes" in suites:
@@ -456,7 +465,7 @@ def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
     """Selection is deliberately conservative: this command will not silently use best.pt."""
     root = artifact_root(cfg); root.mkdir(parents=True, exist_ok=True)
     rows = []; protocol = cfg["protocol"]["validation"]
-    work = [(model, seed) for model in cfg["models"] for seed in cfg["training_seeds"]]
+    work = [(model, seed) for model in cfg["models"] for seed in _model_seeds(cfg, model)]
     assigned = shard_items(work, shard)
     print(f"[selection] shard={shard[0]}/{shard[1]} runs={len(assigned)} "
           f"protocol={protocol['num_envs']}env×{protocol['steps']}steps")
@@ -499,7 +508,7 @@ def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
                     vals = {key: np.asarray(z[key]) for key in METRICS}
                 print(f"[selection] resume {artifact.name}", flush=True)
             else:
-                _load_actor(session.actor, ckpt, session.env.device)
+                session.runner.load_deploy_state(str(ckpt), map_location=session.env.device)
                 session.checkpoint = ckpt
                 vals = rollout(session, commands, warmup=protocol["warmup"], steps=protocol["steps"], seed=protocol["seed"])
                 payload = _meta(session, "validation", "checkpoint_selection", protocol["seed"],
@@ -774,24 +783,53 @@ def cmd_aggregate(cfg: Dict[str, Any]) -> int:
     out=root/"tables"; out.mkdir(parents=True, exist_ok=True)
     with open(out/"results.csv", "w", newline="") as f:
         w=csv.DictWriter(f, fieldnames=sorted(rows[0])); w.writeheader(); w.writerows(rows)
+    # Aggregate across training seeds by experimental condition. Checkpoint
+    # iteration/hash and raw artifact provenance describe the selected seed run;
+    # they must not split an otherwise identical condition into n=1 rows.
+    provenance_fields = {
+        "training_seed", "checkpoint_sha256",
+        "mean", "p25", "p50", "p75", "num_replicas",
+        "raw_path", "raw_sha256",
+    }
     groups={}
     for r in rows:
-        k=tuple((x,r[x]) for x in r if x not in ("training_seed","mean","p25","p50","p75","num_replicas","raw_path","raw_sha256")); groups.setdefault(k,[]).append(r["mean"])
+        # Final suites aggregate selected checkpoints across training seeds, so
+        # their per-seed checkpoint iteration is provenance. Validation contains
+        # one artifact per candidate checkpoint: iteration remains a condition or
+        # different learning stages would be miscounted as extra training seeds.
+        excluded = provenance_fields | ({"checkpoint_iter"} if r.get("suite") != "validation" else set())
+        k=tuple((x,r[x]) for x in r if x not in excluded)
+        seed = int(r["training_seed"])
+        by_seed = groups.setdefault(k, {})
+        if seed in by_seed:
+            raise RuntimeError(f"duplicate aggregate cell for training seed {seed}: {dict(k)}")
+        by_seed[seed] = r["mean"]
     summary=[]
-    for k,vals in groups.items():
-        r=dict(k); r.update(value_median=float(np.median(vals)), value_min=float(np.min(vals)), value_max=float(np.max(vals)), n_training_seeds=len(vals)); summary.append(r)
+    for k,by_seed in groups.items():
+        vals=list(by_seed.values())
+        r=dict(k); r.update(value_median=float(np.median(vals)), value_min=float(np.min(vals)), value_max=float(np.max(vals)), n_training_seeds=len(by_seed)); summary.append(r)
     with open(out/"summary.csv", "w", newline="") as f:
         w=csv.DictWriter(f, fieldnames=sorted(summary[0])); w.writeheader(); w.writerows(summary)
     # Paired seed consistency, never a pseudo-statistical confidence interval.
     consistency = []
     comparisons = (("P5 better than MLP", "P5", "MLP"),
                    ("P5+V better than P5", "P5+V", "P5"))
-    match_keys = ("suite", "scenario", "task", "checkpoint_iter", "eval_seed", "axis", "axis_value",
+    # Pair different model tasks on the shared condition and training seed.
+    # Task/checkpoint fields are model-specific provenance, not comparison keys.
+    match_keys = ("suite", "scenario", "checkpoint_iter", "eval_seed", "axis", "axis_value",
                   "axis_is_id", "command_mode", "command_magnitude", "command_is_id", "severity", "phase", "metric")
     groups_by_context: Dict[Tuple[Any, ...], Dict[Tuple[str, int], float]] = {}
     for row in rows:
-        key = tuple(row.get(k) for k in match_keys)
-        groups_by_context.setdefault(key, {})[(str(row["model"]), int(row["training_seed"]))] = float(row["mean"])
+        # As above, compare validation models only at the same candidate
+        # iteration. Final-suite checkpoints were independently selected, so their
+        # iteration is provenance and is normalized away for paired seed checks.
+        key = tuple((row.get(k) if k != "checkpoint_iter" or row.get("suite") == "validation" else None)
+                    for k in match_keys)
+        cell = (str(row["model"]), int(row["training_seed"]))
+        context_values = groups_by_context.setdefault(key, {})
+        if cell in context_values:
+            raise RuntimeError(f"duplicate consistency cell for model/seed {cell}: {key}")
+        context_values[cell] = float(row["mean"])
     for context, values in groups_by_context.items():
         metric = context[-1]
         lower_is_better = metric in ("tracking", "fall_rate")

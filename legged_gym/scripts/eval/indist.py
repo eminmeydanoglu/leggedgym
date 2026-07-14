@@ -61,12 +61,13 @@ def in_dist_command_ranges(env) -> Dict[str, list]:
 @torch.no_grad()
 def run_indist_eval(
     env,
-    policy: Callable[[torch.Tensor], torch.Tensor],
+    policy: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     *,
     steps: int = 1100,
     warmup: int = 50,
     seed: int = 12345,
     command_ranges: Optional[Dict[str, list]] = None,
+    adapter: Optional[object] = None,
 ) -> Dict[str, float]:
     """Run one in-distribution eval rollout and return env-averaged metrics.
 
@@ -94,6 +95,15 @@ def run_indist_eval(
     """
     device = env.device
 
+    # Deploy-time input plumbing is method-specific; the metrics below are not.
+    # Default (single-tensor obs) methods pass a plain ``policy``; adaptive methods
+    # pass an ``adapter`` that unpacks their multi-tensor obs / multi-input policy.
+    if adapter is None:
+        if policy is None:
+            raise ValueError("run_indist_eval requires either `policy` or `adapter`")
+        from rsl_rl.runners.eval_adapter import EvalAdapter
+        adapter = EvalAdapter(policy, device)
+
     # --- freeze the eval protocol: fixed command ranges, no curriculum drift ---
     saved_ranges = {k: list(v) for k, v in env.command_ranges.items()}
     saved_curriculum = env.cfg.commands.curriculum
@@ -114,13 +124,16 @@ def run_indist_eval(
     np.random.seed(seed)
 
     try:
-        env.reset()
-        obs = env.get_observations().to(device)
+        state = adapter.reset(env)
 
         # warmup: settle under the pinned commands, don't record
         for _ in range(warmup):
-            obs, _, _, _, _ = env.step(policy(obs.detach()))
-            obs = obs.to(device)
+            state, _, _ = adapter.step(env, adapter.act(state))
+
+        # Optional method-specific diagnostics should cover the measured window,
+        # not the unreported settling period.
+        if hasattr(adapter, "begin_measurement"):
+            adapter.begin_measurement()
 
         # restart the episode clock WITHOUT teleporting the settled robots, so the
         # first measured episode is full-length (mirrors sweep.py); otherwise it
@@ -129,8 +142,7 @@ def run_indist_eval(
 
         acc = MetricAccumulator(env.num_envs, device)
         for _ in range(steps):
-            obs, _, rew, dones, _ = env.step(policy(obs.detach()))
-            obs = obs.to(device)
+            state, rew, dones = adapter.step(env, adapter.act(state))
             cmd = env.commands
             v = env.simulator.base_lin_vel
             w = env.simulator.base_ang_vel

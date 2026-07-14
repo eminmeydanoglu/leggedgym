@@ -1,6 +1,6 @@
 # Training runner for the Hybrid Internal Model (HIM).
 # HIM follows the standard single-tensor contract (obs = stacked history,
-# critic_obs = single-frame privileged), so this runner keeps the base
+# critic_obs = five-frame privileged history), so this runner keeps the base
 # OnPolicyRunner fairness machinery: the iteration-based command_schedule and the
 # Eval-V2 / best_tracking.pt selection. learn() is copied from
 # OnPolicyRunner.learn() with HIM's next_critic_obs rollout + estimator logging.
@@ -106,14 +106,16 @@ class HIMRunner(OnPolicyRunner):
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
+            completed_iteration = self.completed_iteration(it)
+            if completed_iteration % self.save_interval == 0:
                 assert self.log_dir is not None
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), iteration=it)
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(completed_iteration)),
+                          iteration=completed_iteration)
 
             # Periodic in-distribution eval -> Eval/* + best_tracking.pt selection.
-            if self.eval_interval > 0 and it % self.eval_interval == 0:
+            if self.eval_interval > 0 and completed_iteration % self.eval_interval == 0:
                 with torch.inference_mode():
-                    self._run_eval(it)
+                    self._run_eval(completed_iteration)
                 obs = self.env.get_observations().to(self.device)
                 privileged_obs = self.env.get_privileged_observations()
                 critic_obs = (privileged_obs if privileged_obs is not None else obs).to(self.device)
@@ -133,3 +135,13 @@ class HIMRunner(OnPolicyRunner):
             self.writer.add_scalar('Loss/Estimation', locs['mean_estimation_loss'], locs['it'])
             self.writer.add_scalar('Loss/Swap', locs['mean_swap_loss'], locs['it'])
         super().log(locs, width, pad)
+
+    # HIM keeps the standard single-tensor obs contract, so the base
+    # StandardAdapter / act_inference eval path already applies. It only adds the
+    # estimator: its Adam moments must survive a resume, and the estimator weights
+    # must load strictly for deployment (act_inference reads estimator latents).
+    def _aux_optimizers(self):
+        return {"estimator_optimizer_state_dict": self.alg.actor_critic.estimator.optimizer}
+
+    def deploy_state_prefixes(self):
+        return ("actor.", "estimator.")

@@ -22,7 +22,9 @@ from rsl_rl.modules.him_actor_critic import HIMActorCritic
 TEMPORAL_STEPS = 6
 NUM_ONE_STEP = 45
 NUM_ACTOR_OBS = TEMPORAL_STEPS * NUM_ONE_STEP   # 270
-NUM_CRITIC_OBS = 3 + NUM_ONE_STEP + 5           # 53
+NUM_SINGLE_CRITIC_OBS = 3 + NUM_ONE_STEP + 5    # 53
+CRITIC_FRAME_STACK = 5
+NUM_CRITIC_OBS = CRITIC_FRAME_STACK * NUM_SINGLE_CRITIC_OBS  # 265
 NUM_ACTIONS = 12
 NUM_LATENT = 16
 
@@ -122,7 +124,11 @@ class TestHIMRegistryAndConfig(unittest.TestCase):
         env_cfg, train_cfg = task_registry.get_cfgs("go2_bench_him")
         env = env_cfg.env
         self.assertEqual(env.num_observations, env.frame_stack * env.num_one_step_obs)
-        self.assertEqual(env.num_privileged_obs, 3 + env.num_one_step_obs + 5)
+        self.assertEqual(env.c_frame_stack, 5)
+        self.assertEqual(env.num_single_critic_obs, 3 + env.num_one_step_obs + 5)
+        self.assertEqual(env.num_privileged_obs,
+                         env.c_frame_stack * env.num_single_critic_obs)
+        self.assertEqual(train_cfg.runner.critic_contract, "stacked_5x53_265d")
         self.assertEqual(train_cfg.runner.policy_class_name, "HIMActorCritic")
         self.assertEqual(train_cfg.runner.algorithm_class_name, "PPO_HIM")
         self.assertEqual(train_cfg.runner_class_name, "HIMRunner")

@@ -33,6 +33,7 @@ from __future__ import annotations
 import time
 import os
 import math
+import shutil
 from collections import deque
 import statistics
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -225,21 +226,23 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
+            completed_iteration = self.completed_iteration(it)
+            if completed_iteration % self.save_interval == 0:
                 assert self.log_dir is not None
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), iteration=it)
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(completed_iteration)),
+                          iteration=completed_iteration)
 
             # Periodic in-distribution eval -> Eval/* + best_tracking.pt selection.
             # The eval rollout resets the env, so we refresh obs/critic_obs and the
             # training-only reward/length bookkeeping before resuming rollout.
-            if self.eval_interval > 0 and it % self.eval_interval == 0:
+            if self.eval_interval > 0 and completed_iteration % self.eval_interval == 0:
                 # The training rollout above ran under torch.inference_mode(), so
                 # the env's step/reset buffers are inference tensors. The eval
                 # rollout reset()s and steps the same env, which are in-place
                 # updates -> must also run inside inference_mode or PyTorch raises
                 # "Inplace update to inference tensor outside InferenceMode".
                 with torch.inference_mode():
-                    self._run_eval(it)
+                    self._run_eval(completed_iteration)
                 obs = self.env.get_observations().to(self.device)
                 privileged_obs = self.env.get_privileged_observations()
                 critic_obs = (privileged_obs if privileged_obs is not None else obs).to(self.device)
@@ -252,6 +255,11 @@ class OnPolicyRunner:
         self.current_learning_iteration += num_learning_iterations
         assert self.log_dir is not None
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
+    @staticmethod
+    def completed_iteration(loop_iteration: int) -> int:
+        """Convert a zero-based update-loop index to completed update count."""
+        return loop_iteration + 1
 
     @staticmethod
     def command_stage_for_iter(
@@ -399,7 +407,7 @@ class OnPolicyRunner:
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
         print(log_string)
 
-    def _run_eval(self, it: int) -> Dict[str, float]:
+    def _run_eval(self, it: int, adapter=None) -> Dict[str, float]:
         """Run one in-distribution eval and update ``best_tracking.pt``.
 
         The exact V2 lexicographic rule is safety first (fixed-window fall rate),
@@ -414,7 +422,7 @@ class OnPolicyRunner:
         self.alg.actor_critic.eval()
         metrics = run_indist_eval(
             self.env,
-            self.alg.actor_critic.act_inference,
+            adapter=adapter if adapter is not None else self.get_eval_adapter(),
             steps=self.eval_steps,
             warmup=self.eval_warmup,
             seed=self.eval_seed,
@@ -464,10 +472,11 @@ class OnPolicyRunner:
             iteration: Iteration count to store in the checkpoint. Defaults to
                 self.current_learning_iteration.
         """
-        torch.save({
+        save_dict = {
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'iter': iteration if iteration is not None else self.current_learning_iteration,
+            'iteration_semantics': 'completed_updates_v2',
             # Keep eval selection state with the training checkpoint so resume
             # cannot treat an already-evaluated run as having no best model.
             'best_eval_score': self.best_eval_score,
@@ -478,7 +487,13 @@ class OnPolicyRunner:
             'schedule_stage_start': self._active_schedule_start,
             'schedule_lin_vel_x': self._active_schedule_range,
             'infos': infos,
-        }, path)
+        }
+        # Auxiliary-head optimizers (history-encoder / VAE / estimator). Base PPO
+        # has none; adaptive runners return them so a resumed Slurm job restores
+        # their Adam moments instead of resetting estimator/encoder learning.
+        for name, opt in self._aux_optimizers().items():
+            save_dict[name] = opt.state_dict()
+        torch.save(save_dict, path)
 
     @staticmethod
     def _checkpoint_eval_score(checkpoint: Dict[str, Any]) -> Optional[float]:
@@ -513,6 +528,11 @@ class OnPolicyRunner:
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+            # Restore auxiliary-head optimizers when present (older checkpoints
+            # predate them -> skipped, keeping backward compatibility).
+            for name, opt in self._aux_optimizers().items():
+                if loaded_dict.get(name) is not None:
+                    opt.load_state_dict(loaded_dict[name])
         self.current_learning_iteration = loaded_dict['iter']
 
         # Restore the full lexicographic selection state from the resumed model
@@ -520,7 +540,9 @@ class OnPolicyRunner:
         # it remains loadable, but the next V2 evaluation establishes a new key.
         choices = [loaded_dict]
         tracking_path = os.path.join(os.path.dirname(path), 'best_tracking.pt')
-        if os.path.abspath(tracking_path) != os.path.abspath(path) and os.path.isfile(tracking_path):
+        loading_tracking_checkpoint = os.path.abspath(tracking_path) == os.path.abspath(path)
+        source_tracking_path = path if loading_tracking_checkpoint else tracking_path
+        if not loading_tracking_checkpoint and os.path.isfile(tracking_path):
             choices.append(torch.load(tracking_path, map_location='cpu', weights_only=False))
         keys = []
         for item in choices:
@@ -534,6 +556,27 @@ class OnPolicyRunner:
         scores = [self._checkpoint_eval_score(item) for item in choices]
         persisted_scores = [score for score in scores if score is not None]
         self.best_eval_score = min(persisted_scores, default=float('inf'))
+
+        # A resumed job normally writes into a fresh run directory. Carry the
+        # selected weights forward as well as their key; otherwise the new run
+        # can finish without a best_tracking.pt when it never beats the old best.
+        if self.best_tracking_key is not None and self.log_dir is not None:
+            destination = os.path.join(self.log_dir, 'best_tracking.pt')
+            if os.path.abspath(source_tracking_path) != os.path.abspath(destination):
+                if not os.path.isfile(source_tracking_path):
+                    raise FileNotFoundError(
+                        "Checkpoint contains a best_tracking selection key, but "
+                        f"the selected artifact is missing: {source_tracking_path}"
+                    )
+                os.makedirs(self.log_dir, exist_ok=True)
+                temporary = f"{destination}.tmp-{os.getpid()}"
+                try:
+                    shutil.copy2(source_tracking_path, temporary)
+                    os.replace(temporary, destination)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+                print(f"[resume] carried best_tracking.pt into {self.log_dir}")
         return loaded_dict['infos']
 
     def get_inference_policy(
@@ -552,3 +595,44 @@ class OnPolicyRunner:
         if device is not None:
             self.alg.actor_critic.to(device)
         return self.alg.actor_critic.act_inference
+
+    # --- shared deploy / eval contract (see rsl_rl/runners/eval_adapter.py) ------
+
+    def _aux_optimizers(self) -> Dict[str, torch.optim.Optimizer]:
+        """name -> auxiliary-head optimizer whose Adam moments must survive a
+        resume. Base PPO has none; adaptive runners override."""
+        return {}
+
+    def deploy_state_prefixes(self) -> Tuple[str, ...]:
+        """state-dict sub-module prefixes that must load strictly for deploy/eval.
+
+        Base method deploys the actor only (MLP / P5). Adaptive runners add the
+        method components consumed at inference time (history_encoder / vae /
+        estimator) so a random head is never silently evaluated."""
+        return ("actor.",)
+
+    def load_deploy_state(
+        self,
+        path: str,
+        map_location: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        """Strictly load exactly ``deploy_state_prefixes()`` from a checkpoint into
+        the live actor-critic (Eval V2 inference loader, blocker #2/#3)."""
+        from rsl_rl.runners.eval_adapter import load_deploy_components
+        dev = map_location if map_location is not None else self.device
+        state = torch.load(path, map_location=dev, weights_only=False)["model_state_dict"]
+        load_deploy_components(self.alg.actor_critic, state, self.deploy_state_prefixes(), path)
+
+    def get_eval_adapter(
+        self,
+        device: Optional[Union[str, torch.device]] = None,
+    ):
+        """Return the deploy-time inference adapter for this method (single-tensor
+        obs contract by default). Adaptive runners override with the adapter that
+        matches their env's multi-tensor observations / multi-input policy."""
+        from rsl_rl.runners.eval_adapter import EvalAdapter
+        self.alg.actor_critic.eval()
+        dev = torch.device(device) if device is not None else self.device
+        if device is not None:
+            self.alg.actor_critic.to(device)
+        return EvalAdapter(self.alg.actor_critic.act_inference, dev)

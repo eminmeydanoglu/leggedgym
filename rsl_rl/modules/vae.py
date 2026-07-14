@@ -96,6 +96,8 @@ class VAE(nn.Module):
         return sampled_out, distribution_params
 
     def inference(self, obs_history):
-        _, distribution_params = self.forward(obs_history)
-        latent_mu, latent_var, vel_mu, vel_var = distribution_params
+        # Deployment uses posterior means. Calling ``forward`` here would sample
+        # and discard z/v, unnecessarily advancing the global Torch RNG and thus
+        # changing environment-noise draws relative to other benchmark methods.
+        latent_mu, _, vel_mu, _ = self.encode(obs_history)
         return torch.cat((latent_mu, vel_mu), dim=-1)

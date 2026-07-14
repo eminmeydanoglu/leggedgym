@@ -97,6 +97,11 @@ class TSRunner(OnPolicyRunner):
             init_at_random_ep_len: Whether to initialize episode lengths randomly.
         """
         self._pre_learn(init_at_random_ep_len)
+        if self.training_seed is not None:
+            print(f"[train] seed={self.training_seed} "
+                  f"start_iter={self.current_learning_iteration}")
+        # land on the correct schedule stage for the (possibly resumed) start iter
+        self._apply_command_schedule(self.current_learning_iteration)
         obs, privileged_obs, obs_history, critic_obs = self.env.get_observations()  # type: ignore[misc]
         obs, privileged_obs, obs_history, critic_obs = (
             obs.to(self.device),
@@ -115,6 +120,8 @@ class TSRunner(OnPolicyRunner):
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            # advance the command schedule if this iteration crosses a stage boundary
+            self._apply_command_schedule(it)
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -129,7 +136,7 @@ class TSRunner(OnPolicyRunner):
                         critic_obs.to(self.device),
                     )
                     self.alg.process_env_step(rewards, dones, infos)
-                    
+
                     if self.log_dir is not None:
                         # Book keeping
                         if 'episode' in infos:
@@ -154,14 +161,78 @@ class TSRunner(OnPolicyRunner):
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
+            completed_iteration = self.completed_iteration(it)
+            if completed_iteration % self.save_interval == 0:
                 assert self.log_dir is not None
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(completed_iteration)),
+                          iteration=completed_iteration)
+
+            # Periodic in-distribution eval -> Eval/* + best_tracking.pt selection.
+            # Uses the deployed *student* policy (RMA history encoder), so the
+            # checkpoint is picked on what actually ships, not the teacher.
+            if self.eval_interval > 0 and completed_iteration % self.eval_interval == 0:
+                with torch.inference_mode():
+                    self._run_eval(completed_iteration)
+                obs, privileged_obs, obs_history, critic_obs = self.env.get_observations()  # type: ignore[misc]
+                obs, privileged_obs, obs_history, critic_obs = (
+                    obs.to(self.device), privileged_obs.to(self.device),
+                    obs_history.to(self.device), critic_obs.to(self.device),
+                )
+                cur_reward_sum.zero_()
+                cur_episode_length.zero_()
+                self.alg.actor_critic.train()
             ep_infos.clear()
-        
+
         self.current_learning_iteration += num_learning_iterations
         assert self.log_dir is not None
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
+    # --- deploy / eval contract overrides (see rsl_rl/runners/eval_adapter.py) ---
+    def _aux_optimizers(self):
+        return {"history_encoder_optimizer_state_dict": self.alg.history_encoder_optimizer}
+
+    def deploy_state_prefixes(self):
+        # deployment runs the student: actor + history_encoder (NOT privilege_encoder)
+        return ("actor.", "history_encoder.")
+
+    def get_eval_adapter(self, device=None):
+        from rsl_rl.runners.eval_adapter import HistoryObsAdapter
+        self.alg.actor_critic.eval()
+        dev = torch.device(device) if device is not None else self.device
+        if device is not None:
+            self.alg.actor_critic.to(device)
+        return HistoryObsAdapter(self.alg.actor_critic.act_student, dev)
+
+    def _run_eval(self, it: int):
+        """Select on the deployed student and report the privileged-teacher gap."""
+        from legged_gym.scripts.eval.indist import run_indist_eval
+        from rsl_rl.runners.eval_adapter import HistoryObsAdapter, RMAStudentDiagnosticAdapter
+
+        diagnostic_adapter = RMAStudentDiagnosticAdapter(self.alg.actor_critic, self.device)
+        student = super()._run_eval(it, adapter=diagnostic_adapter)
+        teacher_adapter = HistoryObsAdapter(self.alg.actor_critic.act_teacher, self.device)
+        teacher_adapter.history_index = 1  # privileged observation, not history
+        teacher = run_indist_eval(
+            self.env, adapter=teacher_adapter, steps=self.eval_steps,
+            warmup=self.eval_warmup, seed=self.eval_seed,
+        )
+
+        gap = diagnostic_adapter.diagnostics()
+
+        diagnostics = {
+            "teacher_fall_rate": teacher["fall_rate"],
+            "teacher_tracking_lin_err": teacher["tracking_lin_err"],
+            "teacher_tracking_ang_err": teacher["tracking_ang_err"],
+            "student_teacher_latent_mse": gap["latent_mse"],
+            "student_teacher_action_mae": gap["action_mae"],
+        }
+        if self.writer is not None:
+            for key, value in diagnostics.items():
+                self.writer.add_scalar("RMAEval/" + key, value, it)
+        print(f"[rma-eval] it={it} teacher_fall={teacher['fall_rate']:.3f} "
+              f"teacher_lin={teacher['tracking_lin_err']:.3f} latent_mse={gap['latent_mse']:.5f} "
+              f"action_mae={gap['action_mae']:.5f}")
+        return {**student, **diagnostics}
 
     def log(
         self,

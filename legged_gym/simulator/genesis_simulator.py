@@ -313,6 +313,7 @@ class GenesisSimulator(Simulator):
         elif mesh_type == 'heightfield':
             self._terrain = Terrain(self._cfg.terrain)
             self._create_heightfield()
+            self._add_play_stair_colliders()
         elif mesh_type == 'trimesh':
             raise NotImplementedError("Trimesh terrain is not validated yet in Genesis, please use heightfield for now.")
             self._terrain = Terrain(self._cfg.terrain)
@@ -1026,6 +1027,33 @@ class GenesisSimulator(Simulator):
         self._height_samples = torch.tensor(self._terrain.heightsamples).view(
             self._terrain.tot_rows, self._terrain.tot_cols).to(self._device)
         self._edge_mask = torch.tensor(self._terrain.edge_mask).view(self._terrain.tot_rows, self._terrain.tot_cols).to(self._device)
+
+    def _add_play_stair_colliders(self):
+        """Add true vertical collision faces for the local play-only stair course.
+
+        Genesis heightfields are excellent for rough ground but their sampled
+        discontinuities are not reliable as rigid stair risers.  The heightmap
+        remains the visible terrain; these fixed boxes provide the matching,
+        solid collision volumes underneath each rendered step.
+        """
+        spec = getattr(self._cfg.terrain, "play_stair_collision_spec", None)
+        if not spec:
+            return
+
+        self._play_stair_colliders = []
+        for level in range(1, int(spec["num_steps"]) + 1):
+            x0 = spec["x_start"] + (level - 1) * spec["step_width"]
+            x1 = x0 + spec["step_width"]
+            top = level * spec["step_height"]
+            collider = self._scene.add_entity(
+                gs.morphs.Box(
+                    lower=(x0, spec["y_start"], -0.20),
+                    upper=(x1, spec["y_stop"], top),
+                    fixed=True,
+                    visualization=False,
+                )
+            )
+            self._play_stair_colliders.append(collider)
     
     def _create_trimesh(self):
         """ Adds a trimesh terrain to the simulation, sets parameters based on the cfg.

@@ -150,18 +150,12 @@ def rough_stairs_course(terrain: SubTerrain,
     step_height_px = int(stair_height / terrain.vertical_scale)
     lane_margin = int(0.15 * terrain.width)
     y_start, y_stop = lane_margin, terrain.width - lane_margin
-    base_height = int(np.median(terrain.height_field_raw[
-        max(0, x_start - step_width_px):x_start + 1, y_start:y_stop
-    ]))
-
     for level in range(1, 5):
         start = x_start + (level - 1) * step_width_px
         stop = min(terrain.length, start + step_width_px)
         if start >= terrain.length:
             break
-        terrain.height_field_raw[start:stop, y_start:y_stop] = (
-            base_height + level * step_height_px
-        )
+        terrain.height_field_raw[start:stop, y_start:y_stop] = level * step_height_px
 
     return terrain
 
