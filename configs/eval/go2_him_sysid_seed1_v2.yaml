@@ -1,0 +1,49 @@
+# Eval V2 full suite for adaptive seed-1 pair (HIM + SysID).
+# Protocol grids match go2_tripler_v2; env/replica counts are half for wall-time,
+# while axis cells still expand to O(10^3) envs so the A100 stays busy.
+campaign: go2_him_sysid_seed1_v2
+artifact_root: logs/eval/go2_him_sysid_seed1_v2
+simulator: genesis
+training_seeds: [1]
+models:
+  - label: HIM
+    task: go2_bench_him
+    checkpoint: best
+    run_folders:
+      1: Jul14_13-26-14_bench_him_genesis_seed1
+  - label: SysID
+    task: go2_bench_sysid
+    checkpoint: best
+    run_folders:
+      1: Jul14_13-26-14_bench_sysid_genesis_seed1
+protocol:
+  # half of tripler_v2 (768 -> 384)
+  validation: {seed: 31001, num_envs: 384, warmup: 100, steps: 1100}
+  id: {seed: 41001, num_envs: 384, warmup: 100, steps: 2000}
+  axes:
+    seed: 41001
+    warmup: 100
+    steps: 2000
+    replicas: 32          # half of 64; friction cell = 12*4*32 = 1536 envs
+    magnitudes: [0.5, 1.0, 1.5, 2.0]
+  hard:
+    seed: 41001
+    warmup: 100
+    steps: 2000
+    terrain_replicas: 128  # half of 256
+    kick_replicas: 128
+    step_replicas: 128
+    terrain_cm: [0, 2.5, 5, 7.5, 10]
+    lateral_kick_mps: [0, 0.5, 1, 1.5, 2, 2.5, 3]
+    kick_step: 50
+    recovery_steps: 250
+    step_amplitudes: [1.0, 2.0]
+    phase_steps: 150
+axes:
+  added_mass: {grid: [-2, -1, 0, 1, 2, 3, 4, 5], in_distribution: [-1, 1], unit: kg}
+  friction: {grid: [0.1, 0.25, 0.4, 0.5, 0.7, 0.9, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5], in_distribution: [0.5, 1.25], unit: ratio}
+  com_x: {grid: [-0.08, -0.05, -0.03, 0, 0.03, 0.05, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  com_y: {grid: [-0.08, -0.05, -0.03, 0, 0.03, 0.05, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  com_z: {grid: [-0.08, -0.05, -0.03, 0, 0.03, 0.05, 0.08], in_distribution: [-0.03, 0.03], unit: m}
+  pd_gain_scale: {grid: [0.5, 0.65, 0.8, 1.0, 1.2, 1.35, 1.5], in_distribution: [1.0, 1.0], unit: scale}
+  control_delay: {grid: [0, 1, 2, 3, 4, 5, 6], in_distribution: [0, 0], unit: control_step}

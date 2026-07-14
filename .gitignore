@@ -17,6 +17,7 @@ dist/
 !/scripts/run_action_quad.sh
 !/scripts/action_quad.sbatch
 !/scripts/action_one.sbatch
+!/scripts/run_him_sysid_v2_on_a115.sh
 # Compiled Java class files
 *.class
 
