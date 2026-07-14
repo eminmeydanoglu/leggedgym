@@ -4,6 +4,9 @@
 campaign: go2_him_sysid_seed1_v2
 artifact_root: logs/eval/go2_him_sysid_seed1_v2
 simulator: genesis
+# Offline re-validation of every model_*.pt is opt-in (campaign select-checkpoints).
+# Default path uses each run's training-time best_tracking.pt via checkpoint: best.
+require_offline_select: false
 training_seeds: [1]
 models:
   - label: HIM

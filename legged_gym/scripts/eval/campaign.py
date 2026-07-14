@@ -541,10 +541,70 @@ def cmd_select(cfg: Dict[str, Any], shard: Tuple[int, int]) -> int:
     return 0
 
 
-def _selected_config(cfg: Dict[str, Any], root: Path, model: Dict[str, Any], seed: int) -> Dict[str, Any]:
+def _materialize_training_best_selection(cfg: Dict[str, Any], root: Path) -> Path:
+    """Write checkpoint_selection.json from each run's training-time best without offline re-eval.
+
+    Offline ``select-checkpoints`` remains available when explicitly requested.  By
+    default the final suite should use the already-selected ``best_tracking.pt``
+    (or the model config's ``checkpoint`` field) from training.
+    """
+    root.mkdir(parents=True, exist_ok=True)
     path = root / "checkpoint_selection.json"
+    work = [(model, seed) for model in cfg["models"] for seed in _model_seeds(cfg, model)]
+    selections = []
+    for model, seed in work:
+        run = _run_dir(model, seed)
+        ckpt_spec = model.get("checkpoint", "best")
+        ckpt = Path(resolve_checkpoint_path(str(run), ckpt_spec))
+        iteration = _checkpoint_iter(ckpt)
+        if iteration < 0:
+            # best_tracking.pt / best.pt: prefer embedded training selection iter
+            try:
+                payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+                iteration = int(payload.get("iter", -1))
+            except Exception:
+                iteration = -1
+        selections.append(dict(
+            model=model["label"],
+            training_seed=int(seed),
+            path=str(ckpt),
+            checkpoint=ckpt_spec if isinstance(ckpt_spec, str) else int(ckpt_spec),
+            iteration=iteration,
+            sha256=sha256_file(str(ckpt)),
+            source="training_best",
+            note="materialized without offline select-checkpoints re-eval",
+        ))
+    canonical = dict(
+        campaign=cfg["campaign"],
+        fall_threshold=float(cfg.get("fall_threshold", 0.05)),
+        expected_selections=len(work),
+        completed_selections=len(selections),
+        complete=True,
+        source="training_best",
+        selections=selections,
+    )
+    path.write_text(_json(canonical), encoding="utf-8")
+    print(f"[selection] using training-time best checkpoints "
+          f"({len(selections)} models×seeds) -> {path}")
+    return path
+
+
+def _selected_config(cfg: Dict[str, Any], root: Path, model: Dict[str, Any], seed: int) -> Dict[str, Any]:
+    """Resolve the deploy checkpoint for one model/seed.
+
+    Default: use training-time ``best`` / ``best_tracking.pt`` from the model
+    config (no offline select).  If ``checkpoint_selection.json`` already exists
+    (from an explicit ``select-checkpoints`` run or a prior materialize), honor it.
+    """
+    path = root / "checkpoint_selection.json"
+    # Offline select is opt-in.  Absent a selection file, materialize from
+    # training best so ``campaign run`` works without re-validating every model_*.pt.
     if not path.exists():
-        raise FileNotFoundError(f"{path}: run select-checkpoints before final eval")
+        if cfg.get("require_offline_select", False):
+            raise FileNotFoundError(
+                f"{path}: offline select required (require_offline_select=true); "
+                "run select-checkpoints first")
+        _materialize_training_best_selection(cfg, root)
     data = json.loads(path.read_text())
     found = [x for x in data["selections"] if x["model"] == model["label"] and int(x["training_seed"]) == int(seed)]
     if len(found) != 1:

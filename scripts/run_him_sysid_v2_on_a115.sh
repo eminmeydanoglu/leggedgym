@@ -40,10 +40,16 @@ echo "[him-sysid-v2] $(ts) plan"
 "$python" -u -m legged_gym.scripts.eval.campaign plan --config "$config" --suite all \
   | tee -a "$root/automation.log"
 
-echo "[him-sysid-v2] $(ts) select-checkpoints"
-"$python" -u -m legged_gym.scripts.eval.campaign select-checkpoints \
-  --config "$config" --shard 0/1 \
-  2>&1 | tee -a "$root/automation.log"
+# Offline select-checkpoints is OFF by default: training already wrote
+# best_tracking.pt.  Set SELECT_CHECKPOINTS=1 to re-score every model_*.pt.
+if [[ "${SELECT_CHECKPOINTS:-0}" == "1" ]]; then
+  echo "[him-sysid-v2] $(ts) select-checkpoints (explicit opt-in)"
+  "$python" -u -m legged_gym.scripts.eval.campaign select-checkpoints \
+    --config "$config" --shard 0/1 \
+    2>&1 | tee -a "$root/automation.log"
+else
+  echo "[him-sysid-v2] $(ts) skip select-checkpoints; using training best_tracking.pt"
+fi
 
 echo "[him-sysid-v2] $(ts) run suite=all (resume enabled)"
 "$python" -u -m legged_gym.scripts.eval.campaign run \
