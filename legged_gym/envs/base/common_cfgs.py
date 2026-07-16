@@ -443,3 +443,43 @@ class Go2BenchmarkCommonCfg(Go2FlatCommonCfg):
         randomize_joint_friction = False
         randomize_joint_damping = False
         push_links = False
+
+
+# ============================================================================
+# V3 adaptive-training substrate.  This deliberately does NOT modify the
+# frozen Go2BenchmarkCommonCfg above: legacy Wave-1 checkpoints and reports
+# must keep their original training distribution.
+# ============================================================================
+class Go2BenchmarkV3CommonCfg(Go2BenchmarkCommonCfg):
+    """Shared training contract for the dynamic-physics V3 campaign.
+
+    ``P5`` remains ``[friction, added_mass, com_x, com_y, com_z]``.  Training
+    uses the widened static band plus a single, low-dose mid-episode physics
+    switch (one per episode, at a random time in the middle of the rollout) so a
+    memoryless policy is structurally suboptimal without destabilising PPO.  PD
+    gain stays held out so the P5 semantic is not silently changed into a
+    different privileged target.
+    """
+    class commands(Go2BenchmarkCommonCfg.commands):
+        class ranges(Go2BenchmarkCommonCfg.commands.ranges):
+            lin_vel_x = [-1.0, 2.0]
+
+    class domain_rand(Go2BenchmarkCommonCfg.domain_rand):
+        # V3 in-distribution physics.  These values match the old evaluation
+        # grid so the oracle labels do not clamp on the training support.
+        added_mass_range = [-2.0, 5.0]
+        com_pos_x_range = [-0.08, 0.08]
+        com_pos_y_range = [-0.08, 0.08]
+        com_pos_z_range = [-0.08, 0.08]
+
+        # Opt-in dynamic-physics contract consumed by Go2V3PhysicsResampleMixin.
+        # Lowest effective dose: exactly ONE switch per episode, fired at a
+        # random step drawn uniformly inside this fraction window of the episode
+        # length.  Most timesteps stay stationary (estimator can converge before
+        # the switch and track it after), and the switch window mirrors the S2
+        # eval protocol.  Applied identically to every V3 method, so the
+        # method comparison stays fair.
+        resample_physics_within_episode = True
+        physics_resample_switch_window = [0.2, 0.8]
+        physics_resample_mass = True
+        physics_resample_com = True

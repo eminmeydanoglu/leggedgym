@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import math
 
 from .actor_critic import get_activation
 
@@ -17,15 +18,17 @@ class HIMEstimator(nn.Module):
     The encoder consumes the stacked observation history and outputs
     ``[vel_hat(3), latent(num_latent)]``. The latent is trained with a
     Sinkhorn/SwAV swapped-prediction loss against a target encoder that reads the
-    *next* one-step observation, so the latent captures short-horizon dynamics.
+    *next* command-free robot response, so the latent captures short-horizon
+    dynamics.
     The explicit head regresses the next base linear velocity.
 
     Critic-obs layout contract (see Go2BenchHIM.compute_observations):
         next_critic_obs starts with the newest frame
             [base_lin_vel(3), one_step_obs(num_one_step_obs), P(...)]
-        and may contain older critic frames after it,
-    so ``vel  = next_critic_obs[:, 0:3]`` and
-       ``next_obs = next_critic_obs[:, 3:3 + num_one_step_obs]``.
+        and may contain older critic frames after it.
+    The source history includes commands, but the target branch must describe
+    the robot response rather than repeat the command. Matching HIMLoco, its
+    input is ``[one_step_obs_without_commands, base_lin_vel]``.
     """
 
     def __init__(self,
@@ -90,7 +93,40 @@ class HIMEstimator(nn.Module):
         z = F.normalize(z, dim=-1, p=2)
         return vel, z
 
-    def update(self, obs_history, next_critic_obs, terminated):
+    @torch.no_grad()
+    def project_prototypes(self, iterations=3):
+        """Retract prototypes to a unit-norm, full-rank tight frame.
+
+        Sinkhorn balances assignment mass, but it cannot distinguish duplicated
+        prototypes: K identical/antipodal rows still satisfy its uniform
+        marginal. Alternating row normalization and a polar projection keeps the
+        learnable codebook spread over the full latent space and makes that
+        degenerate solution impossible. K may exceed the latent dimension.
+        """
+        weight = self.proto.weight.data
+        scale = math.sqrt(self.num_prototype / self.num_latent)
+        for _ in range(iterations):
+            weight = F.normalize(weight, dim=1, p=2)
+            u, _, vh = torch.linalg.svd(weight, full_matrices=False)
+            weight = (u @ vh) * scale
+        self.proto.weight.copy_(F.normalize(weight, dim=1, p=2))
+
+    def _target_observation(self, next_critic_obs):
+        """Build HIMLoco's command-free robot-response target.
+
+        Our critic frame is ``[base_lin_vel(3), one_step_obs(45), P]``, while
+        the reference implementation stores ``[one_step_obs(45),
+        base_lin_vel(3), ...]`` and selects indices ``3:48``. Preserve that
+        semantic contract after the layout change: drop the three commands
+        from ``one_step_obs`` and append the measured base velocity.
+        """
+        vel = next_critic_obs[:, 0:3]
+        one_step_without_commands = next_critic_obs[
+            :, 3 + 3:3 + self.num_one_step_obs
+        ]
+        return torch.cat((one_step_without_commands, vel), dim=-1)
+
+    def update(self, obs_history, next_critic_obs, terminated, lr=None):
         """One estimator optimization step.
 
         Args:
@@ -100,12 +136,19 @@ class HIMEstimator(nn.Module):
             terminated: ``(1 - dones)`` mask, shape (B, 1). Cross-boundary
                 velocity targets are invalid (env resets on done), so the
                 explicit estimation MSE is masked by it.
+            lr: current PPO learning rate. HIMLoco couples the estimator rate
+                to PPO's adaptive schedule so the policy can track its latent.
 
         Returns:
             (estimation_loss, swap_loss) as python floats.
         """
+        if lr is not None:
+            self.learning_rate = float(lr)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.learning_rate
+
         vel = next_critic_obs[:, 0:3].detach()
-        next_obs = next_critic_obs[:, 3:3 + self.num_one_step_obs].detach()
+        next_obs = self._target_observation(next_critic_obs).detach()
 
         out = self.encoder(obs_history)
         pred_vel, z_s = out[..., :3], out[..., 3:]
@@ -113,11 +156,8 @@ class HIMEstimator(nn.Module):
         z_t = self.target(next_obs)
         z_t = F.normalize(z_t, dim=-1, p=2)
 
-        # normalize the prototypes onto the unit sphere before scoring
-        with torch.no_grad():
-            w = self.proto.weight.data.clone()
-            w = F.normalize(w, dim=1, p=2)
-            self.proto.weight.copy_(w)
+        # Keep the codebook both normalized and geometrically non-degenerate.
+        self.project_prototypes()
 
         score_s = self.proto(z_s)
         score_t = self.proto(z_t)
@@ -127,9 +167,10 @@ class HIMEstimator(nn.Module):
         log_p_s = F.log_softmax(score_s / self.temperature, dim=-1)
         log_p_t = F.log_softmax(score_t / self.temperature, dim=-1)
 
-        # Swapped prediction: q_s supervises p_t and vice versa. Left over the
-        # full batch (minor simplification vs. masking; consistent w/ ref impl).
-        swap_loss = -0.5 * (q_s * log_p_t + q_t * log_p_s).sum(dim=-1).mean()
+        # Match the released HIMLoco reduction over batch *and* prototypes.
+        # Summing prototypes first makes this term (and its gradients) K times
+        # larger; with K=32 that caused the prototype matrix to collapse.
+        swap_loss = -0.5 * (q_s * log_p_t + q_t * log_p_s).mean()
         # Explicit velocity estimation, masked to valid (non-terminal) steps.
         estimation_loss = F.mse_loss(pred_vel * terminated, vel * terminated)
         losses = estimation_loss + swap_loss
@@ -138,6 +179,8 @@ class HIMEstimator(nn.Module):
         losses.backward()
         nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
         self.optimizer.step()
+        # Checkpoints and inference should also observe a healthy codebook.
+        self.project_prototypes()
 
         return estimation_loss.item(), swap_loss.item()
 

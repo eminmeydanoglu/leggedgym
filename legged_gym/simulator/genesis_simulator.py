@@ -792,6 +792,20 @@ class GenesisSimulator(Simulator):
         self._added_base_mass[env_ids] = added_mass[:].detach().clone()
         self._robot.set_mass_shift(added_mass, self._base_link_index, env_ids)
 
+    def resample_v3_physics(self, env_ids, *, mass: bool, com: bool):
+        """Apply a live V3 physics switch without resetting robot state.
+
+        ``set_mass_shift``/``set_COM_shift`` are absolute shifts relative to the
+        Genesis model's nominal base properties, so repeated calls replace the
+        previous draw rather than accumulating payloads.
+        """
+        if len(env_ids) == 0:
+            return
+        if mass:
+            self._randomize_base_mass(env_ids)
+        if com:
+            self._randomize_com_displacement(env_ids)
+
     def _randomize_com_displacement(self, env_ids):
         ''' Randomize center of mass displacement of the robot'''
         min_displacement_x, max_displacement_x = self._cfg.domain_rand.com_pos_x_range

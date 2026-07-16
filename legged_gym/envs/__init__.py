@@ -161,6 +161,17 @@ from legged_gym.envs.go2.go2_bench_sysid.go2_bench_sysid_config import Go2BenchS
 # fair command_schedule + Eval-V2 machinery from OnPolicyRunner.
 from legged_gym.envs.go2.go2_bench_him.go2_bench_him import Go2BenchHIM
 from legged_gym.envs.go2.go2_bench_him.go2_bench_him_config import Go2BenchHIMCfg, Go2BenchHIMCfgPPO
+# ---------------------------------------------------------------------------
+# V3 dynamic-physics campaign.  Separate task names preserve the frozen Wave-1
+# family and make manifests/checkpoints unambiguous.
+# ---------------------------------------------------------------------------
+from legged_gym.envs.go2.go2_v3_mlp import Go2V3Mlp, Go2V3MlpCfg, Go2V3MlpCfgPPO
+from legged_gym.envs.go2.go2_v3_sysid import Go2V3SysID, Go2V3SysIDCfg, Go2V3SysIDCfgPPO
+from legged_gym.envs.go2.go2_v3_superset_oracle import (
+    Go2V3SupersetOracle,
+    Go2V3SupersetOracleCfg,
+    Go2V3SupersetOracleCfgPPO,
+)
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
@@ -177,3 +188,11 @@ task_registry.register("go2_bench_rma",      Go2BenchRMA,      Go2BenchRMACfg(),
 task_registry.register("go2_bench_dreamwaq", Go2BenchDreamwaq, Go2BenchDreamwaqCfg(), Go2BenchDreamwaqCfgPPO())
 task_registry.register("go2_bench_sysid",    Go2BenchSysID,    Go2BenchSysIDCfg(),    Go2BenchSysIDCfgPPO())
 task_registry.register("go2_bench_him",      Go2BenchHIM,      Go2BenchHIMCfg(),      Go2BenchHIMCfgPPO())
+task_registry.register("go2_v3_mlp", Go2V3Mlp, Go2V3MlpCfg(), Go2V3MlpCfgPPO())
+task_registry.register("go2_v3_sysid", Go2V3SysID, Go2V3SysIDCfg(), Go2V3SysIDCfgPPO())
+task_registry.register(
+    "go2_v3_superset_oracle",
+    Go2V3SupersetOracle,
+    Go2V3SupersetOracleCfg(),
+    Go2V3SupersetOracleCfgPPO(),
+)

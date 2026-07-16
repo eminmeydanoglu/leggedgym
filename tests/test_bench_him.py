@@ -11,6 +11,7 @@ Run:  .venv/bin/python -m unittest tests/test_bench_him.py -v
 import os
 os.environ.setdefault("SIMULATOR", "genesis")
 
+import math
 import unittest
 
 import torch
@@ -79,6 +80,66 @@ class TestHIMEstimator(unittest.TestCase):
             last_est, _ = self.est.update(obs_history, next_critic_obs, terminated)
         # the explicit head should fit the fixed velocity target better over time
         self.assertLess(last_est, first_est)
+
+    def test_target_observation_excludes_commands_and_includes_velocity(self):
+        B = 2
+        critic_obs = torch.zeros(B, NUM_CRITIC_OBS)
+        velocity = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        one_step = torch.arange(B * NUM_ONE_STEP, dtype=torch.float).reshape(B, -1)
+        critic_obs[:, 0:3] = velocity
+        critic_obs[:, 3:3 + NUM_ONE_STEP] = one_step
+
+        target = self.est._target_observation(critic_obs)
+
+        self.assertEqual(tuple(target.shape), (B, NUM_ONE_STEP))
+        self.assertTrue(torch.equal(target[:, :-3], one_step[:, 3:]))
+        self.assertTrue(torch.equal(target[:, -3:], velocity))
+
+    def test_update_tracks_adaptive_ppo_learning_rate(self):
+        obs_history = torch.randn(8, NUM_ACTOR_OBS)
+        next_critic_obs = torch.randn(8, NUM_CRITIC_OBS)
+        terminated = torch.ones(8, 1)
+
+        self.est.update(obs_history, next_critic_obs, terminated, lr=2.5e-5)
+
+        self.assertEqual(self.est.learning_rate, 2.5e-5)
+        self.assertEqual(self.est.optimizer.param_groups[0]['lr'], 2.5e-5)
+
+    def test_swap_loss_uses_reference_mean_reduction(self):
+        B = 8
+        obs_history = torch.zeros(B, NUM_ACTOR_OBS)
+        next_critic_obs = torch.zeros(B, NUM_CRITIC_OBS)
+        terminated = torch.ones(B, 1)
+        for parameter in self.est.parameters():
+            parameter.data.zero_()
+
+        _, swap_loss = self.est.update(
+            obs_history, next_critic_obs, terminated, lr=0.0)
+
+        expected_uniform_loss = math.log(self.est.num_prototype) / self.est.num_prototype
+        self.assertAlmostEqual(swap_loss, expected_uniform_loss, places=6)
+
+    def test_prototype_projection_prevents_rank_collapse(self):
+        # Reproduce the observed failure: every prototype is collinear.
+        direction = torch.randn(self.est.num_latent)
+        self.est.proto.weight.data.copy_(direction.repeat(self.est.num_prototype, 1))
+
+        self.est.project_prototypes()
+
+        weight = self.est.proto.weight.detach()
+        self.assertEqual(
+            torch.linalg.matrix_rank(weight, tol=1e-3).item(),
+            self.est.num_latent,
+        )
+        self.assertTrue(torch.allclose(
+            weight.norm(dim=1),
+            torch.ones(self.est.num_prototype),
+            atol=1e-5,
+        ))
+        cosine = weight @ weight.T
+        off_diagonal = cosine[~torch.eye(
+            self.est.num_prototype, dtype=torch.bool)]
+        self.assertLess(off_diagonal.abs().mean().item(), 0.35)
 
 
 class TestHIMActorCritic(unittest.TestCase):

@@ -524,7 +524,10 @@ class OnPolicyRunner:
         Returns:
             Optional infos dict stored in the checkpoint.
         """
-        loaded_dict = torch.load(path, weights_only=False)
+        # Checkpoints are commonly saved from CUDA training.  Explicitly map
+        # storage to this runner's device so CPU playback/evaluation can load
+        # them on machines where CUDA is unavailable.
+        loaded_dict = torch.load(path, map_location=self.device, weights_only=False)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])

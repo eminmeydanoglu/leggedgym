@@ -101,7 +101,8 @@ class PPO_HIM(PPO):
 
             # Estimator step (its own optimizer, inside the actor-critic)
             estimation_loss, swap_loss = self.actor_critic.estimator.update(
-                obs_batch, next_critic_obs_batch, terminated_batch)
+                obs_batch, next_critic_obs_batch, terminated_batch,
+                lr=self.learning_rate)
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
