@@ -122,8 +122,22 @@ def train(args):
     else:
         robot_file_path = os.path.join(LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", env_cfg.asset.name, args.task, args.task+".py")
         robot_config_path = os.path.join(LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", env_cfg.asset.name, args.task, args.task+"_config.py")
-    shutil.copy(robot_file_path, log_dir)
-    shutil.copy(robot_config_path, log_dir)
+    # A registered task need not map one-to-one to a source file.  In
+    # particular, V4 reuses the V3 environment implementations and supplies
+    # its contract through go2_v4_config.py.  Source snapshots are useful
+    # provenance, but they must never prevent an otherwise valid training run.
+    for source_path in (robot_file_path, robot_config_path):
+        if os.path.isfile(source_path):
+            shutil.copy(source_path, log_dir)
+        else:
+            print(f"[manifest] source snapshot unavailable; skipping: {source_path}")
+
+    if args.task.startswith("go2_v4_"):
+        v4_config_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", "go2", "go2_v4_config.py"
+        )
+        if os.path.isfile(v4_config_path):
+            shutil.copy(v4_config_path, log_dir)
 
     # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
     write_run_manifest(log_dir, args, env_cfg, train_cfg)
