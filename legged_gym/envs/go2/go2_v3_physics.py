@@ -97,3 +97,9 @@ class Go2V3PhysicsResampleMixin:
         resample(due, mass=self._v3_switch_mass, com=self._v3_switch_com)
         # One switch per episode: mark done and do NOT reschedule until reset.
         self._v3_switch_done[due] = True
+
+    def _update_terrain_curriculum(self, env_ids):
+        """Keep V4 on its declared terrain row, independent of performance."""
+        if getattr(self.cfg.terrain, "fixed_terrain_level", None) is not None:
+            return
+        return super()._update_terrain_curriculum(env_ids)

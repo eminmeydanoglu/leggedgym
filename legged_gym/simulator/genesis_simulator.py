@@ -608,8 +608,19 @@ class GenesisSimulator(Simulator):
             max_init_level = self._cfg.terrain.max_init_terrain_level
             if not self._cfg.terrain.curriculum:
                 max_init_level = self._cfg.terrain.num_rows - 1
-            self._terrain_levels = torch.randint(
-                0, max_init_level+1, (self._num_envs,), device=self._device)
+            fixed_level = getattr(self._cfg.terrain, "fixed_terrain_level", None)
+            if fixed_level is None:
+                self._terrain_levels = torch.randint(
+                    0, max_init_level+1, (self._num_envs,), device=self._device)
+            else:
+                fixed_level = int(fixed_level)
+                if not 0 <= fixed_level < self._cfg.terrain.num_rows:
+                    raise ValueError(
+                        "terrain.fixed_terrain_level must be in "
+                        f"[0, {self._cfg.terrain.num_rows - 1}], got {fixed_level}"
+                    )
+                self._terrain_levels = torch.full(
+                    (self._num_envs,), fixed_level, dtype=torch.long, device=self._device)
             self._terrain_types = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
             if hasattr(self._cfg.env, "num_camera_envs"): # split envs with cameras to all terrain types, ensuring the diversity of data collected by cameras
                 self._terrain_types[:self._cfg.env.num_camera_envs] = torch.div(

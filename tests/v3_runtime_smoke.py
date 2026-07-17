@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Genesis-only V3 runtime smoke.  It never creates a PPO runner or trains."""
 
+import argparse
 import os
 import types
 
@@ -16,6 +17,9 @@ from legged_gym.utils import task_registry
 TASKS = {
     "go2_v3_mlp": (45, 48),
     "go2_v3_sysid": (900, 265),
+    "go2_v3_rma": (45, 265),
+    "go2_v3_dreamwaq": (45, 265),
+    "go2_v3_him_fixed": (270, 265),
     "go2_v3_superset_oracle": (908, 908),
 }
 
@@ -39,11 +43,15 @@ def args_for(task):
     )
 
 
-def first_and_critic(env):
+def first_and_critic(env, task):
     obs = env.get_observations()
     if isinstance(obs, tuple):
-        # Explicit-estimator contract: (history, labels, critic).
-        return obs[0], obs[-1]
+        # SysID: (history, labels, critic); RMA: (obs, teacher, history,
+        # critic); DreamWaQ: (obs, critic, history, labels, decoder_target).
+        # All three deploy from their first tensor, but their critic location
+        # differs by method contract.
+        critic = obs[-1] if task in {"go2_v3_sysid", "go2_v3_rma"} else obs[1]
+        return obs[0], critic
     return obs, env.get_privileged_observations()
 
 
@@ -95,7 +103,7 @@ def smoke_one(task, expected_actor, expected_critic):
     try:
         for _ in range(12):
             env.step(torch.zeros(env.num_envs, env.num_actions, device=env.device))
-        actor, critic = first_and_critic(env)
+        actor, critic = first_and_critic(env, task)
         assert actor.shape == (env.num_envs, expected_actor), actor.shape
         assert critic.shape == (env.num_envs, expected_critic), critic.shape
         assert calls, "no V3 live physics switch occurred"
@@ -124,8 +132,13 @@ def smoke_one(task, expected_actor, expected_critic):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Genesis V3 runtime smoke")
+    parser.add_argument("--tasks", nargs="+", choices=tuple(TASKS), default=tuple(TASKS),
+                        help="optional subset; enables one independent smoke per GPU")
+    args = parser.parse_args()
     gs.init(backend=gs.gpu, logging_level="warning")
-    for task, shapes in TASKS.items():
+    for task in args.tasks:
+        shapes = TASKS[task]
         smoke_one(task, *shapes)
 
 

@@ -146,7 +146,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
     # Get initial observations according to task type
     if task_type == "ts_depth":
         obs_buf, privileged_obs_buf, depth_image, critic_obs = env.get_observations()
-    elif task_type == "ts" or task_type == "cat" or task_type == "cts" or task_type == "cts_amp": # teacher-student specific (including AMP)
+    elif task_type in {"ts", "cat", "cts", "cts_amp", "rma", "bench_rma", "v3_rma"}: # teacher-student specific (including RMA)
         obs_buf, privileged_obs_buf, obs_history, critic_obs = env.get_observations()
     elif task_type == "ee":
         estimator_features, _, _ = env.get_observations()
@@ -189,7 +189,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         if task_type == "ts_depth":
             actions = policy(obs_buf, depth_image)
             obs_buf, privileged_obs_buf, depth_image, critic_obs, rews, dones, infos = env.step(actions.detach())
-        elif task_type == "ts" or task_type == "cat" or task_type == "cts":
+        elif task_type in {"ts", "cat", "cts", "rma", "bench_rma", "v3_rma"}:
             actions = policy(obs_buf, obs_history)
             obs_buf, privileged_obs_buf, obs_history, critic_obs, rews, dones, infos = env.step(actions.detach())
         elif task_type == "ee":
@@ -209,7 +209,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
             obs_buf, _, rews, dones, infos = env.step(actions.detach())
         
         if viser_viewer is not None:
-            viser_viewer.update_from_simulator(env, robot_index)
+            viser_viewer.update_from_simulator(env, [robot_index])
 
         print_debug_info(env, robot_index)
         

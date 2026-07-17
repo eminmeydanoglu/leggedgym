@@ -6,9 +6,10 @@ import math
 import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 import trimesh
 import trimesh.visual
 
@@ -628,6 +629,7 @@ class ViserViewer:
         base_quat_wxyz: np.ndarray,
         dof_pos: np.ndarray,
         env_idx: int = 0,
+        flush: bool = True,
     ) -> None:
         fk_results = self.kin_model.forward_kinematics(
             base_pos, base_quat_wxyz, dof_pos
@@ -645,30 +647,65 @@ class ViserViewer:
                     client.camera.position = base_pos + self._camera_offset
                     client.camera.look_at = base_pos + self._camera_look_at_offset
 
+        if flush:
+            self.server.flush()
+
+    def update_from_simulator(
+        self,
+        env,
+        env_indices: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Publish the *current* state of selected training environments.
+
+        This reads state directly from the active simulator, rather than from a
+        checkpoint or a second playback scene.  Transfer all selected robots in
+        three batched GPU-to-CPU copies, then flush a single Viser update.
+        """
+        if env_indices is None:
+            env_indices = [0]
+        indices = list(env_indices)[:self.num_envs]
+        if not indices:
+            return
+
+        device = env.simulator.base_pos.device
+        idx = torch.as_tensor(indices, device=device, dtype=torch.long)
+        base_pos = env.simulator.base_pos[idx].detach().cpu().numpy()
+        base_quat_xyzw = env.simulator.base_quat[idx].detach().cpu().numpy()
+        dof_pos = env.simulator.dof_pos[idx].detach().cpu().numpy()
+
+        for viewer_idx, (pos, quat_xyzw, joints) in enumerate(
+            zip(base_pos, base_quat_xyzw, dof_pos)
+        ):
+            self.update(
+                pos,
+                _xyzw_to_wxyz(quat_xyzw),
+                joints,
+                env_idx=viewer_idx,
+                flush=False,
+            )
         self.server.flush()
-
-    def update_from_simulator(self, env, robot_index: int = 0) -> None:
-        base_pos = env.simulator.base_pos[robot_index].cpu().numpy()
-        base_quat_xyzw = env.simulator.base_quat[robot_index].cpu().numpy()
-        base_quat_wxyz = _xyzw_to_wxyz(base_quat_xyzw)
-        dof_pos = env.simulator.dof_pos[robot_index].cpu().numpy()
-
-        self.update(base_pos, base_quat_wxyz, dof_pos, env_idx=0)
 
     def stop(self) -> None:
         if hasattr(self, 'server'):
             self.server.stop()
 
 
-def create_viser_viewer(env, port: int = 8080, robot_index: int = 0) -> ViserViewer:
+def create_viser_viewer(
+    env,
+    port: int = 8080,
+    env_indices: Optional[Sequence[int]] = None,
+) -> ViserViewer:
     xml_path = env.cfg.asset.xml_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
     
     dof_names = env.cfg.asset.dof_names
 
+    if env_indices is None:
+        env_indices = [0]
+
     viewer = ViserViewer(
         xml_path=xml_path,
         dof_names=dof_names,
-        num_envs=1,
+        num_envs=len(env_indices),
         port=port,
     )
 

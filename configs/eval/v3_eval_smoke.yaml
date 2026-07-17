@@ -1,0 +1,56 @@
+# GPU runtime smoke only.  This never writes into the scientific
+# ``v3_ilk_deneme`` campaign and intentionally accepts an in-progress
+# best_tracking checkpoint to validate deploy/eval plumbing before training ends.
+campaign: v3_eval_smoke
+artifact_root: logs/eval/v3_eval_smoke
+simulator: genesis
+require_final_checkpoint: false
+training_seeds: [1]
+models:
+  - {label: MLP, task: go2_v3_mlp, log_root: logs/go2_v3_dynamic, run_pattern: "*_v3_mlp_genesis_seed{seed}", checkpoint: best_tracking}
+  - {label: SysID, task: go2_v3_sysid, log_root: logs/go2_v3_dynamic, run_pattern: "*_v3_sysid_genesis_seed{seed}", checkpoint: best_tracking}
+  - {label: RMA, task: go2_v3_rma, log_root: logs/go2_v3_dynamic, run_pattern: "*_v3_rma_genesis_seed{seed}", checkpoint: best_tracking}
+  - {label: DreamWaQ, task: go2_v3_dreamwaq, log_root: logs/go2_v3_dynamic, run_pattern: "*_v3_dreamwaq_genesis_seed{seed}", checkpoint: best_tracking}
+  - {label: HIM-fixed, task: go2_v3_him_fixed, log_root: logs/go2_v3_dynamic, run_pattern: "*_v3_him_fixed_genesis_seed{seed}", checkpoint: best_tracking}
+  - {label: Superset-Oracle, task: go2_v3_superset_oracle, log_root: logs/go2_v3_dynamic, run_pattern: "*_v3_superset_oracle_genesis_seed{seed}", checkpoint: best_tracking}
+protocol:
+  num_envs: 16
+  eval_seed: 41001
+  payload:
+    com_x_per_kg: 0.01
+    com_x_limit_m: 0.08
+    static: [{name: plus4, mass_kg: 4.0, tier: in_band}]
+    switches: [{name: nominal_to_plus4, mass_kg: 4.0, tier: in_band}]
+  s0:
+    warmup: 8
+    steps: 32
+    pre_steps: 16
+    post_steps: 24
+    command_bank:
+      lin_vel_x: [-1.0, 2.0]
+      lin_vel_y: [-1.0, 1.0]
+      ang_vel_yaw: [-1.0, 1.0]
+      anchor_x: [-1.0, 0.0, 1.0, 2.0]
+      anchor_y: [-1.0, 0.0, 1.0]
+      anchor_yaw_rate: [-1.0, 0.0, 1.0]
+  s0_dynamic_target: {name: nominal_to_plus4, mass_kg: 4.0, tier: in_band}
+  s1: {warmup: 8, steps: 32}
+  s1_commands: [{name: lateral_1_0, mode: lateral, vector: [0.0, 1.0, 0.0], headline: true}]
+  s2: {warmup: 8, pre_steps: 16, post_steps: 24}
+  s2_commands: [{name: lateral_1_0, mode: lateral, vector: [0.0, 1.0, 0.0], headline: true}]
+  s3:
+    warmup: 8
+    kick_pre_steps: 8
+    kick_post_steps: 16
+    kick_dvy: [1.0]
+    terrain_cm: [2.5]
+    terrain_steps: 32
+    terrain_horizontal_scale: 0.1
+scorecard:
+  baseline_label: MLP
+  oracle_label: Superset-Oracle
+  method_labels: [SysID, RMA, DreamWaQ, HIM-fixed]
+  relative_headroom: 0.10
+  absolute_headroom: 0.05
+  fall_gate_pp: 0.05
+  achieved_speed_ratio: 0.90

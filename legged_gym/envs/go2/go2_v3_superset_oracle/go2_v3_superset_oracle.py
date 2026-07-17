@@ -55,6 +55,17 @@ class Go2V3SupersetOracle(Go2V3PhysicsResampleMixin, GO2):
         velocity = self.simulator.base_lin_vel * self.obs_scales.lin_vel
         return p5, velocity
 
+    def _terrain_height_map(self):
+        """Noise-free, yaw-aligned local height map for the V4 oracle only."""
+        if not self.cfg.terrain.measure_heights:
+            raise RuntimeError("oracle_height_map requires terrain.measure_heights=True")
+        return torch.clip(
+            self.simulator.base_pos[:, 2].unsqueeze(1) - 0.5
+            - self.simulator.measured_heights,
+            -1.0,
+            1.0,
+        ) * self.obs_scales.height_measurements
+
     def compute_observations(self):
         clean_current = self._one_step_proprio()
         noisy_current = clean_current.clone()
@@ -67,9 +78,16 @@ class Go2V3SupersetOracle(Go2V3PhysicsResampleMixin, GO2):
         clean_history = torch.cat(list(self.clean_history_deque), dim=-1)
         p5, velocity = self._p5_and_velocity()
 
-        # [20 x noisy proprio, true velocity, true P5] = 908 dimensions.
-        self.obs_buf = torch.cat((noisy_history, velocity, p5), dim=-1)
-        self.privileged_obs_buf = torch.cat((clean_history, velocity, p5), dim=-1)
+        actor_parts = (noisy_history, velocity, p5)
+        critic_parts = (clean_history, velocity, p5)
+        if getattr(self.cfg.env, "oracle_height_map", False):
+            # This is privileged perception, not a learned terrain estimate.
+            height_map = self._terrain_height_map()
+            actor_parts += (height_map,)
+            critic_parts += (height_map,)
+
+        self.obs_buf = torch.cat(actor_parts, dim=-1)
+        self.privileged_obs_buf = torch.cat(critic_parts, dim=-1)
 
     def _get_noise_scale_vec(self):
         noise_vec = torch.zeros(self.num_single_obs, device=self.device)

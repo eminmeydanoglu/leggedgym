@@ -185,7 +185,13 @@ def _run_dir(model: Dict[str, Any], seed: int) -> Path:
     if not value or str(value).startswith("TODO"):
         raise FileNotFoundError(f"{model['label']} seed {seed}: run_folders entry is missing/TODO")
     p = Path(value)
-    return p if p.is_absolute() else _root() / "logs" / "go2_benchmark" / p
+    if p.is_absolute():
+        return p
+    # Most historical benchmark runs live under ``logs/go2_benchmark``.  New
+    # campaign families may declare a different, repo-relative log root while
+    # retaining the same strict task/seed/checkpoint loading path.
+    log_root = Path(model.get("log_root", "logs/go2_benchmark"))
+    return (_root() / log_root / p) if not log_root.is_absolute() else (log_root / p)
 
 
 def _checkpoint_iter(path: Path) -> int:
@@ -249,7 +255,7 @@ def _load_actor(actor, checkpoint: Path, device) -> None:
 def build_session(
     model: Dict[str, Any], seed: int, num_envs: int, eval_seed: int, *,
     delay: bool = False, id_domain_rand: bool = False, terrain_raw: np.ndarray | None = None,
-    terrain_horizontal_scale: float = 0.1,
+    terrain_horizontal_scale: float = 0.1, disable_v3_physics_switch: bool = False,
 ) -> Session:
     """Build exactly one task/policy pair, preserving checkpoint/task isolation."""
     import legged_gym.envs  # noqa: F401  (task-registration side effect)
@@ -269,6 +275,12 @@ def build_session(
     env_cfg.commands.curriculum = False
     env_cfg.commands.heading_command = False
     env_cfg.commands.resampling_time = 1e6
+    if disable_v3_physics_switch and hasattr(env_cfg.domain_rand, "resample_physics_within_episode"):
+        # V3's training contract includes one random in-episode switch. Static
+        # scorecard cells and manually scheduled deterministic switches must
+        # disable it explicitly so a hidden random switch cannot contaminate a
+        # cell after its physics was pinned by the evaluation runner.
+        env_cfg.domain_rand.resample_physics_within_episode = False
     if not id_domain_rand:
         env_cfg.domain_rand.randomize_friction = False
         env_cfg.domain_rand.randomize_base_mass = False

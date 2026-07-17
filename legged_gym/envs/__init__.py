@@ -167,10 +167,29 @@ from legged_gym.envs.go2.go2_bench_him.go2_bench_him_config import Go2BenchHIMCf
 # ---------------------------------------------------------------------------
 from legged_gym.envs.go2.go2_v3_mlp import Go2V3Mlp, Go2V3MlpCfg, Go2V3MlpCfgPPO
 from legged_gym.envs.go2.go2_v3_sysid import Go2V3SysID, Go2V3SysIDCfg, Go2V3SysIDCfgPPO
+from legged_gym.envs.go2.go2_v3_rma import Go2V3RMA, Go2V3RMACfg, Go2V3RMACfgPPO
+from legged_gym.envs.go2.go2_v3_dreamwaq import (
+    Go2V3Dreamwaq,
+    Go2V3DreamwaqCfg,
+    Go2V3DreamwaqCfgPPO,
+)
+from legged_gym.envs.go2.go2_v3_him_fixed import (
+    Go2V3HIMFixed,
+    Go2V3HIMFixedCfg,
+    Go2V3HIMFixedCfgPPO,
+)
 from legged_gym.envs.go2.go2_v3_superset_oracle import (
     Go2V3SupersetOracle,
     Go2V3SupersetOracleCfg,
     Go2V3SupersetOracleCfgPPO,
+)
+from legged_gym.envs.go2.go2_v4_config import (
+    Go2V4MlpCfg, Go2V4MlpCfgPPO,
+    Go2V4SysIDCfg, Go2V4SysIDCfgPPO,
+    Go2V4RMACfg, Go2V4RMACfgPPO,
+    Go2V4DreamwaqCfg, Go2V4DreamwaqCfgPPO,
+    Go2V4HIMFixedCfg, Go2V4HIMFixedCfgPPO,
+    Go2V4SupersetOracleCfg, Go2V4SupersetOracleCfgPPO,
 )
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
@@ -190,9 +209,35 @@ task_registry.register("go2_bench_sysid",    Go2BenchSysID,    Go2BenchSysIDCfg(
 task_registry.register("go2_bench_him",      Go2BenchHIM,      Go2BenchHIMCfg(),      Go2BenchHIMCfgPPO())
 task_registry.register("go2_v3_mlp", Go2V3Mlp, Go2V3MlpCfg(), Go2V3MlpCfgPPO())
 task_registry.register("go2_v3_sysid", Go2V3SysID, Go2V3SysIDCfg(), Go2V3SysIDCfgPPO())
+task_registry.register("go2_v3_rma", Go2V3RMA, Go2V3RMACfg(), Go2V3RMACfgPPO())
+task_registry.register(
+    "go2_v3_dreamwaq",
+    Go2V3Dreamwaq,
+    Go2V3DreamwaqCfg(),
+    Go2V3DreamwaqCfgPPO(),
+)
+task_registry.register(
+    "go2_v3_him_fixed",
+    Go2V3HIMFixed,
+    Go2V3HIMFixedCfg(),
+    Go2V3HIMFixedCfgPPO(),
+)
 task_registry.register(
     "go2_v3_superset_oracle",
     Go2V3SupersetOracle,
     Go2V3SupersetOracleCfg(),
     Go2V3SupersetOracleCfgPPO(),
+)
+# V4 reuses V3 method implementations but pins all runs to the same medium
+# terrain row.  Only its oracle receives the privileged 17x11 terrain map.
+task_registry.register("go2_v4_mlp", Go2V3Mlp, Go2V4MlpCfg(), Go2V4MlpCfgPPO())
+task_registry.register("go2_v4_sysid", Go2V3SysID, Go2V4SysIDCfg(), Go2V4SysIDCfgPPO())
+task_registry.register("go2_v4_rma", Go2V3RMA, Go2V4RMACfg(), Go2V4RMACfgPPO())
+task_registry.register("go2_v4_dreamwaq", Go2V3Dreamwaq, Go2V4DreamwaqCfg(), Go2V4DreamwaqCfgPPO())
+task_registry.register("go2_v4_him_fixed", Go2V3HIMFixed, Go2V4HIMFixedCfg(), Go2V4HIMFixedCfgPPO())
+task_registry.register(
+    "go2_v4_superset_oracle",
+    Go2V3SupersetOracle,
+    Go2V4SupersetOracleCfg(),
+    Go2V4SupersetOracleCfgPPO(),
 )

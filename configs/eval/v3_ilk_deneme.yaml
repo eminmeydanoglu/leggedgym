@@ -1,0 +1,130 @@
+# Incremental V3 generalisation campaign.  ``v3_eval`` is the reusable runner
+# and Slurm batch; this file names one append-only scientific campaign.  It may
+# begin with one completed policy-seed and accepts the remaining results later.
+campaign: v3_ilk_deneme
+artifact_root: logs/eval/v3_ilk_deneme
+simulator: genesis
+require_final_checkpoint: true
+training_seeds: [1, 2]
+
+models:
+  - label: MLP
+    task: go2_v3_mlp
+    log_root: logs/go2_v3_dynamic
+    run_pattern: "*_v3_mlp_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: SysID
+    task: go2_v3_sysid
+    log_root: logs/go2_v3_dynamic
+    run_pattern: "*_v3_sysid_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: RMA
+    task: go2_v3_rma
+    log_root: logs/go2_v3_dynamic
+    run_pattern: "*_v3_rma_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: DreamWaQ
+    task: go2_v3_dreamwaq
+    log_root: logs/go2_v3_dynamic
+    run_pattern: "*_v3_dreamwaq_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: HIM-fixed
+    task: go2_v3_him_fixed
+    log_root: logs/go2_v3_dynamic
+    run_pattern: "*_v3_him_fixed_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: Superset-Oracle
+    task: go2_v3_superset_oracle
+    log_root: logs/go2_v3_dynamic
+    run_pattern: "*_v3_superset_oracle_genesis_seed{seed}"
+    checkpoint: best_tracking
+
+protocol:
+  # A parallel environment is a measurement replica, not a training seed.
+  num_envs: 384
+  eval_seed: 41001
+
+  payload:
+    # A forward-mounted payload is represented by an added mass and a
+    # correlated forward CoM displacement.  The clamp keeps far-OOD payloads
+    # inside the simulator's exercised CoM support.
+    com_x_per_kg: 0.01
+    com_x_limit_m: 0.08
+    static:
+      - {name: neg2, mass_kg: -2.0, tier: in_band}
+      - {name: nominal, mass_kg: 0.0, tier: in_band}
+      - {name: plus4, mass_kg: 4.0, tier: in_band}
+      - {name: plus5, mass_kg: 5.0, tier: in_band}
+      - {name: plus6, mass_kg: 6.0, tier: near_ood}
+      - {name: plus8, mass_kg: 8.0, tier: far_ood}
+    switches:
+      - {name: nominal_to_plus4, mass_kg: 4.0, tier: in_band}
+      - {name: nominal_to_plus6, mass_kg: 6.0, tier: near_ood}
+      - {name: nominal_to_plus8, mass_kg: 8.0, tier: far_ood}
+
+  s0:
+    warmup: 100
+    steps: 2000
+    pre_steps: 500
+    post_steps: 500
+    # ``build_session`` forces heading_command=False and writes these values
+    # directly to env.commands[:, :3].  The third component is therefore yaw
+    # rate, not a heading target; command resampling is disabled.
+    command_bank:
+      lin_vel_x: [-1.0, 2.0]
+      lin_vel_y: [-1.0, 1.0]
+      ang_vel_yaw: [-1.0, 1.0]
+      anchor_x: [-1.0, 0.0, 1.0, 2.0]
+      anchor_y: [-1.0, 0.0, 1.0]
+      anchor_yaw_rate: [-1.0, 0.0, 1.0]
+  s0_dynamic_target: {name: nominal_to_plus4, mass_kg: 4.0, tier: in_band}
+
+  s1:
+    warmup: 100
+    steps: 2000
+  s1_commands:
+    # Headline cells change only physics: lateral support remains [-1, 1],
+    # while forward 1.5/2.0 is inside V3's expanded lin_vel_x support.
+    - {name: lateral_neg_1_0, mode: lateral, vector: [0.0, -1.0, 0.0], headline: true}
+    - {name: lateral_neg_0_5, mode: lateral, vector: [0.0, -0.5, 0.0], headline: true}
+    - {name: lateral_pos_0_5, mode: lateral, vector: [0.0, 0.5, 0.0], headline: true}
+    - {name: lateral_pos_1_0, mode: lateral, vector: [0.0, 1.0, 0.0], headline: true}
+    - {name: forward_1_5, mode: forward, vector: [1.5, 0.0, 0.0], headline: true}
+    - {name: forward_2_0, mode: forward, vector: [2.0, 0.0, 0.0], headline: true}
+    # These preserve the raw artefacts but need ``--diagnostics`` to run and
+    # are excluded from every GapClosed_static aggregation.
+    - {name: lateral_neg_1_5, mode: lateral, vector: [0.0, -1.5, 0.0], headline: false, diagnostic_kind: command_ood_diagnostic}
+    - {name: lateral_neg_2_0, mode: lateral, vector: [0.0, -2.0, 0.0], headline: false, diagnostic_kind: command_ood_diagnostic}
+    - {name: lateral_pos_1_5, mode: lateral, vector: [0.0, 1.5, 0.0], headline: false, diagnostic_kind: command_ood_diagnostic}
+    - {name: lateral_pos_2_0, mode: lateral, vector: [0.0, 2.0, 0.0], headline: false, diagnostic_kind: command_ood_diagnostic}
+
+  s2:
+    warmup: 100
+    pre_steps: 500
+    post_steps: 500
+  s2_commands:
+    - {name: lateral_pos_1_0, mode: lateral, vector: [0.0, 1.0, 0.0], headline: true}
+    - {name: lateral_neg_1_0, mode: lateral, vector: [0.0, -1.0, 0.0], headline: true}
+    - {name: forward_1_5, mode: forward, vector: [1.5, 0.0, 0.0], headline: true}
+    - {name: lateral_pos_1_5, mode: lateral, vector: [0.0, 1.5, 0.0], headline: false, diagnostic_kind: command_ood_diagnostic}
+    - {name: lateral_neg_1_5, mode: lateral, vector: [0.0, -1.5, 0.0], headline: false, diagnostic_kind: command_ood_diagnostic}
+
+  # These are deliberately raw diagnostic cells.  The MLP kick curve chooses
+  # the useful 30–70% fall region; terrain never enters gap_closed.
+  s3:
+    warmup: 100
+    kick_pre_steps: 50
+    kick_post_steps: 250
+    kick_dvy: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    terrain_cm: [0.0, 2.5, 5.0, 7.5, 10.0]
+    terrain_steps: 2000
+    terrain_horizontal_scale: 0.1
+
+scorecard:
+  baseline_label: MLP
+  oracle_label: Superset-Oracle
+  method_labels: [SysID, RMA, DreamWaQ, HIM-fixed]
+  relative_headroom: 0.10
+  absolute_headroom: 0.05
+  fall_gate_pp: 0.05
+  achieved_speed_ratio: 0.90

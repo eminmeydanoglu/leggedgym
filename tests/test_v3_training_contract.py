@@ -6,7 +6,14 @@ from legged_gym.envs import task_registry
 from legged_gym.utils.helpers import class_to_dict
 
 
-V3_TASKS = ("go2_v3_mlp", "go2_v3_sysid", "go2_v3_superset_oracle")
+V3_TASKS = (
+    "go2_v3_mlp",
+    "go2_v3_sysid",
+    "go2_v3_rma",
+    "go2_v3_dreamwaq",
+    "go2_v3_him_fixed",
+    "go2_v3_superset_oracle",
+)
 
 
 class TestV3TrainingContract(unittest.TestCase):
@@ -40,12 +47,27 @@ class TestV3TrainingContract(unittest.TestCase):
     def test_observation_contracts(self):
         mlp, _ = self._cfgs("go2_v3_mlp")
         sysid, _ = self._cfgs("go2_v3_sysid")
+        rma, _ = self._cfgs("go2_v3_rma")
+        dreamwaq, _ = self._cfgs("go2_v3_dreamwaq")
+        him_fixed, him_fixed_train = self._cfgs("go2_v3_him_fixed")
         oracle, _ = self._cfgs("go2_v3_superset_oracle")
         self.assertEqual(mlp.env.num_observations, 45)
         self.assertEqual(mlp.env.num_privileged_obs, 48)
         self.assertEqual(sysid.env.num_estimator_features, 20 * 45)
         self.assertEqual(sysid.env.num_estimator_labels, 8)
         self.assertEqual(sysid.env.num_privileged_obs, 5 * 53)
+        self.assertEqual(rma.env.num_observations, 45)
+        self.assertEqual(rma.env.num_history_obs, 20 * 45)
+        self.assertEqual(rma.env.num_privileged_obs, 8)
+        self.assertEqual(rma.env.num_critic_obs, 5 * 53)
+        self.assertEqual(dreamwaq.env.num_observations, 45)
+        self.assertEqual(dreamwaq.env.num_history_obs, 5 * 45)
+        self.assertEqual(dreamwaq.env.num_privileged_obs, 5 * 53)
+        self.assertEqual(him_fixed.env.num_observations, 6 * 45)
+        self.assertEqual(him_fixed.env.num_privileged_obs, 5 * 53)
+        self.assertEqual(him_fixed_train.runner.policy_class_name, "HIMActorCritic")
+        self.assertEqual(him_fixed_train.runner.algorithm_class_name, "PPO_HIM")
+        self.assertEqual(him_fixed_train.runner_class_name, "HIMRunner")
         self.assertEqual(oracle.env.num_observations, 20 * 45 + 3 + 5)
         self.assertEqual(oracle.env.num_privileged_obs, 20 * 45 + 3 + 5)
 

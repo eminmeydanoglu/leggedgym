@@ -126,7 +126,66 @@ class OnPolicyRunner:
         self.tot_time: float = 0.0
         self.current_learning_iteration: int = 0
 
+        # Optional browser bridge for the *same* live training scene.  It is
+        # deliberately opt-in through environment variables so normal training
+        # remains byte-for-byte headless and the launcher can enable it for only
+        # one GPU slot.  State publication is throttled to avoid per-step GPU
+        # synchronization.
+        self._live_viser = None
+        self._live_viser_env_indices: List[int] = []
+        self._live_viser_interval_s = 0.0
+        self._live_viser_last_update_s = 0.0
+        self._init_live_viser_bridge()
+
         self.env.reset()
+
+    def _init_live_viser_bridge(self) -> None:
+        if os.environ.get("LEGGED_GYM_LIVE_VISER", "0") != "1":
+            return
+        try:
+            from legged_gym.utils.viser_viewer import create_viser_viewer
+
+            count = int(os.environ.get("LEGGED_GYM_LIVE_VISER_ENVS", "36"))
+            hz = float(os.environ.get("LEGGED_GYM_LIVE_VISER_HZ", "5"))
+            port = int(os.environ.get("LEGGED_GYM_LIVE_VISER_PORT", "8080"))
+            if count < 1 or hz <= 0:
+                raise ValueError("environment count and update frequency must be positive")
+
+            count = min(count, self.env.num_envs)
+            self._live_viser_env_indices = list(range(count))
+            self._live_viser = create_viser_viewer(
+                self.env,
+                port=port,
+                env_indices=self._live_viser_env_indices,
+            )
+            self._live_viser_interval_s = 1.0 / hz
+            print(
+                f"[live-viser] enabled: {count} real training envs, "
+                f"{hz:g} Hz, http://127.0.0.1:{port}"
+            )
+        except Exception as exc:
+            # A visual aid must never bring down an otherwise valid training.
+            self._live_viser = None
+            self._live_viser_env_indices = []
+            print(f"[live-viser] disabled after initialization error: {exc}")
+
+    def _update_live_viser_bridge(self) -> None:
+        if self._live_viser is None:
+            return
+        now = time.monotonic()
+        if now - self._live_viser_last_update_s < self._live_viser_interval_s:
+            return
+        try:
+            self._live_viser.update_from_simulator(
+                self.env, self._live_viser_env_indices
+            )
+            self._live_viser_last_update_s = now
+        except Exception as exc:
+            print(f"[live-viser] disabled after update error: {exc}")
+            try:
+                self._live_viser.stop()
+            finally:
+                self._live_viser = None
     
     def _init_agent_and_algo(self) -> None:
         """Initialize the actor-critic network and PPO algorithm."""
@@ -193,6 +252,7 @@ class OnPolicyRunner:
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
+                    self._update_live_viser_bridge()
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),

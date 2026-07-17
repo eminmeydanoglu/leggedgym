@@ -1,0 +1,99 @@
+# FILE 3 — v3_rma_latent_probe.yaml
+# Driver manifest for the RMA latent-probe campaign (probe_rma_latent.py + probe_rma_analyze.py).
+# Consumed by run_rma_latent_probe_on_a115.sh and optionally a Python driver.
+
+campaign: v3_rma_latent_probe
+output_root: logs/eval/v3_ilk_deneme/probes/rma
+task: go2_v3_rma
+
+# ── Seeds ───────────────────────────────────────────────────────────────────
+seeds:
+  - label:      seed_1
+    load_run:   logs/go2_v3_dynamic/Jul16_15-17-45_v3_rma_genesis_seed1
+    checkpoint: best_tracking
+
+  - label:      seed_2
+    load_run:   logs/go2_v3_dynamic/Jul16_15-17-46_v3_rma_genesis_seed2
+    checkpoint: best_tracking
+
+# ── Axes and grids (single-axis ID sweep; pin others nominal) ────────────────
+axes:
+  friction:
+    grid: [0.50, 0.65, 0.80, 0.95, 1.10, 1.25]
+    norm_lo: 0.50
+    norm_hi: 1.25
+
+  added_mass:
+    grid: [-2.0, -1.0, 0.0, 1.0, 3.0, 5.0]
+    norm_lo: -2.0
+    norm_hi:  5.0
+
+  com_x:
+    grid: [-0.08, -0.04, 0.0, 0.04, 0.08]
+    norm_lo: -0.08
+    norm_hi:  0.08
+
+  com_y:
+    grid: [-0.08, -0.04, 0.0, 0.04, 0.08]
+    norm_lo: -0.08
+    norm_hi:  0.08
+
+  com_z:
+    grid: [-0.08, -0.04, 0.0, 0.04, 0.08]
+    norm_lo: -0.08
+    norm_hi:  0.08
+
+# ── Command set (index → [vx, vy, yaw]) ────────────────────────────────────
+commands:
+  # id: [vx,   vy,    yaw]
+  0: [0.0,   0.0,  0.0]   # stand
+  1: [1.0,   0.0,  0.0]   # fwd
+  2: [0.0,  -1.0,  0.0]   # lat-1.0
+  3: [0.0,  -0.5,  0.0]   # lat-0.5
+  4: [0.0,   0.5,  0.0]   # lat+0.5
+  5: [0.0,   1.0,  0.0]   # lat+1.0
+
+# ── Rollout parameters ──────────────────────────────────────────────────────
+per_point: 384        # envs per grid value
+steps:     500        # rollout steps per command (after warmup)
+warmup:    100        # steps before recording begins
+stride:    5          # record every N steps
+
+# max_samples cap (subsample if N rows exceeds this; set 0 to disable)
+max_samples: 0
+
+# ── Switch block ────────────────────────────────────────────────────────────
+switch:
+  command_id:  1       # fwd [1,0,0]
+  switch_step: 100     # apply the switch at this step (within the rollout)
+  switch_from: 0.0     # added_mass before switch (kg)
+  switch_to:   4.0     # added_mass after switch (kg)
+  steps:       400     # total steps in switch rollout
+  per_point:   384     # envs for switch rollout
+
+# ── Intervene block ─────────────────────────────────────────────────────────
+intervene:
+  axis:       added_mass
+  grid:       [-2.0, 0.0, 3.0, 5.0]
+  command_id: 1        # fwd
+  steps:      500
+  modes:
+    - student
+    - teacher_true
+    - teacher_nominal
+    - teacher_wrong
+  wrong_mode: swap_mass   # overwrite added_mass slot to opposite end
+
+# ── Smoke-test overrides ────────────────────────────────────────────────────
+# Run with SMOKE=1 in the shell wrapper to use these values instead.
+smoke:
+  per_point:   16
+  steps:       40
+  warmup:      10
+  stride:      5
+  switch:
+    steps:     80
+    switch_step: 20
+    per_point: 16
+  intervene:
+    steps: 40

@@ -483,3 +483,35 @@ class Go2BenchmarkV3CommonCfg(Go2BenchmarkCommonCfg):
         physics_resample_switch_window = [0.2, 0.8]
         physics_resample_mass = True
         physics_resample_com = True
+
+
+# ============================================================================
+# V4 terrain campaign. V3 stays flat and must not inherit these settings.
+# ============================================================================
+class Go2BenchmarkV4TerrainCfg(Go2BenchmarkV3CommonCfg):
+    """V3's physics contract on one fixed medium-difficulty terrain grid.
+
+    The terrain generator builds its deterministic type-by-difficulty grid
+    because ``curriculum`` is true. ``fixed_terrain_level`` then pins every
+    environment to row five (difficulty 5/10) instead of letting a method's
+    own performance alter the terrain distribution.
+    """
+    class terrain(Go2BenchmarkV3CommonCfg.terrain):
+        mesh_type = "heightfield"
+        border_size = 20.0
+        curriculum = True
+        selected = False
+        fixed_terrain_level = 5
+        terrain_length = 8.0
+        terrain_width = 8.0
+        platform_size = 4.0
+        num_rows = 10
+        num_cols = 10
+        terrain_proportions = [0.2, 0.1, 0.25, 0.25, 0.2]
+        measure_heights = True
+        # 1.6 m fore/aft by 1.0 m lateral, 17 x 11 = 187 samples.
+        measured_points_x = [
+            -0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.0,
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+        ]
+        measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
