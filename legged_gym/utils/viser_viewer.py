@@ -618,24 +618,30 @@ class ViserViewer:
         # heavy for the browser and get silently dropped, so the terrain looks
         # flat.  Downsampling by ``stride`` keeps world alignment (x/y scale by
         # stride) while cutting the triangle count to something renderable.
+        #
+        # Indexing must match ``Terrain`` / Genesis: height_samples[x_idx, y_idx]
+        # where axis-0 is world X (terrain rows / length) and axis-1 is world Y
+        # (terrain cols / width).  The old meshgrid default swapped X/Y, so the
+        # visual mesh sat at the wrong place and robots looked buried in the mesh
+        # even when physics feet were on the real heightfield.
         if stride > 1:
             height_samples = height_samples[::stride, ::stride]
             horizontal_scale = horizontal_scale * stride
         hfield = height_samples.astype(np.float64) * vertical_scale
-        nrow, ncol = hfield.shape
+        nx, ny = hfield.shape
 
-        x = np.arange(ncol) * horizontal_scale
-        y = np.arange(nrow) * horizontal_scale
-        xx, yy = np.meshgrid(x, y)
+        x = np.arange(nx) * horizontal_scale
+        y = np.arange(ny) * horizontal_scale
+        xx, yy = np.meshgrid(x, y, indexing="ij")
         zz = hfield
 
         vertices = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
 
-        ri, ci = np.mgrid[:nrow-1, :ncol-1]
-        i0 = (ri * ncol + ci).ravel()
+        xi, yi = np.mgrid[:nx - 1, :ny - 1]
+        i0 = (xi * ny + yi).ravel()
         faces = np.column_stack([
-            i0, i0 + 1, i0 + ncol + 1,
-            i0, i0 + ncol + 1, i0 + ncol,
+            i0, i0 + 1, i0 + ny + 1,
+            i0, i0 + ny + 1, i0 + ny,
         ]).reshape(-1, 3)
 
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
