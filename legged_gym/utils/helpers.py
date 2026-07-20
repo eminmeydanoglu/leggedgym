@@ -162,8 +162,8 @@ def get_args():
     parser.add_argument('--viewer',         type=str, default='native', choices=['native', 'viser'], 
                         help="viewer backend: 'native' for simulator viewer, 'viser' for web-based 3D viewer")
     parser.add_argument('--viser_port',     type=int, default=8080, help="port for viser web server (only used with --viewer viser)")
-    parser.add_argument('--terrain',        type=str, default='flat', choices=['flat', 'bumpy', 'course'],
-                        help="play terrain override: flat, mildly bumpy, or a rough course with stairs (used by play.py)")
+    parser.add_argument('--terrain',        type=str, default='flat', choices=['flat', 'bumpy', 'course', 'train'],
+                        help="play terrain override: flat, mildly bumpy, a rough course with stairs, or 'train' to keep the task's own training terrain unchanged (used by play.py)")
     parser.add_argument('--motion_file',    type=str, 
                         default=None, 
                         help="motion file to load, under resources/reference_motion")

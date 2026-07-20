@@ -14,6 +14,22 @@ from legged_gym.scripts.joystick import Joystick
 
 def configure_play_terrain(env_cfg, terrain_mode):
     """Apply a visual-playback terrain override without changing task training cfgs."""
+    if terrain_mode == "train":
+        # Show the task's own training terrain, but shrink the curriculum grid so
+        # it builds fast and fits in RAM locally.  Difficulty = row / num_rows, so
+        # num_rows=2 + fixed_terrain_level=1 keeps the exact difficulty (e.g. 0.5)
+        # the policy trained on; num_cols=5 gives one tile of every terrain type
+        # (slope | random-uniform | stairs-up | stairs-down | discrete).
+        # difficulty in curiculum() is row/num_rows; the trained v4 grid uses
+        # fixed_terrain_level=5 of num_rows=10 => 0.5.  num_rows=2 + level=1 keeps
+        # that same 0.5 while building only 2x5 tiles instead of 10x10.
+        if getattr(env_cfg.terrain, "fixed_terrain_level", None) is not None:
+            level_frac = env_cfg.terrain.fixed_terrain_level / env_cfg.terrain.num_rows
+            env_cfg.terrain.num_rows = 2
+            env_cfg.terrain.num_cols = 5
+            env_cfg.terrain.fixed_terrain_level = round(level_frac * env_cfg.terrain.num_rows)
+            env_cfg.terrain.border_size = 2.0
+        return
     if terrain_mode == "flat":
         env_cfg.terrain.mesh_type = "plane"
         env_cfg.terrain.curriculum = False
@@ -75,8 +91,9 @@ def override_configs(env_cfg, args, task_type):
         task_type: type of the task
     """
     # override some parameters for testing
-    # number of environments
-    env_cfg.env.num_envs = 2
+    # number of environments (respect --num_envs when given, e.g. to spread
+    # robots across every terrain type on the training grid)
+    env_cfg.env.num_envs = args.num_envs if getattr(args, "num_envs", None) else 2
     if task_type == "cts" or task_type == "cts_amp": # concurrent teacher-student specific
         env_cfg.env.num_teacher = 1
     elif "depth" in task_type:  # depth specific
@@ -146,11 +163,11 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
     # Get initial observations according to task type
     if task_type == "ts_depth":
         obs_buf, privileged_obs_buf, depth_image, critic_obs = env.get_observations()
-    elif task_type in {"ts", "cat", "cts", "cts_amp", "rma", "bench_rma", "v3_rma"}: # teacher-student specific (including RMA)
+    elif task_type in {"ts", "cat", "cts", "cts_amp", "rma", "bench_rma", "v3_rma", "v4_rma"}: # teacher-student specific (including RMA)
         obs_buf, privileged_obs_buf, obs_history, critic_obs = env.get_observations()
     elif task_type == "ee":
         estimator_features, _, _ = env.get_observations()
-    elif task_type == "dreamwaq":  # dreamwaq
+    elif task_type in {"dreamwaq", "v4_dreamwaq"}:  # dreamwaq
         obs_buf, privileged_obs_buf, obs_history, explicit_labels, next_states = env.get_observations()
     else: # vanilla
         obs_buf = env.get_observations()
@@ -189,13 +206,13 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         if task_type == "ts_depth":
             actions = policy(obs_buf, depth_image)
             obs_buf, privileged_obs_buf, depth_image, critic_obs, rews, dones, infos = env.step(actions.detach())
-        elif task_type in {"ts", "cat", "cts", "rma", "bench_rma", "v3_rma"}:
+        elif task_type in {"ts", "cat", "cts", "rma", "bench_rma", "v3_rma", "v4_rma"}:
             actions = policy(obs_buf, obs_history)
             obs_buf, privileged_obs_buf, obs_history, critic_obs, rews, dones, infos = env.step(actions.detach())
         elif task_type == "ee":
             actions = policy(estimator_features.detach())
             estimator_features, estimator_labels, _, rews, dones, infos = env.step(actions.detach())
-        elif task_type == "dreamwaq":
+        elif task_type in {"dreamwaq", "v4_dreamwaq"}:
             actions = policy(obs_buf, obs_history)
             obs_buf, privileged_obs_buf, obs_history, explicit_labels, next_states, rews, dones, infos = env.step(actions.detach())
         elif task_type == "amp":
@@ -210,6 +227,10 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         
         if viser_viewer is not None:
             viser_viewer.update_from_simulator(env, [robot_index])
+            viser_viewer.update_live_telemetry(
+                env.simulator.base_lin_vel[robot_index].detach().cpu().numpy(),
+                env.simulator.base_ang_vel[robot_index, 2].item(),
+            )
 
         print_debug_info(env, robot_index)
         
@@ -268,7 +289,7 @@ def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
     elif task_type == "ee":
         exporter = PolicyExporterEE(alg_runner.alg.actor_critic)
         exporter.export(path, env_cfg, args.export_onnx, train_cfg)
-    elif task_type == "dreamwaq":
+    elif task_type in {"dreamwaq", "v4_dreamwaq"}:
         exporter = PolicyExporterWaQ(alg_runner.alg.actor_critic)
         exporter.export(path, env_cfg, args.export_onnx, train_cfg)
     else:

@@ -466,6 +466,7 @@ class ViserViewer:
         self._setup_camera()
         self._setup_camera_gui()
         self._setup_command_sliders()
+        self._setup_live_telemetry()
         self._setup_respawn_button()
 
     def _setup_camera(self) -> None:
@@ -534,6 +535,30 @@ class ViserViewer:
                 initial_value=0.0,
             )
 
+    def _setup_live_telemetry(self) -> None:
+        """Add read-only fields for the simulated base velocities."""
+        with self.server.gui.add_folder("Live Base Velocity", expand_by_default=True):
+            self._telemetry_fields = {
+                "linear": self.server.gui.add_text(
+                    "Linear (m/s)",
+                    initial_value="vx=+0.000  vy=+0.000  vz=+0.000",
+                    disabled=True,
+                ),
+                "yaw": self.server.gui.add_text(
+                    "Angular yaw (rad/s)",
+                    initial_value="+0.000",
+                    disabled=True,
+                ),
+            }
+
+    def update_live_telemetry(self, linear_velocity, yaw_rate) -> None:
+        """Publish current simulated base linear velocity and yaw rate."""
+        linear = np.asarray(linear_velocity, dtype=float)
+        self._telemetry_fields["linear"].value = (
+            f"vx={linear[0]:+.3f}  vy={linear[1]:+.3f}  vz={linear[2]:+.3f}"
+        )
+        self._telemetry_fields["yaw"].value = f"{float(yaw_rate):+.3f}"
+
     def _setup_respawn_button(self) -> None:
         """Add a manual "Respawn" button that triggers self._respawn_callback."""
         self._respawn_callback: Optional[object] = None
@@ -587,7 +612,15 @@ class ViserViewer:
         horizontal_scale: float = 0.1,
         vertical_scale: float = 0.005,
         return_mesh: bool = False,
+        stride: int = 1,
     ):
+        # Full-resolution heightfields (e.g. 1200x1200 ~ 2.9M triangles) are too
+        # heavy for the browser and get silently dropped, so the terrain looks
+        # flat.  Downsampling by ``stride`` keeps world alignment (x/y scale by
+        # stride) while cutting the triangle count to something renderable.
+        if stride > 1:
+            height_samples = height_samples[::stride, ::stride]
+            horizontal_scale = horizontal_scale * stride
         hfield = height_samples.astype(np.float64) * vertical_scale
         nrow, ncol = hfield.shape
 
@@ -738,6 +771,7 @@ def create_viser_viewer(
                 horizontal_scale=env.cfg.terrain.horizontal_scale,
                 vertical_scale=env.cfg.terrain.vertical_scale,
                 return_mesh=True,
+                stride=3,
             )
             if mesh is not None:
                 translation = trimesh.transformations.translation_matrix(transform)
