@@ -102,3 +102,8 @@ lpacr/*.pdf
 lpacr/subplans/
 lpacr/tokens.md
 lpacr/dashboard/data/
+
+# Upstream multi-sim packaging (we run Genesis natively / on cluster, not these)
+/Dockerfile
+/Dockerfile.*
+/switch_simulator.sh
