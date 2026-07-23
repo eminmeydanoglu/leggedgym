@@ -520,11 +520,15 @@ class ViserViewer:
         T/G = forward/back, F/H = strafe left/right, R/Y = turn left/right,
         Space = hard stop.  (WASD is deliberately avoided - viser's own 3D
         fly-controls already bind those keys; T/F/G/H keep the same inverted-T
-        layout on free keys.)  Viser's GUI only forwards key-*down* events
-        (there is no key-up), so "held" is inferred from the browser's
-        key-repeat: a key counts as held while repeat events keep arriving, and
-        once they stop the command coasts smoothly back to zero (see
-        ``get_command``)."""
+        layout on free keys.)
+
+        Viser only forwards key-*down* (no key-up).  Hold is inferred from
+        browser key-repeat.  Browsers only auto-repeat the *last* key, so a
+        second key used to drop the first; we promote already-active keys to
+        **sticky latches** when a new key is pressed so multi-axis chords work
+        (e.g. hold T then tap R keeps forward).  Sticky keys clear on a second
+        press of the same key or Space.
+        """
         # command envelope in the robot base frame (m/s, m/s, rad/s)
         self._max_vel = {"fwd": 1.5, "back": 1.0, "lat": 0.7, "yaw": 1.5}
         self._tau_accel = 0.10   # ramp-up time constant (s)
@@ -538,11 +542,17 @@ class ViserViewer:
         # detected almost immediately and the command coasts to zero promptly.
         self._repeat_gap_max = 0.15   # max gap counted as auto-repeat (s)
         self._grace_initial = 0.6     # release window before repeats confirmed
-        self._grace_repeat = 0.15     # release window once repeating
+        self._grace_repeat = 0.18     # release window once repeating (slightly > typical gap)
+        # When a new key is pressed, any other key seen this recently is promoted
+        # to sticky (bridges the gap left by browser single-key-repeat).
+        self._multi_key_promote_window = 0.40
 
         keys = ("T", "F", "G", "H", "R", "Y")
+        self._drive_keys = keys
         self._key_last_ts: Dict[str, float] = {k: -1e9 for k in keys}
         self._key_repeating: Dict[str, bool] = {k: False for k in keys}
+        # Sticky latches: stay on without key-repeat (multi-key chords).
+        self._key_sticky: Dict[str, bool] = {k: False for k in keys}
         self._cmd_vel = np.zeros(3, dtype=float)  # ramped [vx, vy, yaw]
         self._get_command_last_t: Optional[float] = None
 
@@ -557,21 +567,18 @@ class ViserViewer:
 
         with self.server.gui.add_folder("Keyboard Drive (TFGH/RY)", expand_by_default=True):
             self.server.gui.add_markdown(
-                "**Hold** a key to move, **release** to coast to a stop.\n\n"
+                "**Hold** a key to move; combining keys keeps prior axes on "
+                "(sticky). Press the same key again or **Space** to clear.\n\n"
                 "- **T / G** forward / back\n"
                 "- **F / H** strafe left / right\n"
                 "- **R / Y** turn left / right\n"
-                "- **Space** hard stop\n\n"
+                "- **Space** hard stop (clears all axes)\n\n"
                 "_Click the 3D view first so it has keyboard focus._"
             )
 
             def _make_press(key: str):
                 def _(_event) -> None:
-                    now = time.perf_counter()
-                    # two triggers closer than _repeat_gap_max => auto-repeat
-                    if now - self._key_last_ts[key] <= self._repeat_gap_max:
-                        self._key_repeating[key] = True
-                    self._key_last_ts[key] = now
+                    self._on_drive_key_event(key, now=time.perf_counter())
                 return _
 
             for key, label in key_labels.items():
@@ -581,12 +588,76 @@ class ViserViewer:
             stop_cmd = self.server.gui.add_command("Stop (Space)", hotkey="space")
 
             def _stop(_event) -> None:
-                for k in self._key_last_ts:
-                    self._key_last_ts[k] = -1e9
-                    self._key_repeating[k] = False
-                self._cmd_vel[:] = 0.0
+                self.clear_drive_command()
 
             stop_cmd.on_trigger(_stop)
+
+    def clear_drive_command(self) -> None:
+        """Zero sticky/held keyboard drive state and the ramped command."""
+        if not hasattr(self, "_key_last_ts"):
+            return
+        for k in self._key_last_ts:
+            self._key_last_ts[k] = -1e9
+            self._key_repeating[k] = False
+            self._key_sticky[k] = False
+        self._cmd_vel[:] = 0.0
+
+    def _is_drive_key_active(self, key: str, now: Optional[float] = None) -> bool:
+        """True if key contributes to the command (sticky or grace-held)."""
+        if not hasattr(self, "_key_last_ts") or key not in self._key_last_ts:
+            return False
+        if self._key_sticky.get(key, False):
+            return True
+        if now is None:
+            now = time.perf_counter()
+        elapsed = now - self._key_last_ts[key]
+        grace = self._grace_repeat if self._key_repeating[key] else self._grace_initial
+        return elapsed <= grace
+
+    def _was_recently_active(self, key: str, now: float) -> bool:
+        """Broader window used when deciding multi-key sticky promotion."""
+        if self._key_sticky.get(key, False):
+            return True
+        if self._key_last_ts[key] < 0:
+            return False
+        return (now - self._key_last_ts[key]) <= self._multi_key_promote_window
+
+    def _on_drive_key_event(self, key: str, now: Optional[float] = None) -> None:
+        """Handle a single key-down / auto-repeat event for multi-key drive.
+
+        Pure control-flow (no GUI); unit-tested.  When a *new* key is pressed
+        while others are active, those others become sticky so the browser's
+        single-key-repeat does not zero their axes.
+        """
+        if key not in self._key_last_ts:
+            return
+        if now is None:
+            now = time.perf_counter()
+        last = self._key_last_ts[key]
+        is_repeat = (last > 0.0) and ((now - last) <= self._repeat_gap_max)
+
+        if is_repeat:
+            self._key_repeating[key] = True
+            self._key_last_ts[key] = now
+            return
+
+        # Fresh press (not auto-repeat).  Second press on a sticky key clears it.
+        if self._key_sticky.get(key, False):
+            self._key_sticky[key] = False
+            self._key_last_ts[key] = -1e9
+            self._key_repeating[key] = False
+            return
+
+        # Multi-key: promote other recently-active keys to sticky latches.
+        promote_window = getattr(self, "_multi_key_promote_window", 0.40)
+        for k in self._key_last_ts:
+            if k == key:
+                continue
+            if self._was_recently_active(k, now):
+                self._key_sticky[k] = True
+
+        self._key_last_ts[key] = now
+        self._key_repeating[key] = False
 
     def _setup_live_telemetry(self) -> None:
         """Read-out of commanded vs. achieved base velocity, as numbers and as
@@ -690,6 +761,7 @@ class ViserViewer:
     def _setup_respawn_button(self) -> None:
         """Add a manual "Respawn" button that triggers self._respawn_callback."""
         self._respawn_callback: Optional[object] = None
+        self._taxonomy_spawn_callback: Optional[object] = None
 
         with self.server.gui.add_folder("Reset", expand_by_default=True):
             respawn_button = self.server.gui.add_button("Respawn")
@@ -703,14 +775,84 @@ class ViserViewer:
         """Register a callback invoked when the "Respawn" button is clicked."""
         self._respawn_callback = callback
 
+    def setup_taxonomy_spawn_panel(
+        self,
+        type_names: Optional[Sequence[str]] = None,
+        num_levels: int = 4,
+        initial_level: int = 0,
+        initial_type: int = 0,
+    ) -> None:
+        """GUI to teleport the play robot onto a taxonomy tile (type × level).
+
+        Call ``set_taxonomy_spawn_callback(fn)`` with
+        ``fn(level: int, type_idx: int)`` to wire the teleport.
+        """
+        from legged_gym.utils.terrain import TAXONOMY_TYPE_NAMES, TAXONOMY_NUM_LEVELS
+
+        names = list(type_names) if type_names is not None else list(TAXONOMY_TYPE_NAMES)
+        n_levels = int(num_levels) if num_levels else TAXONOMY_NUM_LEVELS
+        level_options = [f"L{i}" for i in range(n_levels)]
+        init_level = int(max(0, min(initial_level, n_levels - 1)))
+        init_type = int(max(0, min(initial_type, len(names) - 1)))
+
+        with self.server.gui.add_folder("Spawn (taxonomy)", expand_by_default=True):
+            self.server.gui.add_markdown(
+                "Teleport the robot to a **type × level** tile of the taxonomy "
+                "showcase grid."
+            )
+            dd_type = self.server.gui.add_dropdown(
+                "Terrain type",
+                options=names,
+                initial_value=names[init_type],
+            )
+            dd_level = self.server.gui.add_dropdown(
+                "Difficulty",
+                options=level_options,
+                initial_value=level_options[init_level],
+            )
+            status = self.server.gui.add_text(
+                "Last spawn",
+                initial_value="(none yet)",
+                disabled=True,
+            )
+            btn = self.server.gui.add_button("Teleport", color="green")
+
+            @btn.on_click
+            def _(_) -> None:
+                try:
+                    type_idx = names.index(dd_type.value)
+                except ValueError:
+                    type_idx = 0
+                try:
+                    level = level_options.index(dd_level.value)
+                except ValueError:
+                    level = 0
+                ok = False
+                if self._taxonomy_spawn_callback is not None:
+                    ok = bool(self._taxonomy_spawn_callback(level, type_idx))
+                label = f"{names[type_idx]} L{level}"
+                status.value = f"{'OK' if ok else 'FAILED'}: {label}"
+                print(f"[viser] taxonomy spawn → {label} (ok={ok})")
+
+        self._taxonomy_spawn_gui = {
+            "type": dd_type,
+            "level": dd_level,
+            "status": status,
+        }
+
+    def set_taxonomy_spawn_callback(self, callback) -> None:
+        """Register ``callback(level: int, type_idx: int) -> bool`` for Teleport."""
+        self._taxonomy_spawn_callback = callback
+
     def get_command(self) -> np.ndarray:
         """Current velocity command [lin_vel_x, lin_vel_y, ang_vel_yaw] derived
-        from the WASD/QE keys.
+        from the TFGH/RY keys.
 
-        Each held key defines a per-axis *target*; the returned command ramps
+        Each active key defines a per-axis *target*; the returned command ramps
         towards that target (fast when accelerating, slower when coasting) so
         the robot eases in and, on release, decelerates smoothly to zero rather
-        than snapping.
+        than snapping.  Active = sticky latch or grace-held (see
+        ``_on_drive_key_event``).
         """
         if not hasattr(self, "_key_last_ts"):
             return np.array([0.0, 0.0, 0.0])
@@ -724,13 +866,15 @@ class ViserViewer:
         dt = float(min(max(dt, 0.0), 0.1))
 
         def held(key: str) -> bool:
+            if self._key_sticky.get(key, False):
+                return True
             elapsed = now - self._key_last_ts[key]
             grace = self._grace_repeat if self._key_repeating[key] else self._grace_initial
-            is_held = elapsed < grace
+            is_held = elapsed <= grace
             # Only clear the auto-repeat latch after the *long* timeout, so that
             # crossing the short repeat-grace doesn't snap the window back open
             # and re-trigger the hold.  A new press then re-primes from scratch.
-            if elapsed >= self._grace_initial:
+            if elapsed > self._grace_initial:
                 self._key_repeating[key] = False
             return is_held
 
@@ -942,6 +1086,52 @@ class ViserViewer:
             )
         self.server.flush()
 
+    def set_taxonomy_labels(self, label_map) -> None:
+        """Place per-tile text labels (~1.5 m above origins) in the Viser scene.
+
+        Genesis has no in-world text draw API; Viser ``add_label`` is the
+        interactive fallback so each showcase tile shows its type+level name.
+        """
+        if not label_map:
+            return
+        # Clear previous labels if re-called.
+        for handle in getattr(self, "_taxonomy_label_handles", []):
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._taxonomy_label_handles = []
+        # Colored marker spheres at the same height as a visual type key.
+        for entry in label_map:
+            pos = np.asarray(entry["position"], dtype=np.float64)
+            label = str(entry["label"])
+            row = int(entry.get("row", 0))
+            col = int(entry.get("col", 0))
+            try:
+                handle = self.server.scene.add_label(
+                    f"/taxonomy/label_{row}_{col}",
+                    text=label,
+                    position=pos,
+                    font_size_mode="scene",
+                    font_scene_height=0.35,
+                    anchor="center-center",
+                )
+                self._taxonomy_label_handles.append(handle)
+            except Exception as e:
+                print(f"[viser_viewer] taxonomy label failed ({label}): {e}")
+            color = entry.get("color", (1.0, 0.0, 0.0, 1.0))
+            rgba = tuple(int(max(0, min(255, c * 255))) for c in color[:3])
+            try:
+                sphere = self.server.scene.add_icosphere(
+                    f"/taxonomy/marker_{row}_{col}",
+                    radius=0.12,
+                    position=pos,
+                    color=rgba,
+                )
+                self._taxonomy_label_handles.append(sphere)
+            except Exception:
+                pass
+
     def stop(self) -> None:
         if hasattr(self, 'server'):
             self.server.stop()
@@ -1010,6 +1200,40 @@ def create_viser_viewer(
                 translation = trimesh.transformations.translation_matrix(transform)
                 mesh.apply_transform(translation)
                 viewer.set_terrain_mesh(mesh)
+
+        # Taxonomy showcase labels (Viser text; Genesis has no draw_debug_text).
+        from legged_gym.utils.terrain import (
+            build_taxonomy_label_map,
+            is_taxonomy_terrain_cfg,
+            TAXONOMY_LABEL_Z_OFFSET,
+            TAXONOMY_TYPE_NAMES,
+        )
+        if is_taxonomy_terrain_cfg(env.cfg.terrain):
+            label_map = getattr(terrain, "taxonomy_labels", None)
+            if not label_map and hasattr(terrain, "env_origins"):
+                label_map = build_taxonomy_label_map(
+                    terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
+                )
+            if label_map:
+                viewer.set_taxonomy_labels(label_map)
+                # Elevated oblique default looking at the grid centre.
+                length = float(env.cfg.terrain.terrain_length)
+                width = float(env.cfg.terrain.terrain_width)
+                cx = 0.5 * env.cfg.terrain.num_rows * length
+                cy = 0.5 * env.cfg.terrain.num_cols * width
+                viewer._camera_offset = np.array([cx - 18.0, cy - 22.0, 32.0]) - np.array([cx, cy, 0.0])
+                # Absolute initial pose for new clients (not robot-relative).
+                @viewer.server.on_client_connect
+                def _taxonomy_cam(client, _cx=cx, _cy=cy) -> None:
+                    client.camera.position = np.array([_cx - 18.0, _cy - 22.0, 32.0])
+                    client.camera.look_at = np.array([_cx, _cy, 0.0])
+                    client.camera.fov = np.radians(55.0)
+            viewer.setup_taxonomy_spawn_panel(
+                type_names=TAXONOMY_TYPE_NAMES,
+                num_levels=int(env.cfg.terrain.num_rows),
+                initial_level=0,
+                initial_type=0,
+            )
     except Exception as e:
         print(f"[viser_viewer] Warning: Could not load terrain: {e}")
 

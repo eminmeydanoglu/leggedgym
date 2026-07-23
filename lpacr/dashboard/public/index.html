@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0c0f0e">
+    <title>Curriculum Atlas</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <header class="topbar">
+        <div class="identity">
+          <select id="runSelect" aria-label="Training run"></select>
+        </div>
+        <nav class="mode-switch" aria-label="Playback mode">
+          <button id="liveButton" class="active">Live</button>
+          <button id="historyButton">History</button>
+        </nav>
+        <div class="step-readout"><span id="stepValue">—</span><small>iteration</small></div>
+      </header>
+
+      <section class="controls" aria-label="Chart controls">
+        <label>X <select id="xDimension"></select></label>
+        <label>Y <select id="yDimension"></select></label>
+        <label>Panels <select id="facetDimension"></select></label>
+        <label id="filterWrap">Filter <select id="filterValue"></select></label>
+        <label>Metric <select id="metricSelect"></select></label>
+        <div id="colorLegend" class="color-legend" aria-label="Metric color scale"></div>
+      </section>
+
+      <section class="atlas-section">
+        <div class="panel-key">
+          <span>Panels</span>
+          <strong id="panelDimension">—</strong>
+          <i aria-hidden="true"></i>
+        </div>
+        <div id="atlas" class="atlas" aria-live="polite"></div>
+      </section>
+
+      <section class="triptych-section">
+        <div class="section-rule"><span>Signals</span></div>
+        <div id="triptych" class="triptych"></div>
+      </section>
+
+      <section class="timeline-section">
+        <div class="section-rule"><span>Marginals over time</span></div>
+        <div id="timelines" class="timelines"></div>
+      </section>
+
+      <footer class="playback">
+        <button id="playButton" aria-label="Play history">▶</button>
+        <input id="timeSlider" type="range" min="0" max="0" value="0" aria-label="Training history">
+        <span id="frameCount">0 / 0</span>
+      </footer>
+
+      <aside id="detail" class="detail" aria-hidden="true"></aside>
+      <div id="empty" class="empty">
+        <strong>Waiting for training data</strong>
+        <span>Start the server, then connect a plugger.</span>
+      </div>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,49 @@
+{
+  "run_id": "demo-live",
+  "created_at": 1784784527.7331967,
+  "task_space": {
+    "dimensions": [
+      "terrain_type",
+      "terrain_level",
+      "vx_bin",
+      "yaw_bin"
+    ],
+    "coordinates": {
+      "terrain_type": [
+        "Descending",
+        "Ascending",
+        "Rough",
+        "Uphill",
+        "Downhill"
+      ],
+      "terrain_level": [
+        "L1",
+        "L2",
+        "L3",
+        "L4"
+      ],
+      "vx_bin": [
+        "0–0.5",
+        "0.5–1.0",
+        "1.0–1.5",
+        "1.5–2.0",
+        "2.0–2.5"
+      ],
+      "yaw_bin": [
+        "0–0.5",
+        "0.5–1.0",
+        "1.0–1.5",
+        "1.5–2.0",
+        "2.0–2.5",
+        "2.5–3.0"
+      ]
+    }
+  },
+  "metric_names": [
+    "performance",
+    "learning_progress",
+    "sampling_probability",
+    "success_rate",
+    "sample_count"
+  ]
+}

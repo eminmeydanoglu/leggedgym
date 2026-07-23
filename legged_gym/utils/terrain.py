@@ -32,14 +32,186 @@ import numpy as np
 import trimesh
 
 from . import terrain_utils
-from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
+# Avoid importing legged_gym.envs here (that package pulls simulators which import
+# Terrain) — keeps pure heightfield unit tests importable without a cycle.
+
+# ---------------------------------------------------------------------------
+# LP-ACRL taxonomy showcase (6 types x 4 levels) — pure geometry tables
+# Source of truth: lpacr/solun_plani.md §4 / paper Appendix C.
+# ---------------------------------------------------------------------------
+TAXONOMY_NUM_LEVELS = 4
+TAXONOMY_NUM_TYPES = 6
+TAXONOMY_STEP_WIDTH = 0.4  # m, fixed for all stair levels
+TAXONOMY_STEP_HEIGHTS = (0.05, 0.10, 0.15, 0.20)  # m, L0..L3
+TAXONOMY_SLOPE_GRADIENTS = (0.00, 0.13, 0.27, 0.40)  # |gradient|, L0..L3
+TAXONOMY_ROUGH_AMPLITUDES = (0.02, 0.045, 0.07, 0.10)  # m ±amplitude, L0..L3
+# English paper-style labels (LP-ACRL taxonomy types).
+TAXONOMY_TYPE_NAMES = (
+    "Ascending stairs",
+    "Descending stairs",
+    "Upslope",
+    "Downslope",
+    "Random roughness",
+    "Flat",
+)
+# Per-type RGBA for debug spheres / console legend when in-world text is unavailable.
+TAXONOMY_TYPE_COLORS = (
+    (1.0, 0.25, 0.2, 1.0),   # ascending stairs — red
+    (0.2, 0.45, 1.0, 1.0),   # descending stairs — blue
+    (1.0, 0.65, 0.1, 1.0),   # upslope — orange
+    (0.15, 0.85, 0.35, 1.0), # downslope — green
+    (0.75, 0.25, 0.85, 1.0), # random roughness — purple
+    (0.7, 0.7, 0.7, 1.0),    # flat — gray
+)
+TAXONOMY_LABEL_Z_OFFSET = 1.5  # m above tile origin
+
+
+def taxonomy_tile_label(level: int, type_idx: int) -> str:
+    """Return the showcase label for grid cell (level row, type column)."""
+    if not 0 <= level < TAXONOMY_NUM_LEVELS:
+        raise ValueError(f"level must be in 0..{TAXONOMY_NUM_LEVELS - 1}, got {level}")
+    if not 0 <= type_idx < TAXONOMY_NUM_TYPES:
+        raise ValueError(f"type_idx must be in 0..{TAXONOMY_NUM_TYPES - 1}, got {type_idx}")
+    return f"{TAXONOMY_TYPE_NAMES[type_idx]} L{level}"
+
+
+def build_taxonomy_label_map(env_origins, z_offset: float = TAXONOMY_LABEL_Z_OFFSET):
+    """Build per-tile label metadata from env_origins shaped (num_rows, num_cols, 3).
+
+    Returns a list of dicts: row, col, label, color, position (x,y,z with z_offset).
+    """
+    origins = np.asarray(env_origins, dtype=np.float64)
+    if origins.ndim != 3 or origins.shape[2] != 3:
+        raise ValueError(f"env_origins must be (R, C, 3), got {origins.shape}")
+    num_rows, num_cols = origins.shape[0], origins.shape[1]
+    labels = []
+    for i in range(num_rows):
+        for j in range(num_cols):
+            # Clamp type name index when a non-showcase grid is passed in.
+            type_idx = min(j, TAXONOMY_NUM_TYPES - 1)
+            level = min(i, TAXONOMY_NUM_LEVELS - 1)
+            ox, oy, oz = origins[i, j]
+            labels.append({
+                "row": i,
+                "col": j,
+                "level": level,
+                "type_idx": type_idx,
+                "label": taxonomy_tile_label(level, type_idx) if (
+                    num_rows == TAXONOMY_NUM_LEVELS and num_cols == TAXONOMY_NUM_TYPES
+                ) else f"tile r{i}c{j}",
+                "color": TAXONOMY_TYPE_COLORS[type_idx],
+                "position": np.array([ox, oy, oz + z_offset], dtype=np.float64),
+            })
+    return labels
+
+
+def format_taxonomy_console_map(label_map) -> str:
+    """Human-readable 6×4 (cols×rows printed top=L3) grid of labels + positions."""
+    by_rc = {(e["row"], e["col"]): e for e in label_map}
+    if not by_rc:
+        return "(empty taxonomy map)"
+    max_r = max(r for r, _ in by_rc)
+    max_c = max(c for _, c in by_rc)
+    lines = ["Taxonomy showcase grid (row=L0.. bottom→top, col=type):"]
+    # Print hardest level first so top-of-console matches top-of-grid (higher X).
+    for i in range(max_r, -1, -1):
+        cells = []
+        for j in range(max_c + 1):
+            e = by_rc[(i, j)]
+            p = e["position"]
+            cells.append(f"{e['label']} @({p[0]:.1f},{p[1]:.1f})")
+        lines.append(f"  L{i}: " + " | ".join(cells))
+    lines.append("Legend colors (type index): " + ", ".join(
+        f"{k}:{TAXONOMY_TYPE_NAMES[k]}" for k in range(TAXONOMY_NUM_TYPES)
+    ))
+    return "\n".join(lines)
+
+
+def is_taxonomy_terrain_cfg(cfg) -> bool:
+    """True when cfg selects the LP-ACRL taxonomy showcase builder."""
+    mode = getattr(cfg, "mode", None)
+    if mode is not None and str(mode).lower() in ("taxonomy", "showcase"):
+        return True
+    return bool(getattr(cfg, "taxonomy_showcase", False))
+
+
+def clamp_taxonomy_spawn(level: int, type_idx: int, num_rows: int = TAXONOMY_NUM_LEVELS,
+                         num_cols: int = TAXONOMY_NUM_TYPES):
+    """Clamp (level, type) into a valid grid cell."""
+    level = int(max(0, min(int(level), int(num_rows) - 1)))
+    type_idx = int(max(0, min(int(type_idx), int(num_cols) - 1)))
+    return level, type_idx
+
+
+def apply_taxonomy_tile_assignment(
+    terrain_levels,
+    terrain_types,
+    env_origins,
+    terrain_origins,
+    env_ids,
+    level: int,
+    type_idx: int,
+):
+    """Assign envs to a taxonomy tile origin (in-place).
+
+    Works with numpy arrays or torch tensors.  ``terrain_origins`` is shaped
+    (num_rows, num_cols, 3).  Returns the origin applied (length-3 vector /
+    tensor row).
+    """
+    num_rows = int(terrain_origins.shape[0])
+    num_cols = int(terrain_origins.shape[1])
+    level, type_idx = clamp_taxonomy_spawn(level, type_idx, num_rows, num_cols)
+    origin = terrain_origins[level, type_idx]
+    # Support list/tuple/np/torch env_ids.
+    try:
+        import torch
+        if isinstance(env_ids, torch.Tensor):
+            ids_iter = env_ids.detach().cpu().tolist()
+        else:
+            ids_iter = list(env_ids)
+    except Exception:
+        ids_iter = list(env_ids)
+    for i in ids_iter:
+        ii = int(i)
+        terrain_levels[ii] = level
+        terrain_types[ii] = type_idx
+        env_origins[ii] = origin
+    return origin
+
+
+def teleport_env_to_taxonomy_tile(env, env_index: int, level: int, type_idx: int) -> bool:
+    """Teleport one play env onto a taxonomy tile and reset it there.
+
+    Requires a heightfield/trimesh sim with ``_terrain_origins``.  Returns True
+    on success.
+    """
+    import torch
+    sim = env.simulator
+    if not getattr(sim, "custom_origins", False):
+        return False
+    if not hasattr(sim, "_terrain_origins"):
+        return False
+    env_ids = torch.tensor([int(env_index)], device=env.device, dtype=torch.long)
+    apply_taxonomy_tile_assignment(
+        sim.terrain_levels,
+        sim.terrain_types,
+        sim.env_origins,
+        sim._terrain_origins,
+        env_ids,
+        level,
+        type_idx,
+    )
+    env.reset_idx(env_ids)
+    return True
+
 
 class Terrain:
-    def __init__(self, cfg: LeggedRobotCfg.terrain) -> None:
+    def __init__(self, cfg) -> None:
 
         self.cfg = cfg
         self.type = cfg.mesh_type
         self.simplify_mesh = cfg.simplify_mesh
+        self.taxonomy_labels = []
         if self.type in ["none", 'plane']:
             return
         self.env_length = cfg.terrain_length
@@ -81,9 +253,12 @@ class Terrain:
             self.height_field_raw = raw.copy()
             self.heightsamples = self.height_field_raw
             return
-        if cfg.curriculum and cfg.selected:
+        if is_taxonomy_terrain_cfg(cfg):
+            print("Generating taxonomy showcase terrain (6 types x 4 levels)...")
+            self.taxonomy_showcase()
+        elif cfg.curriculum and cfg.selected:
             raise ValueError("Curriculum and selected terrain cannot be both True.")
-        if cfg.curriculum:
+        elif cfg.curriculum:
             print("Generating curriculum terrain...")
             self.terrain_curriculum_difficulty = cfg.terrain_curriculum_difficulty
             self.curiculum()
@@ -137,6 +312,101 @@ class Terrain:
                 
             eval(terrain_type)(terrain, **self.cfg.terrain_kwargs, terrain_type=self.type)
             self.add_terrain_to_map(terrain, i, j)
+
+    def taxonomy_showcase(self):
+        """Build the LP-ACRL 6-type × 4-level taxonomy grid as a fixed exhibit.
+
+        Rows (X) are difficulty L0..L3 bottom→top; columns (Y) are:
+          0 ascending stairs, 1 descending stairs, 2 upslope, 3 downslope,
+          4 random roughness, 5 flat (degenerate geometry, still 4 cells).
+
+        Curriculum promote/demote is intentionally not used here — this is a
+        static showcase for visualization / play.
+        """
+        if self.cfg.num_rows != TAXONOMY_NUM_LEVELS or self.cfg.num_cols != TAXONOMY_NUM_TYPES:
+            # Still build what was requested, but warn: geometry tables index by level.
+            print(
+                f"[taxonomy] warning: expected {TAXONOMY_NUM_LEVELS}x{TAXONOMY_NUM_TYPES} "
+                f"grid, got {self.cfg.num_rows}x{self.cfg.num_cols}"
+            )
+        seed = int(getattr(self.cfg, "taxonomy_seed", 0))
+        rng_state = np.random.get_state()
+        np.random.seed(seed)
+        try:
+            for i in range(self.cfg.num_rows):
+                for j in range(self.cfg.num_cols):
+                    level = min(i, TAXONOMY_NUM_LEVELS - 1)
+                    type_idx = min(j, TAXONOMY_NUM_TYPES - 1)
+                    terrain = self._make_taxonomy_subterrain(level, type_idx)
+                    self.add_terrain_to_map(terrain, i, j)
+        finally:
+            np.random.set_state(rng_state)
+
+        self.taxonomy_labels = build_taxonomy_label_map(
+            self.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
+        )
+
+    def _make_taxonomy_subterrain(self, level: int, type_idx: int):
+        """Create one SubTerrain cell for taxonomy type/level using shared generators."""
+        terrain = terrain_utils.SubTerrain(
+            "terrain",
+            width=self.width_per_env_pixels,
+            length=self.length_per_env_pixels,
+            vertical_scale=self.cfg.vertical_scale,
+            horizontal_scale=self.cfg.horizontal_scale,
+        )
+        # Slightly smaller center platform than training defaults so stair/slope
+        # rings remain visible on a 6 m tile.
+        platform = min(float(self.platform_size), 2.0)
+
+        if type_idx == 0:  # ascending stairs
+            terrain_utils.pyramid_stairs_terrain(
+                terrain,
+                step_width=TAXONOMY_STEP_WIDTH,
+                step_height=TAXONOMY_STEP_HEIGHTS[level],
+                platform_size=platform,
+                terrain_type=self.type,
+                simplify_mesh=self.simplify_mesh,
+            )
+        elif type_idx == 1:  # descending stairs
+            terrain_utils.pyramid_stairs_terrain(
+                terrain,
+                step_width=TAXONOMY_STEP_WIDTH,
+                step_height=-TAXONOMY_STEP_HEIGHTS[level],
+                platform_size=platform,
+                terrain_type=self.type,
+                simplify_mesh=self.simplify_mesh,
+            )
+        elif type_idx == 2:  # upslope
+            terrain_utils.pyramid_sloped_terrain(
+                terrain,
+                slope=TAXONOMY_SLOPE_GRADIENTS[level],
+                platform_size=platform,
+                terrain_type=self.type,
+            )
+        elif type_idx == 3:  # downslope
+            terrain_utils.pyramid_sloped_terrain(
+                terrain,
+                slope=-TAXONOMY_SLOPE_GRADIENTS[level],
+                platform_size=platform,
+                terrain_type=self.type,
+            )
+        elif type_idx == 4:  # random roughness
+            amp = TAXONOMY_ROUGH_AMPLITUDES[level]
+            terrain_utils.random_uniform_terrain(
+                terrain,
+                min_height=-amp,
+                max_height=amp,
+                step=0.005,
+                downsampled_scale=0.2,
+                terrain_type=self.type,
+            )
+        elif type_idx == 5:
+            # Flat / platform only — leave zeros (degenerate geometry).
+            pass
+        else:
+            raise ValueError(f"Unknown taxonomy type_idx={type_idx}")
+        return terrain
     
     def make_terrain(self, choice, difficulty):
         terrain = terrain_utils.SubTerrain(   "terrain",

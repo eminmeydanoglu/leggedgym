@@ -211,9 +211,14 @@ class GenesisSimulator(Simulator):
             self._draw_key_body_points(ref_key_body_pos)
         if self._cfg.env.debug_draw_depth_images:
             self._draw_debug_depth_images()
+        self._draw_taxonomy_labels()
           
+
     def set_viewer_camera(self, eye: np.ndarray, target: np.ndarray):
-        self._scene.viewer.set_camera_pose(pos=eye, lookat=target)
+        viewer = getattr(self._scene, "viewer", None)
+        if viewer is None:
+            return
+        viewer.set_camera_pose(pos=eye, lookat=target)
         
     def calc_feet_near_edge(self):
         """ Calculate whether each foot is near the terrain edge, which can be used as a termination condition or for reward shaping
@@ -1035,6 +1040,57 @@ class GenesisSimulator(Simulator):
         if ref_key_body_pos is not None:
             self._scene.draw_debug_spheres(ref_key_body_pos.view(-1, 3), radius=0.03, color=(1, 0, 0, 1))
         else:
+            pass
+
+    def _draw_taxonomy_labels(self):
+        """Draw taxonomy showcase markers.
+
+        Genesis Scene has no draw_debug_text / billboard API (probed at
+        implement time on genesis 1.0.0: only spheres/lines/boxes/mesh).  Fallback:
+        one colored debug sphere per tile, ~1.5 m above the tile origin, with
+        color keyed by terrain type.  Console label map is printed from play.py.
+        """
+        # Lazy import: terrain pure helpers must not create import cycles at module load.
+        from legged_gym.utils.terrain import (
+            build_taxonomy_label_map,
+            is_taxonomy_terrain_cfg,
+            TAXONOMY_LABEL_Z_OFFSET,
+        )
+        if not is_taxonomy_terrain_cfg(self._cfg.terrain):
+            return
+        terrain = getattr(self, "_terrain", None)
+        if terrain is None or not hasattr(terrain, "env_origins"):
+            return
+        label_map = getattr(terrain, "taxonomy_labels", None)
+        if not label_map:
+            label_map = build_taxonomy_label_map(
+                terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
+            )
+            terrain.taxonomy_labels = label_map
+        # Prefer draw_debug_text if a future Genesis version adds it.
+        draw_text = getattr(self._scene, "draw_debug_text", None)
+        if callable(draw_text):
+            for entry in label_map:
+                try:
+                    draw_text(entry["position"], entry["label"])
+                except TypeError:
+                    try:
+                        draw_text(pos=entry["position"], text=entry["label"])
+                    except Exception:
+                        pass
+            return
+        # Group spheres by type color for fewer draw calls.  Headless /
+        # rasterizer-only contexts may not support debug nodes — fail soft.
+        by_color = {}
+        for entry in label_map:
+            color = tuple(entry["color"])
+            by_color.setdefault(color, []).append(entry["position"])
+        try:
+            for color, positions in by_color.items():
+                poss = np.asarray(positions, dtype=np.float32)
+                self._scene.draw_debug_spheres(poss, radius=0.12, color=color)
+        except Exception:
+            # Console map (printed from play) and Viser labels still apply.
             pass
             
     def _create_heightfield(self):

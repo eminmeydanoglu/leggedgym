@@ -6,6 +6,15 @@ import os
 from legged_gym.envs import *
 from legged_gym.utils import *
 from legged_gym.utils.viser_viewer import create_viser_viewer
+from legged_gym.utils.terrain import (
+    build_taxonomy_label_map,
+    format_taxonomy_console_map,
+    is_taxonomy_terrain_cfg,
+    teleport_env_to_taxonomy_tile,
+    TAXONOMY_LABEL_Z_OFFSET,
+    TAXONOMY_NUM_LEVELS,
+    TAXONOMY_NUM_TYPES,
+)
 
 import numpy as np
 import torch
@@ -75,6 +84,23 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
             _pin_terrain_difficulty(env_cfg, terrain_level, default_level=2, max_level=9)
         return
 
+    if terrain_mode in {"taxonomy", "showcase"}:
+        # LP-ACRL paper taxonomy exhibit: 6 semantic types × 4 difficulty levels.
+        # Static showcase — no curriculum promote/demote.
+        env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+        env_cfg.terrain.curriculum = False
+        env_cfg.terrain.selected = False
+        env_cfg.terrain.terrain_kwargs = None
+        env_cfg.terrain.mode = "taxonomy"
+        env_cfg.terrain.taxonomy_showcase = True
+        env_cfg.terrain.num_rows = TAXONOMY_NUM_LEVELS
+        env_cfg.terrain.num_cols = TAXONOMY_NUM_TYPES
+        env_cfg.terrain.border_size = 2.0
+        # Spawn on the easiest row so the robot does not bury itself in L3 stairs.
+        env_cfg.terrain.max_init_terrain_level = 0
+        env_cfg.terrain.fixed_terrain_level = 0
+        return
+
     if terrain_mode not in {"bumpy", "course"}:
         raise ValueError(f"Unsupported play terrain mode: {terrain_mode}")
 
@@ -131,12 +157,16 @@ def override_configs(env_cfg, args, task_type):
     # override some parameters for testing
     # number of environments (respect --num_envs when given, e.g. to spread
     # robots across every terrain type on the training grid)
-    env_cfg.env.num_envs = args.num_envs if getattr(args, "num_envs", None) else 2
+    default_num_envs = 1 if getattr(args, "terrain", None) in {"taxonomy", "showcase"} else 2
+    env_cfg.env.num_envs = args.num_envs if getattr(args, "num_envs", None) else default_num_envs
     if task_type == "cts" or task_type == "cts_amp": # concurrent teacher-student specific
         env_cfg.env.num_teacher = 1
     elif "depth" in task_type:  # depth specific
         env_cfg.env.num_envs = 1 # for depth observation, only support num_envs=1 for now
         env_cfg.env.num_camera_envs = 1
+    # Taxonomy exhibit: keep robots few so they do not occlude the 24-tile grid.
+    if getattr(args, "terrain", None) in {"taxonomy", "showcase"}:
+        env_cfg.env.num_envs = min(int(env_cfg.env.num_envs), 4)
     env_cfg.viewer.rendered_envs_idx = list(range(env_cfg.env.num_envs))
 
     configure_play_terrain(env_cfg, args.terrain, getattr(args, "terrain_level", None))
@@ -163,6 +193,20 @@ def override_configs(env_cfg, args, task_type):
     # mode would overwrite that value every physics step from commands[:, 3], so
     # disable it for both joystick and Viser control.
     env_cfg.commands.heading_command = False
+
+    # Elevated / oblique camera defaults for the taxonomy exhibit so the full
+    # 4×6 grid is visible without --follow_robot.  Offsets are absolute world
+    # eye/lookat when taxonomy is active (see interaction_loop).
+    if getattr(args, "terrain", None) in {"taxonomy", "showcase"}:
+        # Grid extents (default 6 m tiles, 4 rows × 6 cols) → center ≈ (12, 18).
+        length = float(env_cfg.terrain.terrain_length)
+        width = float(env_cfg.terrain.terrain_width)
+        cx = 0.5 * env_cfg.terrain.num_rows * length
+        cy = 0.5 * env_cfg.terrain.num_cols * width
+        env_cfg.viewer.pos = [cx - 18.0, cy - 22.0, 32.0]
+        env_cfg.viewer.lookat = [cx, cy, 0.0]
+        # Relative-to-robot offsets unused for taxonomy fixed camera, but keep
+        # sensible values if the user later enables --follow_robot.
     
     if args.viewer == "viser":
         args.headless = True
@@ -217,6 +261,25 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
     # Setup joystick if needed
     if args.use_joystick:
         joystick = Joystick(joystick_type=args.joystick_type)
+
+    taxonomy_mode = is_taxonomy_terrain_cfg(env.cfg.terrain) or getattr(args, "terrain", None) in {
+        "taxonomy", "showcase",
+    }
+    taxonomy_camera_set = False
+    if taxonomy_mode:
+        # Console fallback for labels (Genesis has no draw_debug_text).
+        terrain = getattr(env.simulator, "_terrain", None)
+        label_map = None
+        if terrain is not None and getattr(terrain, "taxonomy_labels", None):
+            label_map = terrain.taxonomy_labels
+        elif terrain is not None and hasattr(terrain, "env_origins"):
+            label_map = build_taxonomy_label_map(
+                terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
+            )
+        if label_map:
+            print(format_taxonomy_console_map(label_map))
+            if viser_viewer is not None and hasattr(viser_viewer, "set_taxonomy_labels"):
+                viser_viewer.set_taxonomy_labels(label_map)
     
     frame_dt = 1 / 60.0 # 30Hz
     # interaction loop - runs indefinitely so the viewer stays up continuously
@@ -243,6 +306,17 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
             pos = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.pos, dtype=np.float32)
             lookat = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.lookat, dtype=np.float32)
             env.set_viewer_camera(pos, lookat)
+        elif taxonomy_mode and not taxonomy_camera_set and viser_viewer is None:
+            # One-shot elevated oblique view of the full showcase grid.
+            # Headless / no native viewer: skip (scene.viewer is None).
+            try:
+                env.set_viewer_camera(
+                    np.array(env.cfg.viewer.pos, dtype=np.float32),
+                    np.array(env.cfg.viewer.lookat, dtype=np.float32),
+                )
+            except Exception:
+                pass
+            taxonomy_camera_set = True
             
         # Step the environment according to task type
         if task_type == "ts_depth":
@@ -415,6 +489,22 @@ def play(args):
         viser_viewer.set_respawn_callback(
             lambda: env.reset_idx(torch.tensor([robot_index], device=env.device))
         )
+        if is_taxonomy_terrain_cfg(env_cfg.terrain) or getattr(args, "terrain", None) in {
+            "taxonomy", "showcase",
+        }:
+            def _taxonomy_spawn(level: int, type_idx: int, _ri=robot_index) -> bool:
+                ok = teleport_env_to_taxonomy_tile(env, _ri, level, type_idx)
+                if ok and hasattr(viser_viewer, "clear_drive_command"):
+                    viser_viewer.clear_drive_command()
+                return ok
+            # Panel may already exist from create_viser_viewer; (re)bind callback.
+            if not hasattr(viser_viewer, "_taxonomy_spawn_gui"):
+                from legged_gym.utils.terrain import TAXONOMY_TYPE_NAMES
+                viser_viewer.setup_taxonomy_spawn_panel(
+                    type_names=TAXONOMY_TYPE_NAMES,
+                    num_levels=int(env_cfg.terrain.num_rows),
+                )
+            viser_viewer.set_taxonomy_spawn_callback(_taxonomy_spawn)
         print(f"Viser web viewer started at http://localhost:{args.viser_port}")
     
     interaction_loop(env, policy, args, task_type, viser_viewer=viser_viewer)
