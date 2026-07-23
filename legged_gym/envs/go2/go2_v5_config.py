@@ -34,8 +34,11 @@ from legged_gym.utils.terrain import TAXONOMY_NUM_LEVELS, TAXONOMY_NUM_TYPES
 V5_ALGORITHMS = ("handcrafted_v4", "uniform", "lp_acrl", "alp")
 
 # Standing-exposure mixture rho (solun_plani.md §4 "Standstill kontratı"):
-# constant across every arm so standing exposure is not an experiment variable.
-# Lower than the legacy base default (0.4) so LP/valid cells stay denser.
+# the explicit budget for the reserved standstill bucket.  Under UED each env
+# is drawn standstill with probability rho and an LP moving task otherwise, so
+# rho is a plain budget line, not a hidden curriculum-contamination rate.
+# Constant across every arm so standing exposure is not an experiment variable;
+# lower than the legacy base default (0.4) so LP cells stay denser.
 V5_STANDSTILL_RHO = 0.12
 
 # Fixed global_control_steps stage length for the episode-task sampler (§5,
@@ -133,8 +136,8 @@ class _Go2V5UedArmCfg(Go2V5CommonCfg):
 
     The episode-task sampler becomes the single owner of the command/terrain
     distribution (§14.5): legacy terrain promotion and command curriculum are
-    switched off, and standstill becomes a per-env draw outside the sampler's
-    task space (§4 "Standstill kontratı", §14.4).
+    switched off, and standstill becomes a reserved mixture bucket drawn per-env
+    beside the sampler's task space (§4 "Standstill kontratı", §14.4).
     """
 
     class env(Go2V5CommonCfg.env):
@@ -152,7 +155,9 @@ class _Go2V5UedArmCfg(Go2V5CommonCfg):
     class commands(Go2V5CommonCfg.commands):
         # The sampler is the single owner of the command/terrain distribution
         # for these arms; the legacy performance-based widening never fires.
-        # zero_cmd_prob inherits V5_STANDSTILL_RHO from Go2V5CommonCfg.
+        # zero_cmd_prob inherits V5_STANDSTILL_RHO from Go2V5CommonCfg and is the
+        # reserved standstill budget.  per_env_standstill is kept True for
+        # continuity but the UED reserve draw is always per-env regardless.
         legacy_performance_command_curriculum_enabled = False
         per_env_standstill = True
 

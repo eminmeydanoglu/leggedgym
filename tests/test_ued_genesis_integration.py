@@ -60,30 +60,45 @@ class TestGenesisUEDAdapter(unittest.TestCase):
         self.assertTrue(torch.equal(self.adapter.active_sampler_revision[ids], torch.tensor([7, 7])))
         self.assertTrue(torch.equal(self.adapter.active_task_id[[0, 2, 3, 4, 5, 7]], torch.full((6,), -1)))
 
-    def test_old_assignment_provenance_and_invalid_decorrelation(self):
+    def test_old_assignment_provenance_survives_reassignment(self):
         ids = torch.tensor([0, 2])
         self.adapter.assign(ids, _assignments([0, 25], revision=3))
         self.adapter.record_step(torch.tensor([1.5, 0., 2.5, 0., 0., 0., 0., 0.]))
-        self.adapter.mark_standstill(torch.tensor([2]))
         outcome = self.adapter.collect_outcomes(ids, completion_revision=5, timed_out=torch.zeros(8, dtype=torch.bool))
         self.assertEqual(outcome.task_ids.tolist(), [0, 25])
         self.assertEqual(outcome.assigned_revision.tolist(), [3, 3])
         self.assertEqual(outcome.episodic_returns.tolist(), [1.5, 2.5])
-        self.assertEqual(outcome.valid_for_curriculum.tolist(), [True, False])
+        # Outcomes carry no validity flag anymore -- standstill is routed away
+        # from collect_outcomes entirely, so every collected outcome is a mover.
+        self.assertFalse(hasattr(outcome, "valid_for_curriculum"))
         # Replacing the assignments cannot retroactively alter the copied outcome.
         self.adapter.assign(ids, _assignments([42, 43], revision=6))
         self.assertEqual(outcome.task_ids.tolist(), [0, 25])
 
-    def test_standstill_hold_survives_mid_episode_resample(self):
-        """Standstill is latched once; mid-episode resample re-zeros and never unlatches."""
-        ids = torch.tensor([0, 1, 2])
-        self.adapter.assign(ids, _assignments([0, 21, 42], revision=1))
-        self.assertFalse(bool(self.adapter.episode_standstill[0]))
-        self.adapter.mark_standstill(torch.tensor([0, 2]))
+    def test_standstill_is_a_reserved_bucket_never_attributed(self):
+        """A standstill episode is born labelled, holds zero, and skips the LP."""
+        # env 1 is a mover; envs 0 and 2 are reserved standstill.
+        self.adapter.assign(torch.tensor([1]), _assignments([21], revision=1))
+        self.commands[torch.tensor([0, 2]), :3] = 1.7  # pretend they had commands
+        self.adapter.assign_standstill(torch.tensor([0, 2]), _assignments([0, 42], revision=1))
+        self.assertFalse(bool(self.adapter.episode_standstill[1]))
         self.assertTrue(bool(self.adapter.episode_standstill[0]))
-        self.assertFalse(bool(self.adapter.episode_valid[0]))
-        self.assertTrue(bool(self.adapter.episode_valid[1]))
-        # Simulate a mid-episode command rewrite attempting to put non-zero cmds.
+        self.assertTrue(bool(self.adapter.episode_standstill[2]))
+        # assign_standstill teleports to the placement terrain but zeros command.
+        self.assertTrue(torch.all(self.commands[[0, 2], :3] == 0))
+        self.assertTrue(torch.equal(self.adapter.active_task_id[[0, 2]], torch.tensor([0, 42])))
+        # Its return folds into the standstill bucket, not any curriculum cell.
+        self.adapter.record_step(torch.tensor([0., 0., 3.0, 0., 0., 0., 0., 0.]))
+        self.adapter.record_standstill_outcomes(torch.tensor([2]))
+        diag = self.adapter.standstill_diagnostics()
+        self.assertEqual(diag["standstill_episode_count"], 1.0)
+        self.assertAlmostEqual(diag["standstill_mean_return"], 3.0)
+
+    def test_standstill_hold_zeros_commands_every_resample(self):
+        """The birth label re-zeros standstill envs on every command resample."""
+        ids = torch.tensor([0, 1, 2])
+        self.adapter.assign(torch.tensor([1]), _assignments([21], revision=1))
+        self.adapter.assign_standstill(torch.tensor([0, 2]), _assignments([0, 42], revision=1))
         self.commands[ids, :3] = 1.5
         motion_ids = self.adapter.apply_standstill_hold(ids)
         self.assertEqual(motion_ids.tolist(), [1])
@@ -95,10 +110,9 @@ class TestGenesisUEDAdapter(unittest.TestCase):
             motion_ids = self.adapter.apply_standstill_hold(ids)
             self.assertEqual(motion_ids.tolist(), [1])
             self.assertTrue(torch.all(self.commands[[0, 2], :3] == 0))
-        # New assignment clears the latch so the next episode can be motion.
+        # A fresh moving assignment clears the label so the next episode can move.
         self.adapter.assign(torch.tensor([0]), _assignments([3], revision=2))
         self.assertFalse(bool(self.adapter.episode_standstill[0]))
-        self.assertTrue(bool(self.adapter.episode_valid[0]))
 
     def test_resampling_stays_inside_the_active_bin(self):
         ids = torch.tensor([0, 1, 2, 3])
@@ -118,7 +132,7 @@ class TestGenesisUEDAdapter(unittest.TestCase):
         teacher.observe(EpisodeOutcomeBatch(
             task_ids=np.array([0]), assigned_revision=np.array([1]), completion_revision=2,
             episodic_returns=np.array([1.0]), episode_lengths=np.array([10]),
-            terminal_reasons=np.array(["timeout"]), valid_for_curriculum=np.array([True]),
+            terminal_reasons=np.array(["timeout"]),
         ))
         teacher.advance(1)
         self.assertEqual(teacher.state_dict()["transition_occupancy"], {"1:2": 1})
@@ -160,6 +174,8 @@ class TestZGenesisTeleportSmoke(unittest.TestCase):
                     ids = np.asarray([self.task_space.encode(spec) for spec in specs], dtype=np.int64)
                 self.calls += 1
                 return _assignments(ids, revision=self.calls - 1)
+            def draw_placements(self, count, *, global_control_steps):
+                return _assignments(np.zeros(count, dtype=np.int64), revision=max(self.calls - 1, 0))
             def observe(self, outcomes): self.observed.append(outcomes)
             def advance(self, global_control_steps): return None
 
@@ -174,6 +190,7 @@ class TestZGenesisTeleportSmoke(unittest.TestCase):
         cfg.terrain.num_rows = 4
         cfg.terrain.num_cols = 6
         cfg.commands.ranges.lin_vel_x = [0.0, 2.0]
+        cfg.commands.zero_cmd_prob = 0.0  # this test isolates teleport, not the standstill mixture
         args = SimpleNamespace(task="go2", seed=19, debug=False, headless=True, cpu=False,
                                num_envs=64, max_iterations=None, resume=False, sync_wandb=False,
                                ckpt=None, load_run=None, export_onnx=False, motion_file=None, num_student=None)

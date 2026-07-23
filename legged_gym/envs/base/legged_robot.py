@@ -138,11 +138,8 @@ class LeggedRobot(BaseTask):
             device=self.device,
         )
         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
-        assignments = self.episode_curriculum.sample(
-            self.num_envs, global_control_steps=self.common_step_counter
-        )
-        self.ued_adapter.assign(env_ids, assignments)
-        self._resample_commands(env_ids, episode_start=True)
+        self._assign_ued_batch(env_ids)
+        self._resample_commands(env_ids)
         self.ued_adapter.clear_episode_accumulators(env_ids)
 
     def _active_ued_adapter(self):
@@ -151,6 +148,54 @@ class LeggedRobot(BaseTask):
                 raise RuntimeError("UED is enabled but no episode curriculum has been installed")
             return self.ued_adapter
         return None
+
+    def _assign_ued_batch(self, env_ids: EnvIds) -> None:
+        """Draw each env's next episode as a fixed-budget mixture (solun_plani §4).
+
+        Per env, independently: with probability rho a *reserved standstill*
+        episode, otherwise an LP-curriculum moving task.  rho is an explicit
+        budget line (``commands.zero_cmd_prob``), not a hidden contamination
+        rate -- the two arms have separate draws, so standstill is never
+        attributed to a curriculum cell and needs no post-hoc invalidation.
+        """
+        adapter = self.ued_adapter
+        global_control_steps = self.common_step_counter
+        standstill = self._ued_standstill_mask(len(env_ids))
+        mover_ids = env_ids[~standstill]
+        standstill_ids = env_ids[standstill]
+        if len(mover_ids):
+            assignments = self.episode_curriculum.sample(
+                len(mover_ids), global_control_steps=global_control_steps
+            )
+            adapter.assign(mover_ids, assignments)
+        if len(standstill_ids):
+            placements = self.episode_curriculum.draw_placements(
+                len(standstill_ids), global_control_steps=global_control_steps
+            )
+            adapter.assign_standstill(standstill_ids, placements)
+
+    def _ued_standstill_mask(self, count: int) -> Tensor:
+        """Per-env Bernoulli reserve draw; rho <= 0 means no standstill at all."""
+        rho = float(getattr(self.cfg.commands, "zero_cmd_prob", 0.0))
+        if rho <= 0.0:
+            return torch.zeros(count, dtype=torch.bool, device=self.device)
+        return torch.rand(count, device=self.device) < rho
+
+    def _observe_ued_outcomes(self, env_ids: EnvIds) -> None:
+        """Route completed episodes: movers update LP, standstill its own bucket."""
+        adapter = self.ued_adapter
+        standstill = adapter.episode_standstill[env_ids]
+        mover_done = env_ids[~standstill]
+        standstill_done = env_ids[standstill]
+        if len(mover_done):
+            outcomes = adapter.collect_outcomes(
+                mover_done,
+                completion_revision=self.episode_curriculum.sampler_revision,
+                timed_out=self.time_out_buf,
+            )
+            self.episode_curriculum.observe(outcomes)
+        if len(standstill_done):
+            adapter.record_standstill_outcomes(standstill_done)
 
     def step(self, actions: Action) -> Tuple[ObsBuf, ObsBuf | None, Reward, Tensor, Dict[str, Any]]:
         """Execute one simulation step with the given actions.
@@ -296,20 +341,12 @@ class LeggedRobot(BaseTask):
         if len(env_ids) == 0:
             return
         ued_adapter = self._active_ued_adapter()
-        # Frozen provenance order: copy/observe the completed old assignment
-        # before sampling or applying the replacement assignment.
+        # Frozen provenance order: observe the completed old episodes (splitting
+        # standstill off from the curriculum) before drawing their replacements.
         if ued_adapter is not None:
-            outcomes = ued_adapter.collect_outcomes(
-                env_ids,
-                completion_revision=self.episode_curriculum.sampler_revision,
-                timed_out=self.time_out_buf,
-            )
-            self.episode_curriculum.observe(outcomes)
+            self._observe_ued_outcomes(env_ids)
             self.episode_curriculum.advance(self.common_step_counter)
-            assignments = self.episode_curriculum.sample(
-                len(env_ids), global_control_steps=self.common_step_counter
-            )
-            ued_adapter.assign(env_ids, assignments)
+            self._assign_ued_batch(env_ids)
         # update curriculum
         if self.cfg.terrain.curriculum and ued_adapter is None:
             self._update_terrain_curriculum(env_ids)
@@ -319,7 +356,7 @@ class LeggedRobot(BaseTask):
                 and ued_adapter is None and (self.common_step_counter % self.max_episode_length ==0)):
             self._update_command_curriculum(env_ids)
 
-        self._resample_commands(env_ids, episode_start=True)
+        self._resample_commands(env_ids)
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
         self.simulator.reset_idx(env_ids)
@@ -558,9 +595,7 @@ class LeggedRobot(BaseTask):
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
         """
         env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt) == 0).nonzero(as_tuple=False).flatten()
-        # Mid-episode only: do not re-roll the standstill Bernoulli (see
-        # _resample_commands(episode_start=...)).
-        self._resample_commands(env_ids, episode_start=False)
+        self._resample_commands(env_ids)
         if self.cfg.commands.heading_command:
             forward = quat_apply(self.simulator.base_quat, self.forward_vec)
             self.heading = torch.atan2(forward[:, 1], forward[:, 0])
@@ -575,32 +610,27 @@ class LeggedRobot(BaseTask):
             self.simulator.push_links()
             # print(f"pushing links")
         
-    def _resample_commands(self, env_ids: EnvIds, *, episode_start: bool = False) -> None:
-        """Randomly select commands of some environments.
+    def _resample_commands(self, env_ids: EnvIds) -> None:
+        """Draw fresh commands for the given envs.
 
-        Args:
-            env_ids: Environments ids for which new commands are needed
-            episode_start: True only from reset / UED enable.  Standstill is a
-                once-per-episode latch when UED is active: mid-episode resamples
-                (``resampling_time``) re-apply zeros for latched envs and never
-                re-roll ``zero_cmd_prob``, so episodic returns stay pure
-                standstill or pure motion for LP validity.
+        Under UED, standstill is a reserved-mixture episode chosen once at
+        assignment (see ``_assign_ued_batch``): those envs hold a zero command
+        for the whole episode, so every resample only re-zeros them and draws a
+        fresh velocity for the movers.  The legacy non-UED path keeps its own
+        per-resample ``zero_cmd_prob`` standstill draw unchanged.
         """
         if len(env_ids) == 0:
             return
         ued_adapter = self._active_ued_adapter()
-        # UED mid-episode: keep standstill holds at zero; only re-sample movers.
-        motion_ids = env_ids
-        if ued_adapter is not None and not episode_start:
+        if ued_adapter is not None:
             motion_ids = ued_adapter.apply_standstill_hold(env_ids)
             if len(motion_ids) == 0:
                 return
-
-        if ued_adapter is None:
+            ued_adapter.resample_commands_within_active_bin(motion_ids)
+        else:
+            motion_ids = env_ids
             self.commands[motion_ids, 0] = torch_rand_float(
                 self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(motion_ids),1), self.device).squeeze(1)
-        else:
-            ued_adapter.resample_commands_within_active_bin(motion_ids)
         self.commands[motion_ids, 1] = torch_rand_float(
             self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(motion_ids),1), self.device).squeeze(1)
         if self.cfg.commands.heading_command:
@@ -608,20 +638,14 @@ class LeggedRobot(BaseTask):
         else:
             self.commands[motion_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(motion_ids), 1), device=self.device).squeeze(1)
 
-        # Standstill Bernoulli: episode-start only under UED (latched for the
-        # whole episode).  Legacy non-UED keeps the historical mid-episode re-roll.
-        draw_standstill = episode_start if ued_adapter is not None else True
-        if draw_standstill:
+        # Legacy non-UED standstill: re-rolled every resample (UED reserves its
+        # standstill budget at assignment instead).
+        if ued_adapter is None:
             if getattr(self.cfg.commands, "per_env_standstill", False):
                 standstill = torch.rand(len(motion_ids), device=self.device) < self.cfg.commands.zero_cmd_prob
-                standstill_ids = motion_ids[standstill]
-                self.commands[standstill_ids, :3] *= 0.0
-                if ued_adapter is not None and len(standstill_ids):
-                    ued_adapter.mark_standstill(standstill_ids)
+                self.commands[motion_ids[standstill], :3] *= 0.0
             elif np.random.rand() < self.cfg.commands.zero_cmd_prob:
                 self.commands[motion_ids, :3] *= 0.0  # legacy batch-wide standstill draw
-                if ued_adapter is not None:
-                    ued_adapter.mark_standstill(motion_ids)
 
         # set small commands to zero (movers only; standstill holds already 0)
         self.commands[motion_ids, :3] *= (torch.norm(

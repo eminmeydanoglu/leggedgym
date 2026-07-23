@@ -43,14 +43,16 @@ class GenesisUEDAdapter:
         self.active_vx_upper = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self.episode_return = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self.episode_length = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
-        # False until an assignment starts an episode; a standstill also makes
-        # the rollout curriculum-invalid while PPO still consumes it.
-        self.episode_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
-        # Standstill is a once-per-episode decision (drawn only at reset).  Mid-
-        # episode command resamples must re-apply zeros for these envs and must
-        # never re-roll the Bernoulli, or the episode becomes a mixed
-        # standstill/motion return that the binary valid flag cannot describe.
+        # Birth label, not a post-hoc veto: an env is set standstill (True) or
+        # moving (False) once, at assignment.  Standstill episodes are a reserved
+        # mixture bucket -- they run beside the LP task space, hold a zero command
+        # for the whole episode, and their return updates the standstill bucket
+        # instead of any curriculum cell.  PPO still learns from them.
         self.episode_standstill = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Reserved standstill bucket metrics (never part of learning progress).
+        self._standstill_episode_count = 0
+        self._standstill_return_sum = 0.0
+        self._standstill_length_sum = 0
 
     def record_step(self, rewards: torch.Tensor) -> None:
         """Accumulate the actual clipped reward for every active environment."""
@@ -67,7 +69,12 @@ class GenesisUEDAdapter:
         completion_revision: int,
         timed_out: torch.Tensor,
     ) -> EpisodeOutcomeBatch:
-        """Copy outcomes for *old* assignments before they are replaced."""
+        """Copy moving-task outcomes for *old* assignments before replacement.
+
+        The caller passes only the moving envs among the completing batch;
+        reserved-standstill envs are collected separately by
+        :meth:`record_standstill_outcomes`.
+        """
         ids = self._env_ids(env_ids)
         if torch.any(self.active_task_id[ids] < 0):
             raise RuntimeError("cannot collect a UED outcome before assigning a task")
@@ -83,19 +90,36 @@ class GenesisUEDAdapter:
             episodic_returns=self.episode_return[ids].detach().cpu().numpy().astype(np.float64, copy=True),
             episode_lengths=self.episode_length[ids].detach().cpu().numpy().astype(np.int64, copy=True),
             terminal_reasons=reasons,
-            valid_for_curriculum=self.episode_valid[ids].detach().cpu().numpy().astype(bool, copy=True),
         )
 
     def assign(self, env_ids: torch.Tensor, assignments: TaskAssignmentBatch) -> None:
-        """Atomically apply one decoded assignment per environment by teleport.
+        """Start one moving-task episode per environment by teleport.
 
         This deliberately changes only tensors already owned by the simulator;
         it never calls terrain construction or changes the static heightfield.
         """
+        ids = self._teleport(env_ids, assignments)
+        self.episode_standstill[ids] = False
+
+    def assign_standstill(self, env_ids: torch.Tensor, placements: TaskAssignmentBatch) -> None:
+        """Start one reserved-standstill episode per environment.
+
+        The placement cells (drawn LP-weighted, see
+        ``EpisodeCurriculum.draw_placements``) decide only *where* the robot
+        stands: the env is teleported there and its command is held at zero.
+        The outcome is never attributed to that cell -- the episode is born
+        standstill and reported to the standstill bucket, not the curriculum.
+        """
+        ids = self._teleport(env_ids, placements)
+        self.commands[ids, :3] = 0.0
+        self.episode_standstill[ids] = True
+
+    def _teleport(self, env_ids: torch.Tensor, batch: TaskAssignmentBatch) -> torch.Tensor:
+        """Shared atomic teleport for both moving and standstill placements."""
         ids = self._env_ids(env_ids)
-        task_ids = np.asarray(assignments.task_ids)
+        task_ids = np.asarray(batch.task_ids)
         if task_ids.shape != (len(ids),) or not np.issubdtype(task_ids.dtype, np.integer):
-            raise ValueError("assignment task_ids must match env_ids")
+            raise ValueError("placement task_ids must match env_ids")
         decoded = self.task_space.decode_batch(task_ids)
         terrain_types = torch.as_tensor(decoded.terrain_types, device=self.device, dtype=torch.long)
         terrain_levels = torch.as_tensor(decoded.terrain_levels, device=self.device, dtype=torch.long)
@@ -107,11 +131,10 @@ class GenesisUEDAdapter:
         self.simulator.terrain_levels[ids] = terrain_levels
         self.simulator.env_origins[ids] = origins[terrain_levels, terrain_types]
         self.active_task_id[ids] = torch.as_tensor(task_ids, device=self.device, dtype=torch.long)
-        self.active_sampler_revision[ids] = int(assignments.sampler_revision)
+        self.active_sampler_revision[ids] = int(batch.sampler_revision)
         self.active_vx_lower[ids] = torch.as_tensor(decoded.vx_lower, device=self.device, dtype=torch.float32)
         self.active_vx_upper[ids] = torch.as_tensor(decoded.vx_upper, device=self.device, dtype=torch.float32)
-        self.episode_valid[ids] = True
-        self.episode_standstill[ids] = False
+        return ids
 
     def clear_episode_accumulators(self, env_ids: torch.Tensor) -> None:
         """Start the newly teleported episode after its root state is reset."""
@@ -128,17 +151,34 @@ class GenesisUEDAdapter:
         upper = self.active_vx_upper[ids]
         self.commands[ids, 0] = lower + (upper - lower) * torch.rand(len(ids), device=self.device)
 
-    def mark_standstill(self, env_ids: torch.Tensor) -> None:
-        """Latch standstill for the rest of the episode; LP/ALP skip this return."""
+    def record_standstill_outcomes(self, env_ids: torch.Tensor) -> None:
+        """Fold completed standstill episodes into the reserved-bucket metrics.
+
+        This is the standstill counterpart of :meth:`collect_outcomes`; its
+        returns never touch learning progress.
+        """
         ids = self._env_ids(env_ids)
-        self.episode_valid[ids] = False
-        self.episode_standstill[ids] = True
+        if not len(ids):
+            return
+        self._standstill_episode_count += int(len(ids))
+        self._standstill_return_sum += float(self.episode_return[ids].sum())
+        self._standstill_length_sum += int(self.episode_length[ids].sum())
+
+    def standstill_diagnostics(self) -> Mapping[str, float]:
+        """Cumulative reserved-bucket metrics, safe to log beside the curriculum."""
+        count = self._standstill_episode_count
+        return {
+            "standstill_episode_count": float(count),
+            "standstill_mean_return": self._standstill_return_sum / count if count else 0.0,
+            "standstill_mean_length": self._standstill_length_sum / count if count else 0.0,
+        }
 
     def apply_standstill_hold(self, env_ids: torch.Tensor) -> torch.Tensor:
-        """Re-zero commands for envs already latched as standstill this episode.
+        """Keep reserved-standstill envs at a zero command; return the movers.
 
-        Returns the subset of ``env_ids`` that are *not* on a standstill hold
-        (safe to draw a fresh non-zero command for).
+        Standstill is a whole-episode birth label, so every command (re)sample
+        must re-zero these envs.  The returned subset of ``env_ids`` is the
+        moving envs, safe to draw a fresh non-zero command for.
         """
         ids = self._env_ids(env_ids)
         hold = self.episode_standstill[ids]

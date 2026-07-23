@@ -4,7 +4,10 @@ from __future__ import annotations
 from typing import Mapping
 
 
-SCHEMA_VERSION = 1
+# v2 dropped the standstill-era ``invalid_outcome_count`` and
+# ``valid_task_completion_counts`` fields: standstill is now a reserved mixture
+# bucket that never reaches the curriculum, so every observed outcome is valid.
+SCHEMA_VERSION = 2
 
 
 def validate_checkpoint_state(
@@ -16,7 +19,7 @@ def validate_checkpoint_state(
         "rng_bit_generator_state", "stage_index", "sampler_revision", "stage_start_global_steps",
         "probabilities", "previous_returns", "current_returns", "learning_progress", "observed_masks",
         "stage_return_sums", "stage_episode_counts", "task_assignment_counts", "task_completion_counts",
-        "valid_task_completion_counts", "transition_occupancy", "invalid_outcome_count", "source_label",
+        "transition_occupancy", "source_label",
     }
     missing = required.difference(state)
     if missing:

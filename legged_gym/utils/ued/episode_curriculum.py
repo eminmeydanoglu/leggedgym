@@ -25,13 +25,20 @@ class TaskAssignmentBatch:
 
 @dataclass(frozen=True)
 class EpisodeOutcomeBatch:
+    """Completed *moving-task* episodes handed back to the curriculum.
+
+    Reserved-standstill episodes never appear here: the environment splits them
+    off before calling ``observe`` (see the standstill mixture in
+    ``legged_robot._assign_ued_batch``), so every outcome in this batch is a
+    real LP cell with a finite return.  There is no per-episode validity flag.
+    """
+
     task_ids: np.ndarray
     assigned_revision: np.ndarray
     completion_revision: int
     episodic_returns: np.ndarray
     episode_lengths: np.ndarray
     terminal_reasons: np.ndarray
-    valid_for_curriculum: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -49,11 +56,11 @@ class StageSnapshot:
     task_completion_counts: np.ndarray
     transition_occupancy: Mapping[str, int]
     diagnostics: Mapping[str, object]
-    invalid_outcome_count: int
 
 
 class EpisodeCurriculum(Protocol):
     def sample(self, count: int, *, global_control_steps: int) -> TaskAssignmentBatch: ...
+    def draw_placements(self, count: int, *, global_control_steps: int) -> TaskAssignmentBatch: ...
     def observe(self, outcomes: EpisodeOutcomeBatch) -> None: ...
     def advance(self, global_control_steps: int) -> StageSnapshot | None: ...
     def probabilities(self) -> np.ndarray: ...
@@ -95,9 +102,7 @@ class _FiniteEpisodeCurriculum:
         self._stage_episode_counts = np.zeros(self._n, dtype=np.int64)
         self._task_assignment_counts = np.zeros(self._n, dtype=np.int64)
         self._task_completion_counts = np.zeros(self._n, dtype=np.int64)
-        self._valid_task_completion_counts = np.zeros(self._n, dtype=np.int64)
         self._transition_occupancy: dict[str, int] = {}
-        self._invalid_outcome_count = 0
         self._snapshots: list[StageSnapshot] = []
 
     @property
@@ -124,10 +129,31 @@ class _FiniteEpisodeCurriculum:
             np.full(count, self._source_label, dtype="U10"),
         )
 
+    def draw_placements(self, count: int, *, global_control_steps: int) -> TaskAssignmentBatch:
+        """Draw terrain/vx cells for reserved-standstill episodes.
+
+        Identical draw to :meth:`sample` -- LP-weighted, so standing exposure
+        rides the same easy->hard ordering the curriculum discovers -- but
+        bookkeeping-free: these draws only decide *where* a standstill episode
+        stands.  They are never counted as curriculum assignments and their
+        returns never feed learning progress.  The reserved bucket lives beside
+        the LP task space, not inside it.
+        """
+        count = self._non_negative_integer(count, name="count")
+        self._non_negative_integer(global_control_steps, name="global_control_steps")
+        task_ids = self._rng.choice(self._n, size=count, p=self._probabilities).astype(np.int64, copy=False)
+        return TaskAssignmentBatch(
+            task_ids,
+            self.sampler_revision,
+            self.stage_index,
+            self._probabilities[task_ids].copy(),
+            np.full(count, "standstill", dtype="U10"),
+        )
+
     def observe(self, outcomes: EpisodeOutcomeBatch) -> None:
         arrays = (
             outcomes.task_ids, outcomes.assigned_revision, outcomes.episodic_returns,
-            outcomes.episode_lengths, outcomes.terminal_reasons, outcomes.valid_for_curriculum,
+            outcomes.episode_lengths, outcomes.terminal_reasons,
         )
         lengths = {np.asarray(value).shape for value in arrays}
         if len(lengths) != 1 or len(next(iter(lengths))) != 1:
@@ -145,20 +171,17 @@ class _FiniteEpisodeCurriculum:
         episode_lengths = np.asarray(outcomes.episode_lengths)
         if not np.issubdtype(episode_lengths.dtype, np.integer) or np.any(episode_lengths < 0):
             raise ValueError("outcome episode_lengths must be non-negative integers")
-        if np.asarray(outcomes.valid_for_curriculum).dtype != np.bool_:
-            raise ValueError("outcome valid_for_curriculum must be boolean")
-        valid = np.asarray(outcomes.valid_for_curriculum, dtype=bool)
-        if np.any(valid & ~np.isfinite(returns)):
-            raise ValueError("valid curriculum outcomes require finite returns")
-        self._task_completion_counts += np.bincount(task_ids.astype(np.int64), minlength=self._n)
-        self._invalid_outcome_count += int((~valid).sum())
+        # Every outcome is a real moving-task episode (standstill is split off
+        # upstream), so all returns must be finite and all feed learning progress.
+        if np.any(~np.isfinite(returns)):
+            raise ValueError("curriculum outcomes require finite returns")
+        ids = task_ids.astype(np.int64, copy=False)
+        self._task_completion_counts += np.bincount(ids, minlength=self._n)
         for assigned in assigned_revisions:
             key = f"{int(assigned)}:{completion_revision}"
             self._transition_occupancy[key] = self._transition_occupancy.get(key, 0) + 1
-        valid_ids = task_ids[valid].astype(np.int64, copy=False)
-        self._valid_task_completion_counts += np.bincount(valid_ids, minlength=self._n)
-        self._stage_return_sums += np.bincount(valid_ids, weights=returns[valid], minlength=self._n)
-        self._stage_episode_counts += np.bincount(valid_ids, minlength=self._n)
+        self._stage_return_sums += np.bincount(ids, weights=returns, minlength=self._n)
+        self._stage_episode_counts += np.bincount(ids, minlength=self._n)
 
     def _score(self, progress: np.ndarray) -> np.ndarray:
         return progress if self.algorithm == "lp_acrl" else np.abs(progress)
@@ -212,12 +235,10 @@ class _FiniteEpisodeCurriculum:
             self._previous_returns.copy(), self._current_returns.copy(), self._learning_progress.copy(),
             self._observed_masks.copy(), self._stage_episode_counts.copy(), self._task_assignment_counts.copy(),
             self._task_completion_counts.copy(), dict(self._transition_occupancy), self.diagnostics(),
-            self._invalid_outcome_count,
         )
         self._snapshots.append(snapshot)
         self._stage_return_sums.fill(0.0)
         self._stage_episode_counts.fill(0)
-        self._invalid_outcome_count = 0
         return snapshot
 
     def probabilities(self) -> np.ndarray:
@@ -231,7 +252,7 @@ class _FiniteEpisodeCurriculum:
             "effective_sample_size": float(1.0 / np.sum(np.square(p))),
             "max_cell_probability": float(np.max(p)),
             "task_assignment_coverage": float(np.count_nonzero(self._task_assignment_counts) / self._n),
-            "valid_completed_outcome_coverage": float(np.count_nonzero(self._valid_task_completion_counts) / self._n),
+            "completed_outcome_coverage": float(np.count_nonzero(self._task_completion_counts) / self._n),
         }
 
     def state_dict(self) -> dict:
@@ -244,17 +265,15 @@ class _FiniteEpisodeCurriculum:
             "learning_progress": self._learning_progress.copy(), "observed_masks": self._observed_masks.copy(),
             "stage_return_sums": self._stage_return_sums.copy(), "stage_episode_counts": self._stage_episode_counts.copy(),
             "task_assignment_counts": self._task_assignment_counts.copy(), "task_completion_counts": self._task_completion_counts.copy(),
-            "valid_task_completion_counts": self._valid_task_completion_counts.copy(),
             "transition_occupancy": dict(self._transition_occupancy),
-            "invalid_outcome_count": self._invalid_outcome_count,
             "source_label": self._source_label,
             "rng_bit_generator_state": deepcopy(self._rng.bit_generator.state),
         }
 
     def load_state_dict(self, state: Mapping[str, object]) -> None:
         validate_checkpoint_state(state, algorithm=self.algorithm, task_space_fingerprint=self.task_space.fingerprint(), config_fingerprint=self.config_fingerprint)
-        arrays = ("probabilities", "previous_returns", "current_returns", "learning_progress", "observed_masks", "stage_return_sums", "stage_episode_counts", "task_assignment_counts", "task_completion_counts", "valid_task_completion_counts")
-        count_arrays = {"stage_episode_counts", "task_assignment_counts", "task_completion_counts", "valid_task_completion_counts"}
+        arrays = ("probabilities", "previous_returns", "current_returns", "learning_progress", "observed_masks", "stage_return_sums", "stage_episode_counts", "task_assignment_counts", "task_completion_counts")
+        count_arrays = {"stage_episode_counts", "task_assignment_counts", "task_completion_counts"}
         loaded_arrays: dict[str, np.ndarray] = {}
         for name in arrays:
             value = np.asarray(state[name])
@@ -284,7 +303,6 @@ class _FiniteEpisodeCurriculum:
             str(key): self._non_negative_integer(value, name="checkpoint transition occupancy")
             for key, value in occupancy.items()
         }
-        invalid_outcome_count = self._non_negative_integer(state["invalid_outcome_count"], name="checkpoint invalid_outcome_count")
         source_label = str(state["source_label"])
         allowed_sources = {"bootstrap"} if self.algorithm == "uniform" else {"bootstrap", "lp" if self.algorithm == "lp_acrl" else "alp"}
         if source_label not in allowed_sources:
@@ -303,7 +321,6 @@ class _FiniteEpisodeCurriculum:
         self.sampler_revision = sampler_revision
         self.stage_start_global_steps = stage_start_global_steps
         self._transition_occupancy = transition_occupancy
-        self._invalid_outcome_count = invalid_outcome_count
         self._source_label = source_label
         self._rng.bit_generator.state = rng_state
 

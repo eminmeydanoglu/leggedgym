@@ -71,15 +71,21 @@ print(curriculum.config_fingerprint)
   shared `commands.zero_cmd_prob` on `Go2V5CommonCfg` for all four arms so
   standing exposure never becomes an experiment variable (lower than the
   legacy base default of 0.4 to keep LP-valid cell density higher).
-- Standing draw is **per-env**, not batch-wide, for the three UED-teacher
-  arms: `commands.per_env_standstill = True` in `_Go2V5UedArmCfg`
-  (`go2_v5_config.py:152`); `handcrafted_v4` keeps the legacy batch-wide draw
+- For the three UED-teacher arms standstill is a **reserved mixture bucket**,
+  drawn per-env at assignment time: each env is standstill with probability
+  `rho` and an LP moving task otherwise (`legged_robot._assign_ued_batch` /
+  `_ued_standstill_mask`). rho is an explicit budget line, not a hidden
+  contamination rate. `handcrafted_v4` keeps the legacy batch-wide draw
   (`per_env_standstill` absent/`False`, asserted in
-  `test_v5_training_contract.py:123`). The mechanism itself (flag-gated
-  `_resample_commands` change) lives behind `commands.per_env_standstill` per
-  §14.4; v3/v4 default that flag off and are bit-for-bit unaffected.
-- Standstill episodes are excluded from LP/ALP task-return estimation
-  (`valid_for_curriculum=False`) but still feed PPO/reward data (§4, §14.4).
+  `test_v5_training_contract.py:123`); v3/v4 are bit-for-bit unaffected.
+- A standstill episode is **born labelled** (`GenesisUEDAdapter.assign_standstill`
+  sets `episode_standstill=True`): it stands on an LP-weighted placement terrain
+  (`EpisodeCurriculum.draw_placements`, trusting LP for the easy→hard ordering of
+  standing) but its return is never attributed to that cell. There is no post-hoc
+  invalidation flag — the env routes standstill outcomes to the adapter's own
+  standstill bucket (`record_standstill_outcomes` / `standstill_diagnostics`) and
+  only moving episodes ever reach the curriculum. Standstill still feeds
+  PPO/reward data (§4, §14.4).
 
 ## 3. Stage control-step length (solun_plani.md §5, §11 Faz 0)
 
@@ -98,8 +104,8 @@ print(curriculum.config_fingerprint)
 ## 4. Missing-task / minimum-count rule (solun_plani.md §5)
 
 - A task cell counts as "observed" in a stage iff it received **at least one**
-  completed, `valid_for_curriculum=True` episode outcome that stage:
-  `observed = self._stage_episode_counts > 0`
+  completed moving-task episode that stage (standstill never reaches the
+  curriculum): `observed = self._stage_episode_counts > 0`
   (`legged_gym/utils/ued/episode_curriculum.py:186`).
 - Cells that were *not* observed this stage do **not** get a fabricated LP
   score. Their existing probability mass is retained verbatim
@@ -271,17 +277,17 @@ picked `1400`) never needs scoring at all.
 
 ## 9. Curriculum checkpoint schema (solun_plani.md §9)
 
-Schema version **1** (`legged_gym/utils/ued/checkpoint.py:7`,
-`SCHEMA_VERSION = 1`). `EpisodeCurriculum.state_dict()`
-(`legged_gym/utils/ued/episode_curriculum.py:237-252`) writes exactly:
+Schema version **2** (`legged_gym/utils/ued/checkpoint.py`,
+`SCHEMA_VERSION = 2`; v2 dropped the standstill-era `valid_task_completion_counts`
+and `invalid_outcome_count` fields now that standstill is a reserved bucket that
+never reaches the curriculum). `EpisodeCurriculum.state_dict()` writes exactly:
 
 ```
 schema_version, algorithm, task_space_fingerprint, config_fingerprint,
 stage_index, sampler_revision, stage_start_global_steps, probabilities,
 previous_returns, current_returns, learning_progress, observed_masks,
 stage_return_sums, stage_episode_counts, task_assignment_counts,
-task_completion_counts, valid_task_completion_counts,
-transition_occupancy, invalid_outcome_count, source_label,
+task_completion_counts, transition_occupancy, source_label,
 rng_bit_generator_state
 ```
 

@@ -23,7 +23,7 @@ from legged_gym.utils.ued import (
 )
 
 
-def _outcomes(task_ids, returns, *, valid=True, assigned_revision=0, completion_revision=0):
+def _outcomes(task_ids, returns, *, assigned_revision=0, completion_revision=0):
     task_ids = np.asarray(task_ids, dtype=np.int64)
     count = len(task_ids)
     return EpisodeOutcomeBatch(
@@ -33,7 +33,6 @@ def _outcomes(task_ids, returns, *, valid=True, assigned_revision=0, completion_
         episodic_returns=np.asarray(returns, dtype=np.float64),
         episode_lengths=np.full(count, 20, dtype=np.int64),
         terminal_reasons=np.full(count, "timeout", dtype="U16"),
-        valid_for_curriculum=np.full(count, valid, dtype=bool),
     )
 
 
@@ -116,19 +115,32 @@ def test_negative_lp_is_absolute_only_for_alp():
     assert absolute.probabilities()[0] > absolute.probabilities()[1]
 
 
-def test_missing_task_fallback_retains_its_previous_probability_and_invalid_is_ignored():
+def test_missing_task_fallback_retains_its_previous_probability():
     curriculum = LPACRLEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10, beta=0.2, seed=5)
     _advance_with_return(curriculum, [0, 1, 2], [0.0, 0.0, 0.0], 10)
     before = curriculum.probabilities()
+    # Cell 2 is not observed this stage, so its probability must not move.
     curriculum.observe(_outcomes([0, 1], [1.0, 0.0], completion_revision=1))
-    curriculum.observe(_outcomes([0], [999.0], valid=False, completion_revision=1))
     snapshot = curriculum.advance(20)
     assert snapshot is not None
     after = curriculum.probabilities()
     assert after[2] == pytest.approx(before[2])
     assert np.isnan(snapshot.current_returns[2])
-    assert snapshot.invalid_outcome_count == 1
-    assert snapshot.transition_occupancy["0:1"] == 3
+    assert snapshot.transition_occupancy["0:1"] == 2
+
+
+def test_draw_placements_are_bookkeeping_free():
+    """Standstill placements pick a cell but never count as curriculum work."""
+    curriculum = LPACRLEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10, seed=7)
+    before = curriculum.state_dict()
+    placements = curriculum.draw_placements(50, global_control_steps=0)
+    assert placements.task_ids.shape == (50,)
+    assert np.all((placements.task_ids >= 0) & (placements.task_ids < curriculum._n))
+    assert set(placements.sources) == {"standstill"}
+    after = curriculum.state_dict()
+    # Only the RNG advanced; assignment/completion bookkeeping is untouched.
+    np.testing.assert_array_equal(before["task_assignment_counts"], after["task_assignment_counts"])
+    np.testing.assert_array_equal(before["task_completion_counts"], after["task_completion_counts"])
 
 
 def test_diagnostics_and_assignment_completion_provenance():
@@ -141,7 +153,7 @@ def test_diagnostics_and_assignment_completion_provenance():
     assert d["finite_probabilities"] is True
     assert d["entropy"] > 0 and d["effective_sample_size"] == pytest.approx(84.0)
     assert d["task_assignment_coverage"] > 0
-    assert d["valid_completed_outcome_coverage"] > 0
+    assert d["completed_outcome_coverage"] > 0
     assert snapshot.transition_occupancy["0:0"] == 10
 
 
@@ -171,7 +183,7 @@ def test_checkpoint_schema_configuration_and_counter_types_fail_closed():
     with pytest.raises(ValueError, match="configuration"):
         wrong_config.load_state_dict(state)
     wrong_schema = deepcopy(state)
-    wrong_schema["schema_version"] = 2
+    wrong_schema["schema_version"] = 99
     with pytest.raises(ValueError, match="schema"):
         source.load_state_dict(wrong_schema)
     fractional_counter = deepcopy(state)
@@ -198,12 +210,6 @@ def test_public_batch_contract_rejects_bad_outcomes():
     )
     with pytest.raises(ValueError, match="assigned_revision"):
         curriculum.observe(fractional_revision)
-    non_boolean_validity = _outcomes([0], [0.0])
-    non_boolean_validity = EpisodeOutcomeBatch(
-        **{**non_boolean_validity.__dict__, "valid_for_curriculum": np.array([1], dtype=np.int64)}
-    )
-    with pytest.raises(ValueError, match="boolean"):
-        curriculum.observe(non_boolean_validity)
 
 
 def test_public_scalar_inputs_and_softmax_remain_well_defined_at_extremes():
