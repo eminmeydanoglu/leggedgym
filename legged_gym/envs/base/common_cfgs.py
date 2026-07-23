@@ -489,19 +489,37 @@ class Go2BenchmarkV3CommonCfg(Go2BenchmarkCommonCfg):
 # V4 terrain campaign. V3 stays flat and must not inherit these settings.
 # ============================================================================
 class Go2BenchmarkV4TerrainCfg(Go2BenchmarkV3CommonCfg):
-    """V3's physics contract on one fixed medium-difficulty terrain grid.
+    """V3's physics contract on the standard ETH game-inspired terrain curriculum.
+
+    Intentionally inherited from V3: the P5 domain-randomization support, one
+    live mass/CoM switch per episode, and the benchmark observation/critic
+    contracts.  Intentionally overridden for terrain: terrain generation and
+    progression, rough-terrain rewards, and the forward-speed command field.
 
     The terrain generator builds its deterministic type-by-difficulty grid
-    because ``curriculum`` is true. ``fixed_terrain_level`` then pins every
-    environment to row five (difficulty 5/10) instead of letting a method's
-    own performance alter the terrain distribution.
+    because ``curriculum`` is true.  Instead of pinning every environment to one
+    fixed row, we run the off-the-shelf performance-based curriculum: envs start
+    on the easiest rows (``max_init_terrain_level``) and climb only when a method
+    can actually traverse them, so each method equilibrates at the difficulty it
+    can handle.  This exposes online-estimation differences instead of crushing
+    every method onto the same failure floor of a single hard fixed row.
+
+    Rewards are migrated to the rough-terrain shaping (drops the flat-tuned
+    ``orientation``/``base_height`` penalties that fight slopes and steps; adds
+    gait/clearance/stand-still terms).  The reward set is a shared constant
+    across all six methods, so this does not bias the method comparison; it only
+    lets terrain locomotion emerge.  The V3 dynamic-physics contract (P5 switch,
+    domain rand) and the RMA/oracle teacher height map are kept intact.
     """
     class terrain(Go2BenchmarkV3CommonCfg.terrain):
         mesh_type = "heightfield"
         border_size = 20.0
         curriculum = True
         selected = False
-        fixed_terrain_level = 5
+        # Standard ETH curriculum: start easy, progress on performance.  No
+        # fixed_terrain_level, so the V3 physics mixin's _update_terrain_curriculum
+        # guard falls through to the game-inspired progression.
+        max_init_terrain_level = 1
         terrain_length = 8.0
         terrain_width = 8.0
         platform_size = 4.0
@@ -515,3 +533,14 @@ class Go2BenchmarkV4TerrainCfg(Go2BenchmarkV3CommonCfg):
             0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
         ]
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+
+    class commands(Go2BenchmarkV3CommonCfg.commands):
+        class ranges(Go2BenchmarkV3CommonCfg.commands.ranges):
+            # V3 widened this to 2.0 for flat sprinting; on terrain a 2 m/s
+            # command over 15 cm stairs is physically unachievable and just
+            # inflates tracking error.  Back to the benchmark validation field.
+            lin_vel_x = [-1.0, 1.0]
+
+    class rewards(Go2RoughCommonCfg.rewards):
+        """Use the single rough-terrain reward source of truth unchanged."""
+        pass

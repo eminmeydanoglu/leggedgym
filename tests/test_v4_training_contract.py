@@ -1,8 +1,9 @@
-"""Fast, simulator-free checks for the V4 fixed-medium-terrain campaign."""
+"""Fast, simulator-free checks for the V4 terrain-curriculum campaign."""
 
 import unittest
 
 from legged_gym.envs import task_registry
+from legged_gym.envs.base.common_cfgs import Go2RoughCommonCfg
 from legged_gym.utils.helpers import class_to_dict
 
 
@@ -34,7 +35,11 @@ class TestV4TrainingContract(unittest.TestCase):
             self.assertEqual(terrain.mesh_type, "heightfield")
             self.assertTrue(terrain.curriculum)
             self.assertFalse(terrain.selected)
-            self.assertEqual(terrain.fixed_terrain_level, 5)
+            # Standard ETH game curriculum: NOT pinned to one row.  The absence
+            # of fixed_terrain_level is what lets the V3 physics mixin's
+            # _update_terrain_curriculum guard fall through to progression.
+            self.assertFalse(hasattr(terrain, "fixed_terrain_level"))
+            self.assertEqual(terrain.max_init_terrain_level, 1)
             self.assertEqual((terrain.num_rows, terrain.num_cols), (10, 10))
             self.assertTrue(terrain.measure_heights)
             self.assertEqual(
@@ -44,6 +49,35 @@ class TestV4TrainingContract(unittest.TestCase):
             self.assertTrue(dr.resample_physics_within_episode)
             self.assertTrue(dr.physics_resample_mass)
             self.assertTrue(dr.physics_resample_com)
+
+    def test_v4_rewards_exactly_mirror_go2rough(self):
+        # The V4 reward tree is a hand-copied mirror of Go2RoughCommonCfg.rewards.
+        # Compare the FULL resolved config (scales + top-level knobs), not a
+        # hand-picked subset, so the two copies cannot silently diverge later.
+        rough = class_to_dict(Go2RoughCommonCfg.rewards)
+        for name in V4_TASKS:
+            env_cfg, _ = self._cfgs(name)
+            self.assertEqual(
+                class_to_dict(env_cfg.rewards), rough,
+                f"{name} reward config drifted from Go2RoughCommonCfg",
+            )
+
+    def test_shared_command_field_and_schedule_contract(self):
+        for name in V4_TASKS:
+            env_cfg, train_cfg = self._cfgs(name)
+            # Env validation/checkpoint-selection field is the [-1, 1] terrain field.
+            self.assertEqual(env_cfg.commands.ranges.lin_vel_x, [-1.0, 1.0])
+            # The runtime command_schedule (applied by OnPolicyRunner) must ALSO
+            # end on [-1, 1]; the inherited V3 schedule re-widens to [-1, 2] at
+            # iteration 1500, which would undo the fix for the second training half.
+            schedule = class_to_dict(train_cfg)["runner"]["command_schedule"]
+            self.assertIsNotNone(schedule, f"{name} lost its command_schedule")
+            for stage in schedule:
+                self.assertLessEqual(
+                    stage["lin_vel_x"][1], 1.0,
+                    f"{name} command_schedule re-widens beyond 1.0 m/s: {stage}",
+                )
+            self.assertEqual(schedule[-1]["lin_vel_x"], [-1.0, 1.0])
 
     def test_height_map_is_privileged_to_oracle_and_rma_teacher_only(self):
         mlp, _ = self._cfgs("go2_v4_mlp")
@@ -80,7 +114,7 @@ class TestV4TrainingContract(unittest.TestCase):
         for name in V4_TASKS:
             _, train_cfg = self._cfgs(name)
             runner = class_to_dict(train_cfg)["runner"]
-            self.assertEqual(runner["experiment_name"], "go2_v4_medium_terrain")
+            self.assertEqual(runner["experiment_name"], "go2_v4_terrain_curriculum")
             self.assertEqual(runner["max_iterations"], 3000)
             self.assertEqual(runner["eval_seed"], 12345)
 

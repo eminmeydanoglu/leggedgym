@@ -36,7 +36,10 @@ class Logger:
             self.log_state(key, value)
 
     def log_rewards(self, dict, num_episodes):
-        for key, value in dict.items():
+        # snapshot: the env may repopulate this episode dict from another thread
+        # (viser stepping) while we iterate, which otherwise raises
+        # "dictionary changed size during iteration".
+        for key, value in list(dict.items()):
             if 'rew' in key:
                 self.rew_log[key].append(value.item() * num_episodes)
         self.num_episodes += num_episodes

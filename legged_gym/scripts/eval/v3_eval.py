@@ -35,6 +35,7 @@ from legged_gym.scripts.eval.campaign import (
     _terrain_hash,
     _terrain_raw,
     build_session,
+    build_terrain_session,
     parse_shard,
     shard_items,
 )
@@ -45,7 +46,21 @@ from legged_gym.scripts.eval.provenance import verify_run_identity
 
 
 RAW_METRICS = ("tracking_lin", "tracking_yaw", "fall_rate", "return_per_step")
-SCORED_SUITES = ("s1", "s2")
+SCORED_SUITES = ("s1", "s2", "t1", "t2")
+TERRAIN_SUITES = ("t0", "t1", "t2")
+
+# Canonical column->type map for the pinned eval grid.  With num_cols=5 and the
+# benchmark proportions [0.2, 0.1, 0.25, 0.25, 0.2] the deterministic
+# ``curiculum()`` generator assigns ``choice = col / num_cols`` to, in order:
+# smooth slope, random uniform, pyramid stairs (down), pyramid stairs (up),
+# discrete obstacles.  Falls back to a stable ``type{n}`` label off-grid.
+_TERRAIN_TYPE_NAMES = {0: "slope", 1: "random_uniform", 2: "stairs_down", 3: "stairs_up", 4: "discrete"}
+
+
+def _terrain_type_name(index: int, num_cols: int = 5) -> str:
+    if num_cols == 5 and int(index) in _TERRAIN_TYPE_NAMES:
+        return _TERRAIN_TYPE_NAMES[int(index)]
+    return f"type{int(index)}"
 
 
 @dataclass(frozen=True)
@@ -126,10 +141,22 @@ def _command_name(command: Mapping[str, Any]) -> str:
 
 
 def _planned_cells(cfg: Mapping[str, Any], suite: str, *, include_diagnostics: bool = False) -> List[Cell]:
-    requested = ("s0", "s1", "s2", "s3") if suite == "all" else (suite,)
+    protocol = cfg["protocol"]
+    terrain_cfg = protocol.get("terrain")
+    if suite == "all":
+        # ``all`` covers whichever families this campaign actually configures:
+        # the historical flat s-suites and/or the terrain-native t-suites.  A
+        # terrain-only config never plans empty s-cells and vice versa.
+        requested = []
+        if "payload" in protocol and "s1_commands" in protocol:
+            requested += ["s0", "s1", "s2", "s3"]
+        if terrain_cfg:
+            requested += ["t0", "t1", "t2"]
+    else:
+        requested = (suite,)
     model_by_label = {model["label"]: model for model in cfg["models"]}
     out: List[Cell] = []
-    payload_cfg = cfg["protocol"]["payload"]
+    payload_cfg = protocol.get("payload")
     if "s0" in requested:
         for model in cfg["models"]:
             for seed in _seed_list(cfg, model):
@@ -170,6 +197,25 @@ def _planned_cells(cfg: Mapping[str, Any], suite: str, *, include_diagnostics: b
                     out.append(Cell("s3", model["label"], seed, f"terrain_{str(terrain_cm).replace('.', '_')}cm", {
                         "kind": "terrain", "terrain_cm": float(terrain_cm),
                     }))
+    if terrain_cfg and ("t0" in requested or "t1" in requested or "t2" in requested):
+        for model in cfg["models"]:
+            for seed in _seed_list(cfg, model):
+                if "t0" in requested:
+                    id_level = int(terrain_cfg["id_level"])
+                    out.append(Cell("t0", model["label"], seed, f"terrain_id_level_{id_level}", {
+                        "kind": "terrain_id", "level": id_level,
+                    }))
+                if "t1" in requested:
+                    for level in terrain_cfg["severity_levels"]:
+                        out.append(Cell("t1", model["label"], seed, f"terrain_severity_level_{int(level)}", {
+                            "kind": "terrain_severity", "level": int(level),
+                        }))
+                if "t2" in requested:
+                    payload_level = int(terrain_cfg["payload_level"])
+                    for payload in terrain_cfg["payloads"]:
+                        out.append(Cell("t2", model["label"], seed, f"terrain_payload_{payload['name']}", {
+                            "kind": "terrain_payload", "level": payload_level, "payload": payload,
+                        }))
     # Detect typoed method labels in a config while producing a useful error.
     if {cell.model for cell in out} - set(model_by_label):
         raise RuntimeError("planned an undeclared model")
@@ -564,6 +610,32 @@ def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[s
         payload.update(s3_kind="terrain", terrain_cm=cm, terrain_hash=_terrain_hash(raw), terrain_max_abs_m=cm / 100.0,
                        command_mode="forward", command_speed=1.0,
                        **_rollout_fixed(session, commands, warmup=int(p["warmup"]), steps=int(p["terrain_steps"])))
+    elif kind in ("terrain_id", "terrain_severity", "terrain_payload"):
+        t = protocol["terrain"]
+        level = int(scenario["level"])
+        vx = float(t["command"]["vx"])
+        session, terrain_info = build_terrain_session(
+            model, cell.seed, num_envs, eval_seed,
+            fixed_level=level, num_cols=int(t["num_cols"]),
+            terrain_proportions=t["terrain_proportions"], num_rows=t.get("num_rows"),
+            measure_heights=bool(t.get("measure_heights", True)),
+            disable_v3_physics_switch=True,
+        )
+        _set_nominal(session.env)
+        extra: Dict[str, Any] = {}
+        if kind == "terrain_payload":
+            payload_item = scenario["payload"]
+            physics = _apply_payload(session.env, float(payload_item["mass_kg"]), protocol["payload"], pin_nominal=False)
+            extra.update(_payload_metadata(payload_item, protocol["payload"]), **physics)
+        commands = np.tile(np.asarray([[vx, 0., 0.]], dtype=np.float32), (num_envs, 1))
+        scenario_name = {"terrain_id": "terrain_id", "terrain_severity": "terrain_severity",
+                         "terrain_payload": "terrain_payload"}[kind]
+        payload = _base_payload(session, cell.suite, scenario_name, eval_seed, int(t["warmup"]), int(t["steps"]), cfg)
+        payload.update(terrain_kind=kind, terrain_level=level, terrain_hash=terrain_info["terrain_hash"],
+                       terrain_num_cols=terrain_info["num_cols"], terrain_num_rows=terrain_info["num_rows"],
+                       terrain_type=terrain_info["terrain_type"], terrain_level_per_env=terrain_info["terrain_level"],
+                       command_mode="forward", command_speed=vx, headline_command=True, **extra,
+                       **_rollout_fixed(session, commands, warmup=int(t["warmup"]), steps=int(t["steps"])))
     else:
         raise ValueError(f"unknown V3 eval cell kind {kind!r}")
     _save_cell(root, rel, payload)
@@ -649,6 +721,10 @@ def _raw_rows(root: Path) -> List[Dict[str, Any]]:
     for path in sorted((root / "raw").rglob("*.npz")):
         with np.load(path, allow_pickle=False) as z:
             suite = str(_scalar(z, "suite"))
+            if suite in TERRAIN_SUITES:
+                # Terrain cells pack several terrain types into one env dimension;
+                # they are expanded per (type x level) by ``_terrain_raw_rows``.
+                continue
             scenario = str(_scalar(z, "scenario"))
             error_key = "post_switch_tracking_error" if suite == "s2" else "tracking_lin"
             row = {
@@ -670,6 +746,62 @@ def _raw_rows(root: Path) -> List[Dict[str, Any]]:
                 row["post_switch_tracking_error"] = _mean(z, "post_switch_tracking_error")
                 row["post_switch_tracking_yaw"] = _mean(z, "post_switch_tracking_yaw")
             rows.append(row)
+    return rows
+
+
+def _terrain_raw_rows(root: Path) -> List[Dict[str, Any]]:
+    """Expand each terrain cell into one raw row per terrain type present.
+
+    A terrain artifact evaluates every env at one pinned difficulty ``level``
+    but splits the env dimension across ``num_cols`` types.  Each unique type is
+    reduced over its replica envs here, before any cross-seed aggregation, so a
+    seed with more replicas never outweighs another.  The emitted ``scenario``
+    encodes both the type and the controlled second axis (level for t1, payload
+    for t2), which is exactly the key ``cmd_aggregate`` groups baseline/oracle/
+    method on.
+    """
+    rows: List[Dict[str, Any]] = []
+    for path in sorted((root / "raw").rglob("*.npz")):
+        with np.load(path, allow_pickle=False) as z:
+            suite = str(_scalar(z, "suite"))
+            if suite not in TERRAIN_SUITES:
+                continue
+            model = str(_scalar(z, "model"))
+            training_seed = int(_scalar(z, "training_seed"))
+            level = int(_scalar(z, "terrain_level", 0))
+            num_cols = int(_scalar(z, "terrain_num_cols", 5))
+            terrain_hash = str(_scalar(z, "terrain_hash", ""))
+            payload_tier = str(_scalar(z, "payload_tier", ""))
+            payload_name = str(_scalar(z, "payload_name", ""))
+            command_speed = float(_scalar(z, "command_speed", 0.0))
+            terrain_type = np.asarray(z["terrain_type"]).astype(int)
+            tracking = np.asarray(z["tracking_lin"], dtype=float)
+            fall = np.asarray(z["fall_rate"], dtype=float)
+            ratio = np.asarray(z["achieved_speed_ratio"], dtype=float) if "achieved_speed_ratio" in z \
+                else np.full(tracking.shape, np.nan)
+            speed = np.asarray(z["achieved_speed"], dtype=float) if "achieved_speed" in z \
+                else np.full(tracking.shape, np.nan)
+            per_step = np.asarray(z["return_per_step"], dtype=float)
+            for type_index in sorted(np.unique(terrain_type).tolist()):
+                mask = terrain_type == type_index
+                type_name = _terrain_type_name(type_index, num_cols)
+                if suite == "t2":
+                    scenario = f"terrain_type_{type_name}_payload_{payload_name}"
+                else:
+                    scenario = f"terrain_type_{type_name}_level_{level}"
+                rows.append({
+                    "path": str(path.relative_to(root)), "suite": suite, "scenario": scenario,
+                    "model": model, "training_seed": training_seed,
+                    "tracking_error": float(np.mean(tracking[mask])), "tracking_lin": float(np.mean(tracking[mask])),
+                    "fall_rate": float(np.mean(fall[mask])),
+                    "achieved_speed": float(np.mean(speed[mask])),
+                    "achieved_speed_ratio": float(np.mean(ratio[mask])),
+                    "return_per_step": float(np.mean(per_step[mask])),
+                    "command_speed": command_speed, "headline_command": True, "diagnostic_kind": "",
+                    "payload_tier": payload_tier, "payload_name": payload_name, "command_name": "",
+                    "terrain_type": int(type_index), "terrain_type_name": type_name, "terrain_level": level,
+                    "terrain_hash": terrain_hash, "num_replicas": int(mask.sum()),
+                })
     return rows
 
 
@@ -723,12 +855,16 @@ def _scope(row: Mapping[str, Any]) -> str:
         return "GapClosed_static"
     if row["suite"] == "s2":
         return f"GapClosed_dynamic_{row['payload_tier']}"
+    if row["suite"] == "t1":
+        return f"GapClosed_terrain_{row['terrain_type_name']}"
+    if row["suite"] == "t2":
+        return f"GapClosed_terrain_payload_{row['payload_tier']}"
     raise ValueError(f"no gap-closed scope for {row['suite']}")
 
 
 def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
     root = artifact_root(cfg)
-    raw = _raw_rows(root)
+    raw = _raw_rows(root) + _terrain_raw_rows(root)
     if not raw:
         raise FileNotFoundError(f"no raw artifacts under {root / 'raw'}")
     _write_csv(root / "tables" / "raw_cells.csv", raw)
@@ -744,6 +880,20 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
                 diagnostic_raw.append(row)
     score_rows: List[Dict[str, Any]] = []
     for (suite, scenario), rows in grouped.items():
+        if suite in TERRAIN_SUITES:
+            # The entire scorecard's validity rests on every method seeing a
+            # byte-identical heightfield for this (type x level/payload) cell.
+            # Fail loud rather than silently compare apples to oranges if any
+            # policy's terrain geometry diverged (e.g. a task consumed a
+            # different amount of numpy RNG before the terrain was built).
+            hashes = {str(row.get("terrain_hash", "")) for row in rows}
+            hashes.discard("")
+            if len(hashes) > 1:
+                offenders = {row["model"]: str(row.get("terrain_hash", ""))[:12] for row in rows}
+                raise RuntimeError(
+                    f"terrain geometry mismatch in {suite}:{scenario}; methods must share one "
+                    f"heightfield but saw {len(hashes)} distinct terrain_hash values: {offenders}"
+                )
         baseline_rows = [row for row in rows if row["model"] == baseline_label]
         oracle_rows = [row for row in rows if row["model"] == oracle_label]
         if not baseline_rows or not oracle_rows:
@@ -803,6 +953,26 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
                                   "value_median": float(np.median(tracking_delta)), "value_min": float(np.min(tracking_delta)),
                                   "value_max": float(np.max(tracking_delta)), "all_seeds_positive": None,
                                   "fall_delta_median": float(np.median(fall_delta))})
+    # t0 is descriptive, not a gap-closed suite: report each method's
+    # tracking/fall delta versus MLP at the nominal terrain difficulty, per type.
+    t0_rows = [row for row in raw if row["suite"] == "t0"]
+    for type_name in sorted({str(row["terrain_type_name"]) for row in t0_rows}):
+        type_rows = [row for row in t0_rows if str(row["terrain_type_name"]) == type_name]
+        mlp_rows = [row for row in type_rows if row["model"] == baseline_label]
+        if not mlp_rows:
+            continue
+        baseline_tracking = float(np.median([row["tracking_lin"] for row in mlp_rows]))
+        baseline_fall = float(np.median([row["fall_rate"] for row in mlp_rows]))
+        for label in score_cfg["method_labels"]:
+            values = [row for row in type_rows if row["model"] == label]
+            if not values:
+                continue
+            tracking_delta = [row["tracking_lin"] - baseline_tracking for row in values]
+            fall_delta = [row["fall_rate"] - baseline_fall for row in values]
+            headlines.append({"model": label, "metric": f"terrain_ID_delta_tracking_{type_name}",
+                              "n_training_seeds": len(values), "value_median": float(np.median(tracking_delta)),
+                              "value_min": float(np.min(tracking_delta)), "value_max": float(np.max(tracking_delta)),
+                              "all_seeds_positive": None, "fall_delta_median": float(np.median(fall_delta))})
     status_counts: Dict[str, int] = defaultdict(int)
     for row in score_rows:
         status_counts[str(row["headline_status"])] += 1
@@ -837,7 +1007,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="V3 generalisation scorecard batch")
     parser.add_argument("command", choices=("plan", "resolve-runs", "run", "aggregate", "report"))
     parser.add_argument("--config", required=True)
-    parser.add_argument("--suite", choices=("s0", "s1", "s2", "s3", "all"), default="all")
+    parser.add_argument("--suite", choices=("s0", "s1", "s2", "s3", "t0", "t1", "t2", "all"), default="all")
     parser.add_argument("--shard", default="0/1")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--models", default="", help="comma-separated model labels; use one label to append a newly finished policy")

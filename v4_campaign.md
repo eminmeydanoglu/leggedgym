@@ -1,16 +1,20 @@
-# V4: orta terrain + terrain-map oracle kampanyası
+# V4: ETH terrain curriculum + terrain-map oracle kampanyası
 
 V4, bitmiş V3 kampanyasını değiştirmez. Aynı altı yöntemi, V3'ün P5 ve tek
-episode-içi mass/CoM switch kontratıyla; fakat her ortamda **sabit orta seviye**
-terrain üzerinde yeniden eğitir.
+episode-içi mass/CoM switch kontratıyla; fakat **standart ETH oyun-tipi terrain
+curriculum'u** üzerinde yeniden eğitir. (Eski sürüm her ortamı sabit difficulty-5
+satırına pinliyordu; bu, düz-araziye ayarlı reward'larla birleşince tüm yöntemleri
+aynı başarısızlık tabanına sıkıştırdığı için terk edildi — bkz. commit notu.)
 
-## Sabit eğitim kontratı
+## Eğitim kontratı
 
 | Bileşen | V4 kararı |
 |---|---|
 | Terrain üretimi | 10 terrain sütunu, 10 zorluk satırı; sütunlarda terrain türü karışımı |
-| Kullanılan satır | Her ortam için sabit satır `5`; generator tanımında difficulty `5 / 10 = 0.5` |
-| Terrain ilerleme curriculum | Kapalı; generator grid'i kurar ama öğrenen performansına göre satır değişmez |
+| Kullanılan satır | **Sabit değil**; ortamlar kolay satırlardan (`max_init_terrain_level=1`) başlar, performansa göre tırmanır (game curriculum) |
+| Terrain ilerleme curriculum | **Açık**; `fixed_terrain_level` yok, V3 physics mixin guard'ı düşer ve `_update_terrain_curriculum` progresyonu çalışır |
+| Reward shaping | **Rough-terrain seti** (Go2RoughCommonCfg birebir): flat'e-düşman `orientation`/`base_height` cezaları kapalı; gait/clearance/stand-still + `dof_power` açık. 6 yöntemde de aynı sabit. |
+| Komut aralığı | `lin_vel_x=[-1,1]` (V3'ün flat 2.0 m/s sprint alanı arazi için geri çekildi) |
 | Terrain çeşitleri | Eğimi, random-uniform, merdivenleri ve discrete-obstacle zeminleri |
 | Fizik | V3 ile aynı: `P5=[friction,mass,com_x,com_y,com_z]`, `[-2,+5] kg`, `±0.08 m`, episode başına bir switch |
 | Sıradan yöntemler | V3 aktör/critic girişleri aynen korunur; terrain map aktöre verilmez |
@@ -45,7 +49,7 @@ env SIMULATOR=genesis .venv/bin/python tests/v4_runtime_smoke.py
 ```
 
 Altay'da her görev için V3 ile aynı seed/bütçe kullanılır; yalnız task adı V4,
-deney kökü otomatik olarak `logs/go2_v4_medium_terrain/` olur:
+deney kökü otomatik olarak `logs/go2_v4_terrain_curriculum/` olur:
 
 ```bash
 env SIMULATOR=genesis WANDB_MODE=disabled .venv/bin/python -u legged_gym/scripts/train.py \
@@ -61,10 +65,16 @@ parçası olduğu için, eval sırasında ayrıca terrain override verilmez.
 ## Kabul kapısı
 
 1. Her iki kontrat testi geçer; V3 hâlâ flat/map-free kalır.
-2. V4 runtime smoke her görevde terrain level=`5`, live mass/CoM switch ve
-   beklenen aktör/critic boyutlarını doğrular.
+2. V4 runtime smoke her görevde başlangıç terrain level'ının
+   `0..max_init_terrain_level` aralığında olduğunu, reset sonrası curriculum'un
+   geçerli grid aralığında kaldığını, live mass/CoM switch ve beklenen
+   aktör/critic boyutlarını doğrular.
 3. İlk seed'de oracle'ın eğitimi stabil değilse, bütün kampanyayı başlatmadan
-   önce yalnız terrain şiddeti/rewardlar incelenir; yöntemlere ayrı terrain
-   curriculum uygulanmaz.
+   önce terrain curriculum hızı (`max_init_terrain_level`), reward ağırlıkları
+   veya komut aralığı incelenir.
+   NOT: Eski (bozuk) sabit-difficulty-5 çalışmaları `logs/go2_v4_medium_terrain/`
+   altında duruyor. Yeni curriculum koşuları bilinçli olarak ayrı
+   `logs/go2_v4_terrain_curriculum/` köküne yazılır; eski checkpoint ve loglarla
+   karışmaz.
 4. İki seed tamamlandıktan sonra V3 scorecard hücrelerinin aynısı V4 için
    üretilir ve hem mutlak skor hem `MLP→oracle` normalize headroom raporlanır.

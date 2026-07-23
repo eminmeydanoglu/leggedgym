@@ -1,4 +1,4 @@
-"""V4: V3 dynamic-physics methods trained on fixed medium terrain."""
+"""V4: V3 dynamic-physics methods trained on the ETH game terrain curriculum."""
 
 from legged_gym.envs.base.common_cfgs import Go2BenchmarkV4TerrainCfg, get_simulator_suffix
 from legged_gym.envs.go2.go2_v3_mlp.go2_v3_mlp_config import Go2V3CfgPPO
@@ -7,6 +7,18 @@ from legged_gym.envs.go2.go2_v3_rma.go2_v3_rma_config import Go2V3RMACfgPPO
 from legged_gym.envs.go2.go2_v3_dreamwaq.go2_v3_dreamwaq_config import Go2V3DreamwaqCfgPPO
 from legged_gym.envs.go2.go2_v3_him_fixed.go2_v3_him_fixed_config import Go2V3HIMFixedCfgPPO
 from legged_gym.envs.go2.go2_v3_superset_oracle.go2_v3_superset_oracle_config import Go2V3SupersetOracleCfgPPO
+
+
+# The V3 runners inherit a command_schedule whose final stage re-widens
+# lin_vel_x to [-1, 2] at iteration 1500 (a flat sprint field).  On terrain a
+# 2 m/s command over 15 cm stairs is physically unachievable and only inflates
+# tracking error, so V4 overrides the schedule to end on the same [-1, 1]
+# validation field its env config declares.  This is a shared constant across
+# all six methods, so it does not bias the method comparison.
+V4_COMMAND_SCHEDULE = [
+    {"start_iteration": 0, "lin_vel_x": [-0.5, 0.5]},
+    {"start_iteration": 500, "lin_vel_x": [-1.0, 1.0]},
+]
 
 
 class Go2V4MlpCfg(Go2BenchmarkV4TerrainCfg):
@@ -85,35 +97,41 @@ class Go2V4SupersetOracleCfg(Go2BenchmarkV4TerrainCfg):
 
 class Go2V4MlpCfgPPO(Go2V3CfgPPO):
     class runner(Go2V3CfgPPO.runner):
-        experiment_name = "go2_v4_medium_terrain"
+        experiment_name = "go2_v4_terrain_curriculum"
         run_name = "v4_mlp" + get_simulator_suffix()
+        command_schedule = V4_COMMAND_SCHEDULE
 
 
 class Go2V4SysIDCfgPPO(Go2V3SysIDCfgPPO):
     class runner(Go2V3SysIDCfgPPO.runner):
-        experiment_name = "go2_v4_medium_terrain"
+        experiment_name = "go2_v4_terrain_curriculum"
         run_name = "v4_sysid" + get_simulator_suffix()
+        command_schedule = V4_COMMAND_SCHEDULE
 
 
 class Go2V4RMACfgPPO(Go2V3RMACfgPPO):
     class runner(Go2V3RMACfgPPO.runner):
-        experiment_name = "go2_v4_medium_terrain"
+        experiment_name = "go2_v4_terrain_curriculum"
         run_name = "v4_rma" + get_simulator_suffix()
+        command_schedule = V4_COMMAND_SCHEDULE
 
 
 class Go2V4DreamwaqCfgPPO(Go2V3DreamwaqCfgPPO):
     class runner(Go2V3DreamwaqCfgPPO.runner):
-        experiment_name = "go2_v4_medium_terrain"
+        experiment_name = "go2_v4_terrain_curriculum"
         run_name = "v4_dreamwaq" + get_simulator_suffix()
+        command_schedule = V4_COMMAND_SCHEDULE
 
 
 class Go2V4HIMFixedCfgPPO(Go2V3HIMFixedCfgPPO):
     class runner(Go2V3HIMFixedCfgPPO.runner):
-        experiment_name = "go2_v4_medium_terrain"
+        experiment_name = "go2_v4_terrain_curriculum"
         run_name = "v4_him_fixed" + get_simulator_suffix()
+        command_schedule = V4_COMMAND_SCHEDULE
 
 
 class Go2V4SupersetOracleCfgPPO(Go2V3SupersetOracleCfgPPO):
     class runner(Go2V3SupersetOracleCfgPPO.runner):
-        experiment_name = "go2_v4_medium_terrain"
+        experiment_name = "go2_v4_terrain_curriculum"
         run_name = "v4_superset_oracle" + get_simulator_suffix()
+        command_schedule = V4_COMMAND_SCHEDULE

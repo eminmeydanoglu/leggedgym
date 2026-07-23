@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -452,20 +454,24 @@ class ViserViewer:
         self.server.scene.configure_environment_map(
             hdri="studio",
             background=False,
-            environment_intensity=0.5,
+            environment_intensity=0.35,
         )
         self.server.scene.set_background_image(np.zeros((2, 2, 3), dtype=np.uint8))
+        # Dimmed sun: the terrain top faces are lit directly from above, so a
+        # bright sun washed the dark-green ground out to a pale green when viewed
+        # from the top.  1.0 keeps the robot readable while letting the terrain
+        # stay dark.
         self.server.scene.add_light_directional(
             "/sun",
             color=(255, 255, 255),
-            intensity=1.5,
+            intensity=1.0,
             cast_shadow=True,
             position=(3.0, -3.0, 5.0),
         )
 
         self._setup_camera()
         self._setup_camera_gui()
-        self._setup_command_sliders()
+        self._setup_keyboard_control()
         self._setup_live_telemetry()
         self._setup_respawn_button()
 
@@ -481,7 +487,7 @@ class ViserViewer:
 
     def _setup_camera_gui(self) -> None:
         """Add camera tracking and FOV controls."""
-        self._camera_tracking_enabled = True
+        self._camera_tracking_enabled = False
         self._camera_fov_degrees = 60.0
 
         with self.server.gui.add_folder("Camera"):
@@ -508,56 +514,178 @@ class ViserViewer:
                 for client in self.server.get_clients().values():
                     client.camera.fov = np.radians(slider_fov.value)
 
-    def _setup_command_sliders(self) -> None:
-        """Add sliders for velocity commands (lin_vel_x, lin_vel_y, ang_vel_z)."""
-        self._command_sliders = {}
+    def _setup_keyboard_control(self) -> None:
+        """TFGH/RY keyboard driving of the velocity command.
 
-        with self.server.gui.add_folder("Velocity Commands", expand_by_default=True):
-            self._command_sliders['lin_vel_x'] = self.server.gui.add_slider(
-                "Linear X (m/s)",
-                min=-2.0,
-                max=2.0,
-                step=0.1,
-                initial_value=0.0,
+        T/G = forward/back, F/H = strafe left/right, R/Y = turn left/right,
+        Space = hard stop.  (WASD is deliberately avoided - viser's own 3D
+        fly-controls already bind those keys; T/F/G/H keep the same inverted-T
+        layout on free keys.)  Viser's GUI only forwards key-*down* events
+        (there is no key-up), so "held" is inferred from the browser's
+        key-repeat: a key counts as held while repeat events keep arriving, and
+        once they stop the command coasts smoothly back to zero (see
+        ``get_command``)."""
+        # command envelope in the robot base frame (m/s, m/s, rad/s)
+        self._max_vel = {"fwd": 1.5, "back": 1.0, "lat": 0.7, "yaw": 1.5}
+        self._tau_accel = 0.10   # ramp-up time constant (s)
+        self._tau_decel = 0.30   # coast-down time constant (s)
+
+        # "Held" is inferred from browser key-repeat.  A held key emits one
+        # keydown, then (after the OS *initial* repeat delay, ~0.25-0.6 s) a fast
+        # stream of repeats.  We bridge that first gap with a long grace, but as
+        # soon as repeats are confirmed (two triggers closer than
+        # ``_repeat_gap_max``) we switch to a short grace so releasing is
+        # detected almost immediately and the command coasts to zero promptly.
+        self._repeat_gap_max = 0.15   # max gap counted as auto-repeat (s)
+        self._grace_initial = 0.6     # release window before repeats confirmed
+        self._grace_repeat = 0.15     # release window once repeating
+
+        keys = ("T", "F", "G", "H", "R", "Y")
+        self._key_last_ts: Dict[str, float] = {k: -1e9 for k in keys}
+        self._key_repeating: Dict[str, bool] = {k: False for k in keys}
+        self._cmd_vel = np.zeros(3, dtype=float)  # ramped [vx, vy, yaw]
+        self._get_command_last_t: Optional[float] = None
+
+        key_labels = {
+            "T": "Forward (T)",
+            "G": "Backward (G)",
+            "F": "Strafe left (F)",
+            "H": "Strafe right (H)",
+            "R": "Turn left (R)",
+            "Y": "Turn right (Y)",
+        }
+
+        with self.server.gui.add_folder("Keyboard Drive (TFGH/RY)", expand_by_default=True):
+            self.server.gui.add_markdown(
+                "**Hold** a key to move, **release** to coast to a stop.\n\n"
+                "- **T / G** forward / back\n"
+                "- **F / H** strafe left / right\n"
+                "- **R / Y** turn left / right\n"
+                "- **Space** hard stop\n\n"
+                "_Click the 3D view first so it has keyboard focus._"
             )
-            self._command_sliders['lin_vel_y'] = self.server.gui.add_slider(
-                "Linear Y (m/s)",
-                min=-1.0,
-                max=1.0,
-                step=0.1,
-                initial_value=0.0,
-            )
-            self._command_sliders['ang_vel_yaw'] = self.server.gui.add_slider(
-                "Angular Yaw (rad/s)",
-                min=-1.0,
-                max=1.0,
-                step=0.1,
-                initial_value=0.0,
-            )
+
+            def _make_press(key: str):
+                def _(_event) -> None:
+                    now = time.perf_counter()
+                    # two triggers closer than _repeat_gap_max => auto-repeat
+                    if now - self._key_last_ts[key] <= self._repeat_gap_max:
+                        self._key_repeating[key] = True
+                    self._key_last_ts[key] = now
+                return _
+
+            for key, label in key_labels.items():
+                cmd = self.server.gui.add_command(label, hotkey=key)
+                cmd.on_trigger(_make_press(key))
+
+            stop_cmd = self.server.gui.add_command("Stop (Space)", hotkey="space")
+
+            def _stop(_event) -> None:
+                for k in self._key_last_ts:
+                    self._key_last_ts[k] = -1e9
+                    self._key_repeating[k] = False
+                self._cmd_vel[:] = 0.0
+
+            stop_cmd.on_trigger(_stop)
 
     def _setup_live_telemetry(self) -> None:
-        """Add read-only fields for the simulated base velocities."""
-        with self.server.gui.add_folder("Live Base Velocity", expand_by_default=True):
+        """Read-out of commanded vs. achieved base velocity, as numbers and as
+        two small live time-series plots (forward speed and yaw rate)."""
+        self._plot_window = 200   # samples kept (~a few seconds at 60 Hz)
+        self._plot_stride = 3     # push new plot data every N frames (~20 Hz)
+        self._plot_counter = 0
+        self._telemetry_t0 = time.perf_counter()
+
+        self._hist = {
+            k: deque(maxlen=self._plot_window)
+            for k in ("t", "vx_cmd", "vx_act", "yaw_cmd", "yaw_act")
+        }
+        # Seed with two points so uPlot has a valid initial range to draw.
+        for _ in range(2):
+            for k in self._hist:
+                self._hist[k].append(0.0)
+
+        with self.server.gui.add_folder("Command vs Achieved", expand_by_default=True):
             self._telemetry_fields = {
-                "linear": self.server.gui.add_text(
-                    "Linear (m/s)",
-                    initial_value="vx=+0.000  vy=+0.000  vz=+0.000",
+                "cmd": self.server.gui.add_text(
+                    "Command  (vx, vy, yaw)",
+                    initial_value="vx=+0.00  vy=+0.00  yaw=+0.00",
                     disabled=True,
                 ),
-                "yaw": self.server.gui.add_text(
-                    "Angular yaw (rad/s)",
-                    initial_value="+0.000",
+                "act": self.server.gui.add_text(
+                    "Achieved (vx, vy, yaw)",
+                    initial_value="vx=+0.00  vy=+0.00  yaw=+0.00",
                     disabled=True,
                 ),
             }
 
-    def update_live_telemetry(self, linear_velocity, yaw_rate) -> None:
-        """Publish current simulated base linear velocity and yaw rate."""
+            import viser.uplot as uplot
+
+            t0 = np.asarray(self._hist["t"], dtype=np.float64)
+            cmd_series = uplot.Series(
+                label="cmd", stroke="#f59e0b", width=2, dash=(4.0, 4.0)
+            )
+            act_series = uplot.Series(label="act", stroke="#3b82f6", width=2)
+            x_series = uplot.Series()
+
+            # x is elapsed *seconds*, not wall-clock: disable uPlot's time scale
+            # (otherwise the axis renders as "1/1/70 2:00am" style timestamps).
+            scales = {"x": uplot.Scale(time=False)}
+            x_axis = uplot.Axis(label="t (s)")
+
+            self._plot_vx = self.server.gui.add_uplot(
+                data=(t0, np.asarray(self._hist["vx_cmd"]), np.asarray(self._hist["vx_act"])),
+                series=(x_series, cmd_series, act_series),
+                title="Forward speed vx (m/s)",
+                aspect=2.2,
+                scales=scales,
+                axes=(x_axis, uplot.Axis()),
+                legend=uplot.Legend(show=True),
+            )
+            self._plot_yaw = self.server.gui.add_uplot(
+                data=(t0, np.asarray(self._hist["yaw_cmd"]), np.asarray(self._hist["yaw_act"])),
+                series=(x_series, cmd_series, act_series),
+                title="Yaw rate (rad/s)",
+                aspect=2.2,
+                scales=scales,
+                axes=(x_axis, uplot.Axis()),
+                legend=uplot.Legend(show=True),
+            )
+
+    def update_live_telemetry(self, linear_velocity, yaw_rate, command=None) -> None:
+        """Publish commanded (``command`` = [vx, vy, yaw]) and achieved base
+        velocity as numbers and append them to the live plots."""
         linear = np.asarray(linear_velocity, dtype=float)
-        self._telemetry_fields["linear"].value = (
-            f"vx={linear[0]:+.3f}  vy={linear[1]:+.3f}  vz={linear[2]:+.3f}"
+        yaw = float(yaw_rate)
+        cmd = np.zeros(3) if command is None else np.asarray(command, dtype=float)
+
+        self._telemetry_fields["cmd"].value = (
+            f"vx={cmd[0]:+.2f}  vy={cmd[1]:+.2f}  yaw={cmd[2]:+.2f}"
         )
-        self._telemetry_fields["yaw"].value = f"{float(yaw_rate):+.3f}"
+        self._telemetry_fields["act"].value = (
+            f"vx={linear[0]:+.2f}  vy={linear[1]:+.2f}  yaw={yaw:+.2f}"
+        )
+
+        t = time.perf_counter() - self._telemetry_t0
+        self._hist["t"].append(t)
+        self._hist["vx_cmd"].append(float(cmd[0]))
+        self._hist["vx_act"].append(float(linear[0]))
+        self._hist["yaw_cmd"].append(float(cmd[2]))
+        self._hist["yaw_act"].append(yaw)
+
+        self._plot_counter += 1
+        if self._plot_counter % self._plot_stride == 0:
+            ts = np.asarray(self._hist["t"], dtype=np.float64)
+            self._plot_vx.data = (
+                ts,
+                np.asarray(self._hist["vx_cmd"]),
+                np.asarray(self._hist["vx_act"]),
+            )
+            self._plot_yaw.data = (
+                ts,
+                np.asarray(self._hist["yaw_cmd"]),
+                np.asarray(self._hist["yaw_act"]),
+            )
 
     def _setup_respawn_button(self) -> None:
         """Add a manual "Respawn" button that triggers self._respawn_callback."""
@@ -576,23 +704,85 @@ class ViserViewer:
         self._respawn_callback = callback
 
     def get_command(self) -> np.ndarray:
-        """Get current velocity command from sliders.
+        """Current velocity command [lin_vel_x, lin_vel_y, ang_vel_yaw] derived
+        from the WASD/QE keys.
 
-        Returns:
-            np.ndarray: [lin_vel_x, lin_vel_y, ang_vel_yaw]
+        Each held key defines a per-axis *target*; the returned command ramps
+        towards that target (fast when accelerating, slower when coasting) so
+        the robot eases in and, on release, decelerates smoothly to zero rather
+        than snapping.
         """
-        if not hasattr(self, '_command_sliders'):
+        if not hasattr(self, "_key_last_ts"):
             return np.array([0.0, 0.0, 0.0])
 
-        return np.array([
-            self._command_sliders['lin_vel_x'].value,
-            self._command_sliders['lin_vel_y'].value,
-            self._command_sliders['ang_vel_yaw'].value,
+        now = time.perf_counter()
+        if self._get_command_last_t is None:
+            dt = 0.0
+        else:
+            dt = now - self._get_command_last_t
+        self._get_command_last_t = now
+        dt = float(min(max(dt, 0.0), 0.1))
+
+        def held(key: str) -> bool:
+            elapsed = now - self._key_last_ts[key]
+            grace = self._grace_repeat if self._key_repeating[key] else self._grace_initial
+            is_held = elapsed < grace
+            # Only clear the auto-repeat latch after the *long* timeout, so that
+            # crossing the short repeat-grace doesn't snap the window back open
+            # and re-trigger the hold.  A new press then re-primes from scratch.
+            if elapsed >= self._grace_initial:
+                self._key_repeating[key] = False
+            return is_held
+
+        m = self._max_vel
+        target = np.array([
+            (m["fwd"] if held("T") else 0.0) - (m["back"] if held("G") else 0.0),
+            (m["lat"] if held("F") else 0.0) - (m["lat"] if held("H") else 0.0),
+            (m["yaw"] if held("R") else 0.0) - (m["yaw"] if held("Y") else 0.0),
         ])
+
+        for i in range(3):
+            tgt = target[i]
+            cur = self._cmd_vel[i]
+            # accelerate quickly toward a larger magnitude, coast down slowly
+            tau = self._tau_accel if abs(tgt) > abs(cur) else self._tau_decel
+            alpha = 1.0 - math.exp(-dt / tau) if (dt > 0.0 and tau > 1e-6) else 1.0
+            self._cmd_vel[i] = cur + (tgt - cur) * alpha
+
+        return self._cmd_vel.copy()
+
+    @staticmethod
+    def _ensure_lit_material(mesh: trimesh.Trimesh) -> None:
+        """Guarantee the terrain exports with a matte, non-metallic PBR material
+        and vertex normals.  glTF's default material (used when a mesh has none,
+        e.g. a plain ColorVisuals mesh) is fully metallic, which renders pitch
+        black when the environment map is used for lighting only.  We keep any
+        existing per-vertex colors as a COLOR_0 attribute so height/terrain
+        shading survives, but force a lit material like the robot meshes use."""
+        visual = getattr(mesh, 'visual', None)
+        material = getattr(visual, 'material', None)
+        if not isinstance(material, trimesh.visual.material.PBRMaterial):
+            existing_colors = None
+            if isinstance(visual, trimesh.visual.ColorVisuals) and \
+                    visual.vertex_colors is not None and len(visual.vertex_colors):
+                existing_colors = np.asarray(visual.vertex_colors)
+            pbr = trimesh.visual.material.PBRMaterial(
+                baseColorFactor=(1.0, 1.0, 1.0, 1.0),
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                doubleSided=True,
+            )
+            mesh.visual = trimesh.visual.TextureVisuals(material=pbr)
+            if existing_colors is not None:
+                mesh.visual.vertex_attributes['color'] = existing_colors
+        # process=False leaves vertex normals empty; glTF then renders unlit/dark.
+        _ = mesh.vertex_normals
 
     def set_terrain_mesh(self, terrain_mesh: Optional[trimesh.Trimesh]) -> None:
         if terrain_mesh is None:
             return
+
+        self._ensure_lit_material(terrain_mesh)
 
         if hasattr(self, '_terrain_handle') and self._terrain_handle is not None:
             self._terrain_handle.remove()
@@ -651,12 +841,40 @@ class ViserViewer:
             normalized = (heights - h_min) / (h_max - h_min)
         else:
             normalized = np.zeros_like(heights)
+        # Dark-green terrain: keep a subtle height gradient but stay in a deep,
+        # muted green range (roughly RGB (9,28,14) .. (21,50,23)) rather than the
+        # old bright pastel green.  Even lit from directly above by the sun this
+        # reads as a dark forest green.
         colors = np.zeros((len(heights), 4), dtype=np.uint8)
-        colors[:, 0] = (50 + 100 * normalized).astype(np.uint8)
-        colors[:, 1] = (150 + 100 * (1 - normalized)).astype(np.uint8)
-        colors[:, 2] = (100 + 50 * normalized).astype(np.uint8)
+        colors[:, 0] = (9 + 12 * normalized).astype(np.uint8)
+        colors[:, 1] = (28 + 22 * (1 - normalized)).astype(np.uint8)
+        colors[:, 2] = (14 + 9 * normalized).astype(np.uint8)
         colors[:, 3] = 255
-        mesh.visual = trimesh.visual.ColorVisuals(vertex_colors=colors)
+
+        # A bare ColorVisuals mesh exports to glTF with NO material, so the
+        # viewer falls back to glTF's default material - which is fully metallic
+        # (metallicFactor=1.0).  With the environment map used for lighting only
+        # (background=False) there's almost nothing for a metal surface to
+        # reflect, so the terrain rendered pitch black.  Mirror the robot meshes:
+        # attach a matte, non-metallic PBR material (baseColor white) and keep
+        # the per-vertex height colors as a COLOR_0 attribute, which three.js
+        # multiplies with the white base color - so we get the height gradient
+        # AND correct lighting.  Also trigger vertex-normal computation
+        # (process=False leaves them empty, which glTF renders unlit / dark).
+        # doubleSided: the heightfield triangle winding makes the lit front face
+        # point *down*, so a single-sided material renders the terrain black when
+        # viewed from above (back faces get culled -> you see the void) and only
+        # green from below.  Render both sides so the ground is visible and lit
+        # from any camera angle.
+        pbr = trimesh.visual.material.PBRMaterial(
+            baseColorFactor=(1.0, 1.0, 1.0, 1.0),
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+            doubleSided=True,
+        )
+        mesh.visual = trimesh.visual.TextureVisuals(material=pbr)
+        mesh.visual.vertex_attributes['color'] = colors
+        _ = mesh.vertex_normals
 
         if return_mesh:
             return mesh
@@ -772,12 +990,21 @@ def create_viser_viewer(
             transform[0] = -env.cfg.terrain.border_size
             transform[1] = -env.cfg.terrain.border_size
             transform[2] = 0.0
+            # Pick a stride that keeps the mesh under a triangle budget the
+            # browser can actually render.  A fixed stride=3 is fine for a small
+            # play grid, but a full training grid (e.g. 1200x1200 samples) still
+            # yields ~300k+ triangles at stride=3, which Viser/three.js silently
+            # drops - the ground then vanishes and the robot looks like it is
+            # sinking into a void.  Scale the stride up with the sample count.
+            nx, ny = terrain.heightsamples.shape
+            max_verts = 90_000  # ~180k triangles, comfortably renderable
+            stride = max(3, int(np.ceil(np.sqrt((nx * ny) / max_verts))))
             mesh = viewer.set_terrain_from_heightfield(
                 terrain.heightsamples,
                 horizontal_scale=env.cfg.terrain.horizontal_scale,
                 vertical_scale=env.cfg.terrain.vertical_scale,
                 return_mesh=True,
-                stride=3,
+                stride=stride,
             )
             if mesh is not None:
                 translation = trimesh.transformations.translation_matrix(transform)

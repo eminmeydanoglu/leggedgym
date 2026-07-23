@@ -162,8 +162,10 @@ def get_args():
     parser.add_argument('--viewer',         type=str, default='native', choices=['native', 'viser'], 
                         help="viewer backend: 'native' for simulator viewer, 'viser' for web-based 3D viewer")
     parser.add_argument('--viser_port',     type=int, default=8080, help="port for viser web server (only used with --viewer viser)")
-    parser.add_argument('--terrain',        type=str, default='flat', choices=['flat', 'bumpy', 'course', 'train'],
-                        help="play terrain override: flat, mildly bumpy, a rough course with stairs, or 'train' to keep the task's own training terrain unchanged (used by play.py)")
+    parser.add_argument('--terrain',        type=str, default='flat', choices=['flat', 'bumpy', 'course', 'rough', 'train'],
+                        help="play terrain override (user-chosen, independent of the model): 'flat', mildly 'bumpy', a rough 'course' with stairs, 'rough' for the full ETH curriculum terrain on ANY model, or 'train' to deliberately reproduce the checkpoint's own training terrain (used by play.py)")
+    parser.add_argument('--terrain_level',   type=int, default=None,
+                        help="curriculum difficulty (0=easiest) for --terrain rough/train; independent of the checkpoint. Default: an easy, visible level.")
     parser.add_argument('--motion_file',    type=str, 
                         default=None, 
                         help="motion file to load, under resources/reference_motion")

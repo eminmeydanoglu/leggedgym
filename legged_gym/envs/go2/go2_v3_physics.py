@@ -99,7 +99,7 @@ class Go2V3PhysicsResampleMixin:
         self._v3_switch_done[due] = True
 
     def _update_terrain_curriculum(self, env_ids):
-        """Keep V4 on its declared terrain row, independent of performance."""
+        """Respect an explicit fixed row; otherwise use the base game curriculum."""
         if getattr(self.cfg.terrain, "fixed_terrain_level", None) is not None:
             return
         return super()._update_terrain_curriculum(env_ids)

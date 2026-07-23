@@ -1,0 +1,108 @@
+# Terrain-native V4 generalisation campaign.
+#
+# V4 carried the V3 physics contract onto the ETH game-terrain *curriculum*
+# (rough rewards, lin_vel_x=[-1,1], and a 17x11=187 height-map teacher for the
+# RMA teacher / Superset-Oracle).  The flat V3 s-suites are meaningless here:
+# on flat ground the oracle's height map is all-zero, so oracle == MLP and every
+# scorecard cell returns ``no_oracle_headroom``.  This campaign instead makes the
+# terrain the primary controlled axis (t0/t1/t2) and measures how much of the
+# blind-MLP -> all-seeing-Oracle gap each proprioceptive method closes on rough
+# ground.  ``v3_eval`` is the reusable runner; this file names one append-only
+# scientific campaign that may begin with one policy-seed and accept the rest
+# later.
+campaign: v4_terrain
+artifact_root: logs/eval/v4_terrain
+simulator: genesis
+# Curriculum runs are promoted on ``best_tracking.pt`` and do not keep a fixed
+# model_3000.pt, so the final-checkpoint gate must be off.
+require_final_checkpoint: false
+training_seeds: [1]
+
+# NOTE (data availability): only mlp / superset_oracle / dreamwaq / him_fixed are
+# currently trained under ``go2_v4_terrain_curriculum``.  sysid and rma exist so
+# far only under the older, superseded fixed-difficulty ``go2_v4_medium_terrain``
+# contract, which is a *different* training regime and must not be mixed into a
+# curriculum comparison.  ``resolve-runs`` is append-only and simply lists them
+# as pending until they are trained under the curriculum log root below.
+models:
+  - label: MLP
+    task: go2_v4_mlp
+    log_root: logs/go2_v4_terrain_curriculum
+    run_pattern: "*_v4_mlp_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: SysID
+    task: go2_v4_sysid
+    log_root: logs/go2_v4_terrain_curriculum
+    run_pattern: "*_v4_sysid_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: RMA
+    task: go2_v4_rma
+    log_root: logs/go2_v4_terrain_curriculum
+    run_pattern: "*_v4_rma_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: DreamWaQ
+    task: go2_v4_dreamwaq
+    log_root: logs/go2_v4_terrain_curriculum
+    run_pattern: "*_v4_dreamwaq_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: HIM-fixed
+    task: go2_v4_him_fixed
+    log_root: logs/go2_v4_terrain_curriculum
+    run_pattern: "*_v4_him_fixed_genesis_seed{seed}"
+    checkpoint: best_tracking
+  - label: Superset-Oracle
+    task: go2_v4_superset_oracle
+    log_root: logs/go2_v4_terrain_curriculum
+    run_pattern: "*_v4_superset_oracle_genesis_seed{seed}"
+    checkpoint: best_tracking
+
+protocol:
+  # A parallel environment is a measurement replica, not a training seed.  Must
+  # be a multiple of terrain.num_cols so the env->type split is exactly even.
+  num_envs: 380
+  eval_seed: 41001
+
+  # Forward-mounted payload = added mass + correlated forward-CoM shift, reused
+  # by t2 exactly as in the flat V3 payload axis.
+  payload:
+    com_x_per_kg: 0.01
+    com_x_limit_m: 0.08
+
+  terrain:
+    # 5 clean terrain types via choice = col / num_cols on the benchmark
+    # proportions: slope / random-uniform / stairs-down / stairs-up / discrete.
+    num_cols: 5
+    terrain_proportions: [0.2, 0.1, 0.25, 0.25, 0.2]
+    # 10 difficulty rows => diff = level / 10.  Stairs step = 0.05 + 0.2*diff m,
+    # so levels 1/3/5/7/9 are 7/11/15/19/23 cm steps (slope 0.4*diff rad).
+    num_rows: 10
+    # t1 scorecard sweep.  Extend only while the oracle itself stays upright;
+    # score_cell reports the row it topples on as the physical ceiling.
+    severity_levels: [1, 3, 5, 7, 9]
+    # t0 descriptive nominal difficulty.
+    id_level: 3
+    # t2 fixed mid difficulty for the terrain x payload cross.
+    payload_level: 5
+    command:
+      vx: 1.0
+    warmup: 100
+    steps: 2000
+    # Terrain geometry is driven by protocol.eval_seed: make_env's
+    # set_seed(eval_seed) reseeds numpy right before the heightfield is built, so
+    # the random-uniform / discrete cells are byte-identical across all six
+    # methods that share this eval_seed.  aggregate asserts this cross-method
+    # identity via terrain_hash and fails loud on any divergence.
+    measure_heights: true
+    payloads:
+      - {name: nominal, mass_kg: 0.0, tier: in_band}
+      - {name: plus4, mass_kg: 4.0, tier: in_band}
+      - {name: plus6, mass_kg: 6.0, tier: near_ood}
+
+scorecard:
+  baseline_label: MLP
+  oracle_label: Superset-Oracle
+  method_labels: [SysID, RMA, DreamWaQ, HIM-fixed]
+  relative_headroom: 0.10
+  absolute_headroom: 0.05
+  fall_gate_pp: 0.05
+  achieved_speed_ratio: 0.90

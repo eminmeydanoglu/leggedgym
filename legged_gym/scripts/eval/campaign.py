@@ -314,6 +314,114 @@ def build_session(
     return Session(env, adapter, runner, checkpoint, run_dir, model, seed)
 
 
+def build_terrain_session(
+    model: Dict[str, Any], seed: int, num_envs: int, eval_seed: int, *,
+    fixed_level: int, num_cols: int, terrain_proportions: Iterable[float],
+    num_rows: int | None = None, measure_heights: bool = True,
+    disable_v3_physics_switch: bool = True,
+) -> Tuple[Session, Dict[str, Any]]:
+    """Build one task/policy pair on a controlled ETH game-terrain grid.
+
+    Unlike :func:`build_session`'s single-tile ``terrain_raw`` override, this
+    stands up the *real* training ``Terrain`` class in a pinned, reproducible
+    mode so the geometry and height sampling are bit-identical to training:
+
+    * ``curriculum=True`` selects the deterministic ``curiculum()`` generator,
+      where difficulty grows along rows (``diff = row / num_rows``) and terrain
+      *type* varies along columns (``choice = col / num_cols``).  This is the
+      only mode that produces the type-by-difficulty grid; ``curriculum=False``
+      would randomise both per cell.
+    * ``fixed_terrain_level=L`` pins every env's spawn row to difficulty ``L``.
+    * The simulator splits envs across ``num_cols`` types for free via
+      ``terrain_types = arange(num_envs) // (num_envs / num_cols)``.
+
+    After the env is built (geometry already materialised, initial reset guarded
+    by ``init_done``), we flip ``env.cfg.terrain.curriculum`` to ``False`` so the
+    reset-time ``_update_terrain_curriculum`` guard never fires during the
+    rollout.  Levels therefore stay pinned at ``fixed_level`` (std 0) even under
+    ``auto_reset``.  ``build_session`` is intentionally left untouched.
+
+    The heightfield geometry is deterministic: ``task_registry.make_env`` calls
+    ``set_seed(env_cfg.seed)`` (== ``eval_seed``) immediately before the
+    ``Terrain`` is constructed, so the random-uniform / discrete generators'
+    numpy draws are byte-identical for every method that shares this
+    ``eval_seed`` and terrain config.  Callers verify this cross-method identity
+    via the returned ``terrain_hash`` (``cmd_aggregate`` fails loud if a
+    baseline/oracle/method group ever disagrees).  Geometry is therefore coupled
+    to ``eval_seed`` by design; a second eval seed would produce a second grid.
+
+    Returns the :class:`Session` plus a terrain-info dict (deterministic
+    heightfield hash, pinned level, and per-env type/level arrays).
+    """
+    import legged_gym.envs  # noqa: F401  (task-registration side effect)
+    from legged_gym.utils import task_registry
+
+    run_dir = _run_dir(model, seed)
+    verify_run_identity(str(run_dir), expected_task=model["task"], expected_training_seed=seed, require_manifest=True)
+    ckpt_spec = model.get("checkpoint", "best")
+    checkpoint = Path(resolve_checkpoint_path(str(run_dir), ckpt_spec))
+    env_cfg, train_cfg = (copy.deepcopy(x) for x in task_registry.get_cfgs(name=model["task"]))
+    env_cfg.env.num_envs = int(num_envs)
+    env_cfg.env.auto_reset = True
+    env_cfg.env.debug = False
+    env_cfg.seed = int(eval_seed)
+    env_cfg.commands.curriculum = False
+    env_cfg.commands.heading_command = False
+    env_cfg.commands.resampling_time = 1e6
+    if disable_v3_physics_switch and hasattr(env_cfg.domain_rand, "resample_physics_within_episode"):
+        env_cfg.domain_rand.resample_physics_within_episode = False
+    # Terrain scorecard cells are physics-nominal; callers pin the P-axes with
+    # ``_set_nominal``/``_apply_payload``.  Disable the training-time DR here so
+    # the only controlled axis is the terrain geometry itself.
+    env_cfg.domain_rand.randomize_friction = False
+    env_cfg.domain_rand.randomize_base_mass = False
+    env_cfg.domain_rand.randomize_com_displacement = False
+    env_cfg.domain_rand.push_robots = False
+    # Controlled terrain grid.
+    num_cols = int(num_cols)
+    if num_cols < 1:
+        raise ValueError(f"num_cols must be >= 1, got {num_cols}")
+    if int(num_envs) % num_cols != 0:
+        raise ValueError(f"num_envs ({num_envs}) must be a multiple of num_cols ({num_cols}) for an even type split")
+    terrain = env_cfg.terrain
+    terrain.mesh_type = "heightfield"
+    terrain.curriculum = True
+    terrain.selected = False
+    if num_rows is not None:
+        terrain.num_rows = int(num_rows)
+    terrain.num_cols = num_cols
+    terrain.terrain_proportions = list(terrain_proportions)
+    terrain.measure_heights = bool(measure_heights)
+    if not 0 <= int(fixed_level) < int(terrain.num_rows):
+        raise ValueError(f"fixed_level must be in [0, {int(terrain.num_rows) - 1}], got {fixed_level}")
+    terrain.fixed_terrain_level = int(fixed_level)
+    # No manual RNG seeding here: make_env's set_seed(eval_seed) below reseeds
+    # numpy right before Terrain() is built, which is what actually pins the
+    # random-uniform / discrete geometry deterministically across methods.
+    run_folder = run_dir.name
+    args = _registry_args(model["task"], run_folder, ckpt_spec)
+    env, _ = task_registry.make_env(name=model["task"], args=args, env_cfg=env_cfg)
+    # Geometry is built and the guarded initial reset is done; forbid any
+    # reset-time level promotion/demotion for the remainder of this session.
+    env.cfg.terrain.curriculum = False
+    train_cfg.runner.resume = False
+    runner, _ = task_registry.make_alg_runner(env=env, name=model["task"], args=args, train_cfg=train_cfg)
+    runner.load_deploy_state(str(checkpoint), map_location=env.device)
+    adapter = runner.get_eval_adapter(device=env.device)
+    session = Session(env, adapter, runner, checkpoint, run_dir, model, seed)
+    sim = env.simulator
+    height_field = np.ascontiguousarray(np.asarray(sim._terrain.height_field_raw))
+    info = {
+        "terrain_hash": _terrain_hash(height_field),
+        "fixed_level": int(fixed_level),
+        "num_cols": num_cols,
+        "num_rows": int(terrain.num_rows),
+        "terrain_type": sim.terrain_types.detach().cpu().numpy().astype(np.int64),
+        "terrain_level": sim.terrain_levels.detach().cpu().numpy().astype(np.int64),
+    }
+    return session, info
+
+
 def _set_nominal(env) -> None:
     # Pin privileged P dimensions first, then the held-out axes. This keeps the
     # P5 actor's labels consistent even in a non-P sweep.

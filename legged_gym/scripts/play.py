@@ -12,29 +12,67 @@ import torch
 from legged_gym.scripts.joystick import Joystick
 
 
-def configure_play_terrain(env_cfg, terrain_mode):
-    """Apply a visual-playback terrain override without changing task training cfgs."""
-    if terrain_mode == "train":
-        # Show the task's own training terrain, but shrink the curriculum grid so
-        # it builds fast and fits in RAM locally.  Difficulty = row / num_rows, so
-        # num_rows=2 + fixed_terrain_level=1 keeps the exact difficulty (e.g. 0.5)
-        # the policy trained on; num_cols=5 gives one tile of every terrain type
-        # (slope | random-uniform | stairs-up | stairs-down | discrete).
-        # difficulty in curiculum() is row/num_rows; the trained v4 grid uses
-        # fixed_terrain_level=5 of num_rows=10 => 0.5.  num_rows=2 + level=1 keeps
-        # that same 0.5 while building only 2x5 tiles instead of 10x10.
-        if getattr(env_cfg.terrain, "fixed_terrain_level", None) is not None:
-            level_frac = env_cfg.terrain.fixed_terrain_level / env_cfg.terrain.num_rows
-            env_cfg.terrain.num_rows = 2
-            env_cfg.terrain.num_cols = 5
-            env_cfg.terrain.fixed_terrain_level = round(level_frac * env_cfg.terrain.num_rows)
-            env_cfg.terrain.border_size = 2.0
-        return
+def _pin_terrain_difficulty(env_cfg, terrain_level, default_level, max_level):
+    """Pin the curriculum difficulty to a user-chosen level, fully decoupled from
+    the checkpoint.  ``curriculum()`` picks difficulty from the terrain row, and
+    the number of rows caps how hard the hardest row is; we size the grid so the
+    top (hardest) row *is* the requested level and start every env there.  This
+    replaces the old behaviour of reading the difficulty off the model's own cfg
+    (``fixed_terrain_level``), which made the same command mean different things
+    for different checkpoints."""
+    level = default_level if terrain_level is None else terrain_level
+    level = int(max(0, min(level, max_level)))
+    # rows are difficulty levels 0..num_rows-1; make the requested level the top
+    # row and spawn there so the shown difficulty is exactly what was asked for.
+    env_cfg.terrain.num_rows = level + 1
+    env_cfg.terrain.max_init_terrain_level = level
+    # honoured by cfgs whose curriculum supports a hard-pinned level; a harmless
+    # no-op attribute otherwise (during play the curriculum never advances).
+    env_cfg.terrain.fixed_terrain_level = level
+    return level
+
+
+def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
+    """Apply a visual-playback terrain override.
+
+    Terrain is chosen by the *user* (``--terrain`` / ``--terrain_level``), never
+    derived from the loaded checkpoint - the only exception is the explicit
+    ``train`` mode, which deliberately reproduces the checkpoint's own training
+    terrain (e.g. to mirror eval conditions).  All modes shrink the grid so the
+    world builds fast and the Viser heightfield mesh actually renders in the
+    browser (the full 10x10 / border=20 training grid is a 1200x1200 sample
+    heightfield ~120 m x 120 m; even downsampled that mesh is too heavy and gets
+    silently dropped, so the ground vanishes and the robot looks buried)."""
     if terrain_mode == "flat":
         env_cfg.terrain.mesh_type = "plane"
         env_cfg.terrain.curriculum = False
         env_cfg.terrain.selected = False
         env_cfg.terrain.terrain_kwargs = None
+        return
+
+    if terrain_mode == "rough":
+        # Model-agnostic ETH game-inspired curriculum terrain: force it onto ANY
+        # policy regardless of what it trained on.  num_cols=5 gives one tile of
+        # every terrain type (slope | random-uniform | stairs-up | stairs-down |
+        # discrete); difficulty (num_rows) is the user's choice via --terrain_level.
+        env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+        env_cfg.terrain.selected = False
+        env_cfg.terrain.curriculum = True
+        env_cfg.terrain.terrain_proportions = [0.2, 0.1, 0.25, 0.25, 0.2]
+        env_cfg.terrain.num_cols = 5
+        env_cfg.terrain.border_size = 2.0
+        _pin_terrain_difficulty(env_cfg, terrain_level, default_level=3, max_level=9)
+        return
+
+    if terrain_mode == "train":
+        # Deliberately model-coupled: keep the task's own training terrain type
+        # (whatever the checkpoint used - flat for V3, rough curriculum for V4),
+        # just shrink the grid to something renderable.  Difficulty still honours
+        # --terrain_level when the underlying terrain is a curriculum.
+        env_cfg.terrain.num_cols = 5
+        env_cfg.terrain.border_size = 2.0
+        if getattr(env_cfg.terrain, "curriculum", False):
+            _pin_terrain_difficulty(env_cfg, terrain_level, default_level=2, max_level=9)
         return
 
     if terrain_mode not in {"bumpy", "course"}:
@@ -101,7 +139,7 @@ def override_configs(env_cfg, args, task_type):
         env_cfg.env.num_camera_envs = 1
     env_cfg.viewer.rendered_envs_idx = list(range(env_cfg.env.num_envs))
 
-    configure_play_terrain(env_cfg, args.terrain)
+    configure_play_terrain(env_cfg, args.terrain, getattr(args, "terrain_level", None))
 
     # Keep selected non-flat terrain compact and deterministic for interactive play.
     if env_cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
@@ -113,6 +151,10 @@ def override_configs(env_cfg, args, task_type):
     # triggered manually instead (e.g. via the viser "Respawn" button)
     env_cfg.env.auto_reset = False
     env_cfg.commands.zero_cmd_prob = 0.0 # for testing, use non-zero commands all the time
+    # Interactive control writes env.commands every frame; stop the env from
+    # periodically resampling a random command (which would otherwise leak into
+    # the policy observation for one step every resampling_time seconds).
+    env_cfg.commands.resampling_time = 1.0e9
     env_cfg.commands.ranges.lin_vel_x = [0.5, 0.5]
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [-1.0, 1.0]
@@ -230,6 +272,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
             viser_viewer.update_live_telemetry(
                 env.simulator.base_lin_vel[robot_index].detach().cpu().numpy(),
                 env.simulator.base_ang_vel[robot_index, 2].item(),
+                env.commands[robot_index, :3].detach().cpu().numpy(),
             )
 
         print_debug_info(env, robot_index)
