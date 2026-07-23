@@ -73,3 +73,32 @@ wandb
 build
 *debug*
 resources/terrains/*.stl
+
+# Local research wiki, agent notes, IDE/cache (not project source)
+wiki/
+notes/
+.claude/
+.fractal/
+.pytest_cache/
+.worktrees/
+playpy
+
+# Ad-hoc plots / screenshots at repo root or scripts cwd dumps
+/plot.png
+legged_gym/scripts/plot.png
+
+# Working plans & personal session notes (keep on disk, not in git)
+/plan.md
+/codex_plan.md
+/oracle_adam_etme.md
+/bench_tasks.md
+/eval_plan.md
+/v4_campaign.md
+/benchmark_tripler.md
+
+# LPACR: track dashboard code only — not papers, chat logs, demo dumps
+lpacr/*.md
+lpacr/*.pdf
+lpacr/subplans/
+lpacr/tokens.md
+lpacr/dashboard/data/
