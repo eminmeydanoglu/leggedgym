@@ -331,6 +331,29 @@ def _id_commands(num_envs: int, seed: int, bank: Mapping[str, Any]) -> np.ndarra
     return commands
 
 
+def spnte_scales_from_command_bank(bank: Mapping[str, Any]) -> Tuple[float, float]:
+    """Return linear-x and yaw command-support scales for SPNTE.
+
+    A campaign support is fixed for an artifact; it is deliberately not the
+    instantaneous command magnitude, so standstill commands remain well-defined.
+    A degenerate all-zero support is represented by machine epsilon solely to
+    keep its zero-error normalized score finite.
+    """
+    def scale(key: str) -> float:
+        values = np.asarray(bank[key], dtype=float)
+        if values.size == 0 or not np.isfinite(values).all():
+            raise ValueError(f"SPNTE command support {key!r} must be finite and non-empty")
+        return max(float(np.max(np.abs(values))), float(np.finfo(np.float32).eps))
+
+    return scale("lin_vel_x"), scale("ang_vel_yaw")
+
+
+def _spnte_scales(commands: np.ndarray, bank: Mapping[str, Any] | None = None) -> Tuple[float, float]:
+    if bank is not None:
+        return spnte_scales_from_command_bank(bank)
+    return spnte_scales_from_command_bank({"lin_vel_x": commands[:, 0], "ang_vel_yaw": commands[:, 2]})
+
+
 def _command_array(command: Mapping[str, Any], num_envs: int) -> np.ndarray:
     vector = np.asarray(command["vector"], dtype=np.float32)
     if vector.shape != (3,):
@@ -375,16 +398,25 @@ def _kinematics(env, command_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
 
 
 @torch.no_grad()
-def _rollout_fixed(session, commands: np.ndarray, *, warmup: int, steps: int) -> Dict[str, np.ndarray]:
+def _rollout_fixed(
+    session,
+    commands: np.ndarray,
+    *,
+    warmup: int,
+    steps: int,
+    command_bank: Mapping[str, Any] | None = None,
+) -> Dict[str, np.ndarray]:
     env, adapter = session.env, session.adapter
     state, command_t = _warmup(session, commands, warmup)
-    acc = MetricAccumulator(env.num_envs, env.device)
+    v_scale, v_scale_yaw = _spnte_scales(commands, command_bank)
+    acc = MetricAccumulator(env.num_envs, env.device, v_scale=v_scale, v_scale_yaw=v_scale_yaw)
     achieved_sum = torch.zeros(env.num_envs, device=env.device)
     for _ in range(int(steps)):
         env.commands[:, :3] = command_t
         state, rewards, dones = adapter.step(env, adapter.act(state).detach())
         lin, yaw, achieved = _kinematics(env, command_t)
-        acc.update(rewards, dones, env.time_out_buf, lin, yaw)
+        lin_x = (command_t[:, 0] - env.simulator.base_lin_vel[:, 0]).abs()
+        acc.update(rewards, dones, env.time_out_buf, lin, yaw, lin_x_err=lin_x)
         achieved_sum += achieved
     raw = acc.compute()
     target = torch.linalg.vector_norm(command_t[:, :2], dim=1)
@@ -394,6 +426,11 @@ def _rollout_fixed(session, commands: np.ndarray, *, warmup: int, steps: int) ->
         "tracking_yaw": raw["tracking_ang_err"].cpu().numpy(),
         "fall_rate": raw["ever_fell"].cpu().numpy(),
         "return_per_step": raw["return_per_step"].cpu().numpy(),
+        "spnte_lin": raw["spnte_lin"].cpu().numpy(),
+        "spnte_yaw": raw["spnte_yaw"].cpu().numpy(),
+        "first_fall_step": raw["first_fall_step"].cpu().numpy(),
+        "spnte_v_scale": np.asarray(v_scale, dtype=np.float32),
+        "spnte_yaw_scale": np.asarray(v_scale_yaw, dtype=np.float32),
         "achieved_speed": achieved.cpu().numpy(),
         "achieved_speed_ratio": torch.where(target > 1e-6, achieved / target, torch.ones_like(target)).cpu().numpy(),
     }
@@ -423,12 +460,14 @@ def _sysid_trace_summary(pred: torch.Tensor, truth: torch.Tensor) -> Dict[str, t
 @torch.no_grad()
 def _rollout_switch(
     session, commands: np.ndarray, *, warmup: int, pre_steps: int, post_steps: int,
-    target_mass: float, payload_cfg: Mapping[str, Any],
+    target_mass: float, payload_cfg: Mapping[str, Any], command_bank: Mapping[str, Any] | None = None,
 ) -> Dict[str, np.ndarray]:
     """Run an externally scheduled, identical V3 payload switch for every env."""
     env, adapter = session.env, session.adapter
     state, command_t = _warmup(session, commands, warmup)
     total = int(pre_steps) + int(post_steps)
+    v_scale, v_scale_yaw = _spnte_scales(commands, command_bank)
+    spnte = MetricAccumulator(env.num_envs, env.device, v_scale=v_scale, v_scale_yaw=v_scale_yaw)
     lin_errors: List[torch.Tensor] = []
     yaw_errors: List[torch.Tensor] = []
     achieved: List[torch.Tensor] = []
@@ -444,6 +483,11 @@ def _rollout_switch(
         trace = _sysid_trace(session, state)
         state, rewards, dones = adapter.step(env, adapter.act(state).detach())
         lin, yaw, current_speed = _kinematics(env, command_t)
+        lin_x = (command_t[:, 0] - env.simulator.base_lin_vel[:, 0]).abs()
+        # Keep the established stream metrics below untouched.  This separate
+        # accumulator makes the first payload-switch failure terminal for
+        # SPNTE while preserving auto-reset behavior for historical fields.
+        spnte.update(rewards, dones, env.time_out_buf, lin, yaw, lin_x_err=lin_x)
         fell = dones.bool() & ~env.time_out_buf.bool()
         ever_fell |= fell
         if step >= int(pre_steps):
@@ -463,6 +507,7 @@ def _rollout_switch(
     post_lin = lin_error_t[pre_steps:]
     post_yaw = yaw_error_t[pre_steps:]
     target_speed = torch.linalg.vector_norm(command_t[:, :2], dim=1)
+    spnte_raw = spnte.compute()
     result: Dict[str, np.ndarray] = {
         "tracking_lin": lin_error_t.mean(dim=0).cpu().numpy(),
         "tracking_yaw": yaw_error_t.mean(dim=0).cpu().numpy(),
@@ -474,6 +519,11 @@ def _rollout_switch(
         "post_switch_fall_rate": post_fell.float().cpu().numpy(),
         "achieved_speed": speed_t[pre_steps:].mean(dim=0).cpu().numpy(),
         "achieved_speed_ratio": torch.where(target_speed > 1e-6, speed_t[pre_steps:].mean(dim=0) / target_speed, torch.ones_like(target_speed)).cpu().numpy(),
+        "spnte_lin": spnte_raw["spnte_lin"].cpu().numpy(),
+        "spnte_yaw": spnte_raw["spnte_yaw"].cpu().numpy(),
+        "first_fall_step": spnte_raw["first_fall_step"].cpu().numpy(),
+        "spnte_v_scale": np.asarray(v_scale, dtype=np.float32),
+        "spnte_yaw_scale": np.asarray(v_scale_yaw, dtype=np.float32),
     }
     if switch_payload is None:
         raise RuntimeError("switch rollout ended before its scheduled switch")
@@ -549,7 +599,8 @@ def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[s
         payload.update(s0_variant="static", heading_command=False, yaw_semantics="direct_yaw_rate",
                        command_bank_json=json.dumps(p["command_bank"], sort_keys=True), command_matrix=commands,
                        scenario_hash=hashlib.sha256(commands.tobytes()).hexdigest(),
-                       **_rollout_fixed(session, commands, warmup=int(p["warmup"]), steps=int(p["steps"])))
+                       **_rollout_fixed(session, commands, warmup=int(p["warmup"]), steps=int(p["steps"]),
+                                         command_bank=p["command_bank"]))
     elif kind == "dynamic_id":
         p, target = protocol["s0"], scenario["target"]
         session = build_session(model, cell.seed, num_envs, eval_seed, disable_v3_physics_switch=True)
@@ -561,7 +612,7 @@ def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[s
                        **{f"initial_{key}": value for key, value in initial.items()},
                        **_payload_metadata(target, protocol["payload"]), command_matrix=commands,
                        **_rollout_switch(session, commands, warmup=int(p["warmup"]), pre_steps=int(p["pre_steps"]), post_steps=int(p["post_steps"]),
-                                         target_mass=float(target["mass_kg"]), payload_cfg=protocol["payload"]))
+                                         target_mass=float(target["mass_kg"]), payload_cfg=protocol["payload"], command_bank=p["command_bank"]))
     elif kind == "static_payload":
         p, target, command = protocol["s1"], scenario["payload"], scenario["command"]
         session = build_session(model, cell.seed, num_envs, eval_seed, disable_v3_physics_switch=True)
@@ -573,7 +624,8 @@ def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[s
                        command_speed=float(np.linalg.norm(np.asarray(command["vector"], dtype=float)[:2])),
                        headline_command=bool(command.get("headline", True)),
                        diagnostic_kind=str(command.get("diagnostic_kind", "")), **physics,
-                       **_rollout_fixed(session, commands, warmup=int(p["warmup"]), steps=int(p["steps"])))
+                       **_rollout_fixed(session, commands, warmup=int(p["warmup"]), steps=int(p["steps"]),
+                                         command_bank=protocol["s0"]["command_bank"]))
     elif kind == "payload_switch":
         p, target, command = protocol["s2"], scenario["switch"], scenario["command"]
         session = build_session(model, cell.seed, num_envs, eval_seed, disable_v3_physics_switch=True)
@@ -588,7 +640,7 @@ def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[s
                        **_payload_metadata(target, protocol["payload"]),
                        **{f"initial_{key}": value for key, value in initial.items()},
                        **_rollout_switch(session, commands, warmup=int(p["warmup"]), pre_steps=int(p["pre_steps"]), post_steps=int(p["post_steps"]),
-                                         target_mass=float(target["mass_kg"]), payload_cfg=protocol["payload"]))
+                                         target_mass=float(target["mass_kg"]), payload_cfg=protocol["payload"], command_bank=protocol["s0"]["command_bank"]))
     elif kind == "kick":
         p = protocol["s3"]
         session = build_session(model, cell.seed, num_envs, eval_seed, disable_v3_physics_switch=True)
@@ -735,6 +787,12 @@ def _raw_rows(root: Path) -> List[Dict[str, Any]]:
                 "achieved_speed": _mean(z, "achieved_speed") if "achieved_speed" in z else float("nan"),
                 "achieved_speed_ratio": _mean(z, "achieved_speed_ratio") if "achieved_speed_ratio" in z else float("nan"),
                 "return_per_step": _mean(z, "return_per_step"),
+                # Append-only: historical V3 artifacts remain readable, while
+                # newly written V3/V4 fixed rollouts surface SPNTE alongside
+                # their unchanged tracking/fall scorecard inputs.
+                "spnte_lin": _mean(z, "spnte_lin") if "spnte_lin" in z else float("nan"),
+                "spnte_yaw": _mean(z, "spnte_yaw") if "spnte_yaw" in z else float("nan"),
+                "spnte_v_scale": float(_scalar(z, "spnte_v_scale", float("nan"))),
                 "command_speed": float(_scalar(z, "command_speed", 0.0)),
                 "headline_command": bool(_scalar(z, "headline_command", True)),
                 "diagnostic_kind": str(_scalar(z, "diagnostic_kind", "")),
@@ -782,6 +840,9 @@ def _terrain_raw_rows(root: Path) -> List[Dict[str, Any]]:
             speed = np.asarray(z["achieved_speed"], dtype=float) if "achieved_speed" in z \
                 else np.full(tracking.shape, np.nan)
             per_step = np.asarray(z["return_per_step"], dtype=float)
+            spnte_lin = np.asarray(z["spnte_lin"], dtype=float) if "spnte_lin" in z else np.full(tracking.shape, np.nan)
+            spnte_yaw = np.asarray(z["spnte_yaw"], dtype=float) if "spnte_yaw" in z else np.full(tracking.shape, np.nan)
+            spnte_v_scale = float(_scalar(z, "spnte_v_scale", float("nan")))
             for type_index in sorted(np.unique(terrain_type).tolist()):
                 mask = terrain_type == type_index
                 type_name = _terrain_type_name(type_index, num_cols)
@@ -797,6 +858,9 @@ def _terrain_raw_rows(root: Path) -> List[Dict[str, Any]]:
                     "achieved_speed": float(np.mean(speed[mask])),
                     "achieved_speed_ratio": float(np.mean(ratio[mask])),
                     "return_per_step": float(np.mean(per_step[mask])),
+                    "spnte_lin": float(np.mean(spnte_lin[mask])),
+                    "spnte_yaw": float(np.mean(spnte_yaw[mask])),
+                    "spnte_v_scale": spnte_v_scale,
                     "command_speed": command_speed, "headline_command": True, "diagnostic_kind": "",
                     "payload_tier": payload_tier, "payload_name": payload_name, "command_name": "",
                     "terrain_type": int(type_index), "terrain_type_name": type_name, "terrain_level": level,
@@ -976,9 +1040,26 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
     status_counts: Dict[str, int] = defaultdict(int)
     for row in score_rows:
         status_counts[str(row["headline_status"])] += 1
+    # SPNTE is append-only for V3/V4: it is visible in the report and raw CSV,
+    # but does not alter the established tracking/fall gap-closed scorecard.
+    spnte_raw = []
+    by_spnte: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in raw:
+        if np.isfinite(float(row.get("spnte_lin", float("nan")))):
+            by_spnte[(str(row["suite"]), str(row["model"]))].append(row)
+    for (suite, model), rows in sorted(by_spnte.items()):
+        lin = [float(row["spnte_lin"]) for row in rows]
+        yaw = [float(row["spnte_yaw"]) for row in rows if np.isfinite(float(row.get("spnte_yaw", float("nan"))))]
+        scales = sorted({float(row["spnte_v_scale"]) for row in rows if np.isfinite(float(row.get("spnte_v_scale", float("nan"))))})
+        spnte_raw.append({"suite": suite, "model": model, "n_raw_cells": len(rows),
+                          "spnte_lin_mean": float(np.mean(lin)),
+                          "spnte_yaw_mean": float(np.mean(yaw)) if yaw else None,
+                          "spnte_v_scales": scales})
+
     summary = {"campaign": cfg["campaign"], "headline": headlines, "status_counts": dict(status_counts),
                "raw_cells": len(raw), "scorecard_cells": len(score_rows), "seed_scores": len(seed_scores)}
     summary["command_ood_diagnostic_raw_cells"] = len(diagnostic_raw)
+    summary["spnte_raw"] = spnte_raw
     (root / "tables" / "headline.json").write_text(_json(summary), encoding="utf-8")
     print(f"[v3_eval] aggregate raw={len(raw)} scorecard_cells={len(score_rows)} -> {root / 'tables'}")
     return 0
@@ -994,6 +1075,14 @@ def cmd_report(cfg: Mapping[str, Any]) -> int:
     lines += ["", "## Hücre durumları", "", "| Durum | Hücre |", "|---|---:|"]
     for status, count in sorted(summary["status_counts"].items()):
         lines.append(f"| {status} | {count} |")
+    if summary.get("spnte_raw"):
+        lines += ["", "## SPNTE (append-only raw cross-check)", "",
+                  "| Suite | Method | SPNTE lin | SPNTE yaw | v scale | Raw cells |",
+                  "|---|---|---:|---:|---|---:|"]
+        for row in summary["spnte_raw"]:
+            yaw = "" if row["spnte_yaw_mean"] is None else f"{row['spnte_yaw_mean']:.4f}"
+            scales = ", ".join(f"{value:g}" for value in row["spnte_v_scales"])
+            lines.append(f"| {row['suite']} | {row['model']} | {row['spnte_lin_mean']:.4f} | {yaw} | {scales} | {row['n_raw_cells']} |")
     lines += ["", f"Command-OOD diagnostic raw hücreleri: `{summary.get('command_ood_diagnostic_raw_cells', 0)}`. Bunlar headline skoruna dahil edilmez.",
               "", "Ham hücreler `tables/raw_cells.csv`, kapı ve skor hücreleri `tables/scorecard_cells.csv`, seed bazlı özetler `tables/scorecard_seed_scores.csv` içindedir.", ""]
     report = root / "report" / "scorecard.md"

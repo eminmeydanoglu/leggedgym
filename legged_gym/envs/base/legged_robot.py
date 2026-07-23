@@ -91,6 +91,10 @@ class LeggedRobot(BaseTask):
         
         self.cfg: LeggedRobotCfg = cfg
         self.init_done: bool = False
+        # Installed explicitly by the UED arm.  Leaving this None preserves the
+        # complete legacy reset and command path for every existing task.
+        self.ued_adapter = None
+        self.episode_curriculum = None
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, sim_device, headless)
         
@@ -118,6 +122,35 @@ class LeggedRobot(BaseTask):
         self._init_buffers()
         self._prepare_reward_function()
         self.init_done = True
+
+    def enable_ued(self, episode_curriculum, task_space) -> None:
+        """Install the optional Genesis UED boundary and make initial assignments."""
+        if not getattr(self.cfg.env, "ued_enabled", False):
+            raise RuntimeError("set cfg.env.ued_enabled=True before enabling UED")
+        from legged_gym.utils.ued.genesis_adapter import GenesisUEDAdapter
+
+        self.episode_curriculum = episode_curriculum
+        self.ued_adapter = GenesisUEDAdapter(
+            task_space=task_space,
+            simulator=self.simulator,
+            commands=self.commands,
+            command_ranges=self.command_ranges,
+            device=self.device,
+        )
+        env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+        assignments = self.episode_curriculum.sample(
+            self.num_envs, global_control_steps=self.common_step_counter
+        )
+        self.ued_adapter.assign(env_ids, assignments)
+        self._resample_commands(env_ids)
+        self.ued_adapter.clear_episode_accumulators(env_ids)
+
+    def _active_ued_adapter(self):
+        if getattr(self.cfg.env, "ued_enabled", False):
+            if self.ued_adapter is None or self.episode_curriculum is None:
+                raise RuntimeError("UED is enabled but no episode curriculum has been installed")
+            return self.ued_adapter
+        return None
 
     def step(self, actions: Action) -> Tuple[ObsBuf, ObsBuf | None, Reward, Tensor, Dict[str, Any]]:
         """Execute one simulation step with the given actions.
@@ -262,17 +295,37 @@ class LeggedRobot(BaseTask):
         """
         if len(env_ids) == 0:
             return
+        ued_adapter = self._active_ued_adapter()
+        # Frozen provenance order: copy/observe the completed old assignment
+        # before sampling or applying the replacement assignment.
+        if ued_adapter is not None:
+            outcomes = ued_adapter.collect_outcomes(
+                env_ids,
+                completion_revision=self.episode_curriculum.sampler_revision,
+                timed_out=self.time_out_buf,
+            )
+            self.episode_curriculum.observe(outcomes)
+            self.episode_curriculum.advance(self.common_step_counter)
+            assignments = self.episode_curriculum.sample(
+                len(env_ids), global_control_steps=self.common_step_counter
+            )
+            ued_adapter.assign(env_ids, assignments)
         # update curriculum
-        if self.cfg.terrain.curriculum:
+        if self.cfg.terrain.curriculum and ued_adapter is None:
             self._update_terrain_curriculum(env_ids)
         # avoid updating command curriculum at each step since the maximum command is common to all envs
-        if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length ==0):
+        if (self.cfg.commands.curriculum and getattr(self.cfg.commands, "command_curriculum_enabled", True)
+                and ued_adapter is None and (self.common_step_counter % self.max_episode_length ==0)):
             self._update_command_curriculum(env_ids)
 
         self._resample_commands(env_ids)
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
         self.simulator.reset_idx(env_ids)
+        if ued_adapter is not None:
+            # Keep this last within the provenance transition: command sampling
+            # and root teleport precede the start of the new accumulator.
+            ued_adapter.clear_episode_accumulators(env_ids)
 
         # reset buffers
         self.llast_actions[env_ids] = 0.
@@ -290,10 +343,10 @@ class LeggedRobot(BaseTask):
                 self.episode_sums[key][env_ids]) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
         # log additional curriculum info
-        if self.cfg.terrain.curriculum:
+        if self.cfg.terrain.curriculum and ued_adapter is None:
             self.extras["episode"]["terrain_level"] = torch.mean(
                 self.simulator.terrain_levels.float())
-        if self.cfg.commands.curriculum:
+        if self.cfg.commands.curriculum and getattr(self.cfg.commands, "command_curriculum_enabled", True):
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
         # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
@@ -327,6 +380,8 @@ class LeggedRobot(BaseTask):
             ) * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
+        if self.ued_adapter is not None and getattr(self.cfg.env, "ued_enabled", False):
+            self.ued_adapter.record_step(self.rew_buf)
 
     def compute_observations(self) -> None:
         """Compute observations for all environments.
@@ -522,8 +577,12 @@ class LeggedRobot(BaseTask):
         Args:
             env_ids: Environments ids for which new commands are needed
         """
-        self.commands[env_ids, 0] = torch_rand_float(
-            self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids),1), self.device).squeeze(1)
+        ued_adapter = self._active_ued_adapter()
+        if ued_adapter is None:
+            self.commands[env_ids, 0] = torch_rand_float(
+                self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids),1), self.device).squeeze(1)
+        else:
+            ued_adapter.resample_commands_within_active_bin(env_ids)
         self.commands[env_ids, 1] = torch_rand_float(
             self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids),1), self.device).squeeze(1)
         if self.cfg.commands.heading_command:
@@ -531,8 +590,16 @@ class LeggedRobot(BaseTask):
         else:
             self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
         
-        if np.random.rand() < self.cfg.commands.zero_cmd_prob:
-            self.commands[env_ids, :3] *= 0.0  # set command to zero with some probability, to encourage the robot to learn to stand still
+        if getattr(self.cfg.commands, "per_env_standstill", False):
+            standstill = torch.rand(len(env_ids), device=self.device) < self.cfg.commands.zero_cmd_prob
+            standstill_ids = env_ids[standstill]
+            self.commands[standstill_ids, :3] *= 0.0
+            if ued_adapter is not None and len(standstill_ids):
+                ued_adapter.mark_standstill(standstill_ids)
+        elif np.random.rand() < self.cfg.commands.zero_cmd_prob:
+            self.commands[env_ids, :3] *= 0.0  # legacy batch-wide standstill draw
+            if ued_adapter is not None:
+                ued_adapter.mark_standstill(env_ids)
         
         # set small commands to zero
         self.commands[env_ids, :3] *= (torch.norm(

@@ -7,6 +7,8 @@ PDGains = Dict[str, float]
 
 class LeggedRobotCfg(BaseConfig):
     class env:
+        # UED integration is opt-in; legacy tasks never instantiate the adapter.
+        ued_enabled: bool = False
         num_envs: int = 4096 # number of parallel environments
         num_observations: int = 48 # size of the observation vector
         num_privileged_obs: int = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for asymmetric training). 
@@ -59,6 +61,10 @@ class LeggedRobotCfg(BaseConfig):
         platform_size: float = 3.0 # [m] size of the flat platform at the center of each subterrain
         num_rows: int = 4  # number of terrain rows (levels), X direction
         num_cols: int = 4  # number of terrain cols (types), Y direction
+        # Separate from ``taxonomy_showcase``: static 6x4 teleport grid used by
+        # the 84-cell UED training task space (flat only consumes level zero).
+        ued_training_grid: bool = False
+        ued_training_seed: int = 0
         # terrain types: [smooth slope, random uniform, stairs up, stairs down, discrete]
         terrain_proportions: List[float] = [0.1, 0.1, 0.35, 0.25, 0.2]
         # difficulty scaling of the terrain parameters, the actual parameters will be computed by eval() with difficulty as the variable in make_terrain() function
@@ -175,6 +181,9 @@ class LeggedRobotCfg(BaseConfig):
         heading_command = True # if true: compute ang vel command from heading error
         curriculum_threshold = 0.8 # threshold for curriculum learning, if the tracking reward is above this threshold, increase the command range
         zero_cmd_prob = 0.4    # probability of sampling zero command when resampling commands, to encourage the robot to learn standing still behavior
+        # Defaults preserve the original global standstill draw and command curriculum.
+        per_env_standstill: bool = False
+        command_curriculum_enabled: bool = True
         class ranges:
             lin_vel_x: List[float] = [-1.0, 1.0] # min max [m/s]
             lin_vel_y: List[float] = [-1.0, 1.0]   # min max [m/s]

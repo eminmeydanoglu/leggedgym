@@ -135,6 +135,29 @@ def is_taxonomy_terrain_cfg(cfg) -> bool:
     return bool(getattr(cfg, "taxonomy_showcase", False))
 
 
+def is_ued_training_terrain_cfg(cfg) -> bool:
+    """True only for the static terrain grid used by the moving UED support."""
+    return bool(getattr(cfg, "ued_training_grid", False))
+
+
+def ued_training_builder_parameters(cfg) -> dict:
+    """Stable JSON-ready geometry description for ``TaskSpace.fingerprint``."""
+    return {
+        "builder": "ued_training_grid_v1",
+        "terrain_type_names": ("stairs_up", "stairs_down", "slope_up", "slope_down", "rough", "flat"),
+        "levels": TAXONOMY_NUM_LEVELS,
+        "step_width": TAXONOMY_STEP_WIDTH,
+        "step_heights": TAXONOMY_STEP_HEIGHTS,
+        "slope_gradients": TAXONOMY_SLOPE_GRADIENTS,
+        "rough_amplitudes": TAXONOMY_ROUGH_AMPLITUDES,
+        "seed": int(getattr(cfg, "ued_training_seed", 0)),
+        "horizontal_scale": float(cfg.horizontal_scale),
+        "vertical_scale": float(cfg.vertical_scale),
+        "terrain_length": float(cfg.terrain_length),
+        "terrain_width": float(cfg.terrain_width),
+    }
+
+
 def clamp_taxonomy_spawn(level: int, type_idx: int, num_rows: int = TAXONOMY_NUM_LEVELS,
                          num_cols: int = TAXONOMY_NUM_TYPES):
     """Clamp (level, type) into a valid grid cell."""
@@ -253,7 +276,10 @@ class Terrain:
             self.height_field_raw = raw.copy()
             self.heightsamples = self.height_field_raw
             return
-        if is_taxonomy_terrain_cfg(cfg):
+        if is_ued_training_terrain_cfg(cfg):
+            print("Generating deterministic UED training terrain (21 configs / 84 tasks)...")
+            self.ued_training_grid()
+        elif is_taxonomy_terrain_cfg(cfg):
             print("Generating taxonomy showcase terrain (6 types x 4 levels)...")
             self.taxonomy_showcase()
         elif cfg.curriculum and cfg.selected:
@@ -345,6 +371,26 @@ class Terrain:
         self.taxonomy_labels = build_taxonomy_label_map(
             self.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
         )
+
+    def ued_training_grid(self):
+        """Build the static teleport grid, intentionally separate from exhibit mode.
+
+        The physical layout is 4x6 so simulator origins remain addressable as
+        ``[terrain_level, terrain_type]``.  The flat column is geometrically
+        repeated but only its level-zero origin is part of `TaskSpace`, yielding
+        five four-level terrain families plus one flat configuration (21 x four
+        velocity bins = 84 task identities).
+        """
+        if self.cfg.num_rows != TAXONOMY_NUM_LEVELS or self.cfg.num_cols != TAXONOMY_NUM_TYPES:
+            raise ValueError("ued_training_grid requires a 4-row by 6-column terrain grid")
+        rng_state = np.random.get_state()
+        np.random.seed(int(getattr(self.cfg, "ued_training_seed", 0)))
+        try:
+            for level in range(TAXONOMY_NUM_LEVELS):
+                for type_idx in range(TAXONOMY_NUM_TYPES):
+                    self.add_terrain_to_map(self._make_taxonomy_subterrain(level, type_idx), level, type_idx)
+        finally:
+            np.random.set_state(rng_state)
 
     def _make_taxonomy_subterrain(self, level: int, type_idx: int):
         """Create one SubTerrain cell for taxonomy type/level using shared generators."""

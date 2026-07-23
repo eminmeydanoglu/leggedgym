@@ -1,0 +1,48 @@
+# Frozen V5 UED checkpoint-selection protocol.  Do not change this bank after
+# a headline campaign starts: its fingerprint is stored with every validation
+# result and selected checkpoint.
+campaign: v5_ued
+schema_version: 1
+validation_seed: 31001
+eval_seed: 41001
+
+validation_bank:
+  version: v5_ued_bank_v1
+  terrain_types: [stairs_up, stairs_down, slope_up, slope_down, rough]
+  terrain_levels: [0, 1, 2, 3]
+  flat_terrain_type: flat
+  flat_terrain_level: 0
+  velocity_bin_edges: [0.0, 0.5, 1.0, 1.5, 2.0]
+  replicas_per_cell: 48
+  bank_fingerprint: 141e9401f8e93817e3fe2d619d13694a048653d59ac5bae78bab465d2a798275
+  # These are canonical hashes of the frozen terrain-builder descriptions.
+  # A real rollout must report the matching geometry hash for every replica;
+  # selection refuses artifacts that do not carry these pins.
+  geometry_hash_version: v5_ued_geometry_v1
+  geometry_hashes:
+    stairs_up: 40b2b0ff04612b9c0d689980ea6fc0a3c1de821c33cf913bf6f08cd7ba39d370
+    stairs_down: e2997b9f4f9e292ee164fbdbb7c32eb74c7916bb47c090b1e68a8ea882d60169
+    slope_up: 337c2c313d7f53ec31cae2717f739c00cac467e599f10fa3aa2d12320335602d
+    slope_down: 65d4d791e7beb48a55f1a4b6ed1ce7cb4998e5b4f1bf7f87f2ecf959114a9f4e
+    rough: 72cbb6ad6aa9a076a75529bf0ee5b0e51bfd39d11c58f1e24f0ec6f5bcee1937
+    flat: e33f97d09419af424c36adfbbed63a47a733ca4c9a90c86d156bb8c149f237f0
+
+rollout:
+  warmup_steps: 100
+  steps: 1000
+  domain_randomization: pinned_nominal
+
+success:
+  minimum_survival_steps: 900
+  spnte_lin_lt: 0.30
+  replica_success_rate_threshold: 0.90
+
+selection:
+  metric: spnte_v1
+  version: ued_checkpoint_selection_v1
+  primary_tolerance: 0.000001
+  worst_task_fraction: 0.10
+  artifact_dir: ued_validation
+  artifact_pattern: model_{iteration}.json
+  best_artifact: best_spnte.pt
+  secondary_artifact: best_tracking.pt

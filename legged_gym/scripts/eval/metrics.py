@@ -26,7 +26,24 @@ class MetricAccumulator:
     harness actually ran (used for right-censoring envs that never terminated).
     """
 
-    def __init__(self, num_envs: int, device, lin_err_threshold: float = 0.25):
+    def __init__(
+        self,
+        num_envs: int,
+        device,
+        lin_err_threshold: float = 0.25,
+        *,
+        v_scale: float = 1.0,
+        v_scale_yaw: float | None = None,
+    ):
+        """Create an accumulator for one fixed-horizon evaluation rollout.
+
+        ``v_scale`` is the campaign command-support scale, not a per-command
+        magnitude.  The default keeps pre-SPNTE callers source-compatible;
+        evaluation runners should pass their dynamically derived support.
+        """
+        v_scale_yaw = v_scale if v_scale_yaw is None else v_scale_yaw
+        if not (float(v_scale) > 0.0 and float(v_scale_yaw) > 0.0):
+            raise ValueError("SPNTE command-support scales must be positive")
         self.num_envs = num_envs
         self.device = device
         z = lambda dtype=torch.float: torch.zeros(num_envs, dtype=dtype, device=device)
@@ -55,13 +72,22 @@ class MetricAccumulator:
         self._action_rate_sum = z()            # mean_j |a_t - a_(t-1)|
         self._foot_slip_sum = z()              # contact-foot horizontal speed
         self.lin_err_threshold = float(lin_err_threshold)
+        self.v_scale = float(v_scale)
+        self.v_scale_yaw = float(v_scale_yaw)
+
+        # SPNTE uses one logical episode per environment even though the
+        # harness auto-resets terminated robots.  A first fall freezes the
+        # tracking sum; compute() charges remaining rollout steps at 1.0.
+        self._first_fall_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+        self._spnte_err_sum = z()
+        self._spnte_yaw_err_sum = z()
         self._steps = 0                       # global step counter (same for all envs)
 
     @torch.no_grad()
     def update(
         self, rew, reset_buf, time_out_buf, lin_err, ang_err, *,
         tilt=None, torques=None, dof_vel=None, actions=None, last_actions=None,
-        feet_vel=None, feet_contact=None,
+        feet_vel=None, feet_contact=None, lin_x_err=None,
     ):
         """Ingest one env step.
 
@@ -71,6 +97,9 @@ class MetricAccumulator:
             time_out_buf: (num_envs,) 1 where the termination was a timeout.
             lin_err:      (num_envs,) |command_xy - base_lin_vel_xy| this step.
             ang_err:      (num_envs,) |command_yaw - base_ang_vel_yaw| this step.
+            lin_x_err:    optional (num_envs,) |command_x - base_lin_vel_x|.
+                          SPNTE is explicitly x-only; omitted callers use
+                          ``lin_err`` for backwards-compatible generic use.
         """
         done = reset_buf.bool()
         timeout = done & time_out_buf.bool()
@@ -99,6 +128,26 @@ class MetricAccumulator:
             )
         self._steps += 1
 
+        # Record the terminating physics step, then freeze this env's SPNTE
+        # stream.  Subsequent auto-reset episodes are intentionally ignored.
+        still_first = self._first_fall_step < 0
+        spnte_lin_error = lin_err if lin_x_err is None else lin_x_err
+        self._spnte_err_sum += torch.where(
+            still_first,
+            (spnte_lin_error / self.v_scale).clamp(0.0, 1.0),
+            torch.zeros_like(self._spnte_err_sum),
+        )
+        self._spnte_yaw_err_sum += torch.where(
+            still_first,
+            (ang_err / self.v_scale_yaw).clamp(0.0, 1.0),
+            torch.zeros_like(self._spnte_yaw_err_sum),
+        )
+        self._first_fall_step = torch.where(
+            fall & still_first,
+            torch.full_like(self._first_fall_step, self._steps),
+            self._first_fall_step,
+        )
+
         # book a finished episode wherever `done`
         self._ep_len_sum += torch.where(done, self._alive_steps.float(), torch.zeros_like(self._return_run))
         self._ep_count += done.long()
@@ -126,9 +175,18 @@ class MetricAccumulator:
             mean_return     : mean return per finished episode.
             tracking_lin_err: mean |cmd_xy - v_xy| over all steps.
             tracking_ang_err: mean |cmd_yaw - w_yaw| over all steps.
+            spnte_lin      : first-fall x-tracking error with a 1.0 tail penalty.
+            spnte_yaw      : first-fall yaw-tracking error with the same tail.
+            first_fall_step: first terminating physics step, or T when none fell.
         """
         ep = self._ep_count.clamp(min=1).float()
         steps = max(self._steps, 1)
+        first_fall_step = torch.where(
+            self._first_fall_step < 0,
+            torch.full_like(self._first_fall_step, self._steps),
+            self._first_fall_step,
+        )
+        spnte_penalty = (self._steps - first_fall_step).float()
 
         mean_ep_len = torch.where(
             self._ep_count > 0,
@@ -149,6 +207,9 @@ class MetricAccumulator:
             "tracking_ang_err": self._ang_err_sum / steps,
             "tracking_lin_rmse": torch.sqrt(self._lin_err_sq_sum / steps),
             "tracking_lin_bad_frac": self._lin_err_bad_sum / steps,
+            "spnte_lin": (self._spnte_err_sum + spnte_penalty) / steps,
+            "spnte_yaw": (self._spnte_yaw_err_sum + spnte_penalty) / steps,
+            "first_fall_step": first_fall_step,
             "tilt_mean": self._tilt_sum / steps,
             "torque_sq_mean": self._torque_sq_sum / steps,
             "mech_power_abs": self._mech_power_sum / steps,
