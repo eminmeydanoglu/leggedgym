@@ -74,6 +74,32 @@ class TestGenesisUEDAdapter(unittest.TestCase):
         self.adapter.assign(ids, _assignments([42, 43], revision=6))
         self.assertEqual(outcome.task_ids.tolist(), [0, 25])
 
+    def test_standstill_hold_survives_mid_episode_resample(self):
+        """Standstill is latched once; mid-episode resample re-zeros and never unlatches."""
+        ids = torch.tensor([0, 1, 2])
+        self.adapter.assign(ids, _assignments([0, 21, 42], revision=1))
+        self.assertFalse(bool(self.adapter.episode_standstill[0]))
+        self.adapter.mark_standstill(torch.tensor([0, 2]))
+        self.assertTrue(bool(self.adapter.episode_standstill[0]))
+        self.assertFalse(bool(self.adapter.episode_valid[0]))
+        self.assertTrue(bool(self.adapter.episode_valid[1]))
+        # Simulate a mid-episode command rewrite attempting to put non-zero cmds.
+        self.commands[ids, :3] = 1.5
+        motion_ids = self.adapter.apply_standstill_hold(ids)
+        self.assertEqual(motion_ids.tolist(), [1])
+        self.assertTrue(torch.all(self.commands[[0, 2], :3] == 0))
+        self.assertTrue(torch.all(self.commands[1, :3] == 1.5))
+        # Hold is sticky across many "resamples".
+        for _ in range(8):
+            self.commands[ids, :3] = 0.7
+            motion_ids = self.adapter.apply_standstill_hold(ids)
+            self.assertEqual(motion_ids.tolist(), [1])
+            self.assertTrue(torch.all(self.commands[[0, 2], :3] == 0))
+        # New assignment clears the latch so the next episode can be motion.
+        self.adapter.assign(torch.tensor([0]), _assignments([3], revision=2))
+        self.assertFalse(bool(self.adapter.episode_standstill[0]))
+        self.assertTrue(bool(self.adapter.episode_valid[0]))
+
     def test_resampling_stays_inside_the_active_bin(self):
         ids = torch.tensor([0, 1, 2, 3])
         self.adapter.assign(ids, _assignments([0, 21, 42, 63]))
@@ -164,8 +190,8 @@ class TestZGenesisTeleportSmoke(unittest.TestCase):
             self.assertEqual(len(teacher.observed), 1)
             self.assertTrue(np.all(teacher.observed[0].task_ids == 0))
             decoded = task_space.decode_batch(env.ued_adapter.active_task_id[ids].cpu().numpy())
-            self.assertTrue(torch.equal(env.simulator.terrain_types[ids].cpu(), torch.tensor(decoded.terrain_types)))
-            self.assertTrue(torch.equal(env.simulator.terrain_levels[ids].cpu(), torch.tensor(decoded.terrain_levels)))
+            self.assertTrue(torch.equal(env.simulator.terrain_types[ids].cpu(), torch.tensor(decoded.terrain_types, device="cpu")))
+            self.assertTrue(torch.equal(env.simulator.terrain_levels[ids].cpu(), torch.tensor(decoded.terrain_levels, device="cpu")))
             self.assertTrue(torch.allclose(env.simulator.env_origins[ids], env.simulator._terrain_origins[
                 env.simulator.terrain_levels[ids], env.simulator.terrain_types[ids]
             ]))
@@ -173,7 +199,8 @@ class TestZGenesisTeleportSmoke(unittest.TestCase):
             self.assertTrue(torch.all(env.commands[ids, 0] < env.ued_adapter.active_vx_upper[ids]))
             self.assertEqual(id(env.simulator._terrain.height_field_raw), heightfield_id)
         finally:
-            env.destroy()
+            if hasattr(env, "destroy"):
+                env.destroy()
 
 
 if __name__ == "__main__":

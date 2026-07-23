@@ -46,6 +46,11 @@ class GenesisUEDAdapter:
         # False until an assignment starts an episode; a standstill also makes
         # the rollout curriculum-invalid while PPO still consumes it.
         self.episode_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Standstill is a once-per-episode decision (drawn only at reset).  Mid-
+        # episode command resamples must re-apply zeros for these envs and must
+        # never re-roll the Bernoulli, or the episode becomes a mixed
+        # standstill/motion return that the binary valid flag cannot describe.
+        self.episode_standstill = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
     def record_step(self, rewards: torch.Tensor) -> None:
         """Accumulate the actual clipped reward for every active environment."""
@@ -106,6 +111,7 @@ class GenesisUEDAdapter:
         self.active_vx_lower[ids] = torch.as_tensor(decoded.vx_lower, device=self.device, dtype=torch.float32)
         self.active_vx_upper[ids] = torch.as_tensor(decoded.vx_upper, device=self.device, dtype=torch.float32)
         self.episode_valid[ids] = True
+        self.episode_standstill[ids] = False
 
     def clear_episode_accumulators(self, env_ids: torch.Tensor) -> None:
         """Start the newly teleported episode after its root state is reset."""
@@ -123,8 +129,22 @@ class GenesisUEDAdapter:
         self.commands[ids, 0] = lower + (upper - lower) * torch.rand(len(ids), device=self.device)
 
     def mark_standstill(self, env_ids: torch.Tensor) -> None:
-        """Keep the PPO rollout, but exclude standstill data from LP/ALP."""
-        self.episode_valid[self._env_ids(env_ids)] = False
+        """Latch standstill for the rest of the episode; LP/ALP skip this return."""
+        ids = self._env_ids(env_ids)
+        self.episode_valid[ids] = False
+        self.episode_standstill[ids] = True
+
+    def apply_standstill_hold(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Re-zero commands for envs already latched as standstill this episode.
+
+        Returns the subset of ``env_ids`` that are *not* on a standstill hold
+        (safe to draw a fresh non-zero command for).
+        """
+        ids = self._env_ids(env_ids)
+        hold = self.episode_standstill[ids]
+        if torch.any(hold):
+            self.commands[ids[hold], :3] = 0.0
+        return ids[~hold]
 
     def _env_ids(self, env_ids: torch.Tensor) -> torch.Tensor:
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()

@@ -142,7 +142,7 @@ class LeggedRobot(BaseTask):
             self.num_envs, global_control_steps=self.common_step_counter
         )
         self.ued_adapter.assign(env_ids, assignments)
-        self._resample_commands(env_ids)
+        self._resample_commands(env_ids, episode_start=True)
         self.ued_adapter.clear_episode_accumulators(env_ids)
 
     def _active_ued_adapter(self):
@@ -314,11 +314,12 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.curriculum and ued_adapter is None:
             self._update_terrain_curriculum(env_ids)
         # avoid updating command curriculum at each step since the maximum command is common to all envs
-        if (self.cfg.commands.curriculum and getattr(self.cfg.commands, "command_curriculum_enabled", True)
+        if (self.cfg.commands.curriculum
+                and getattr(self.cfg.commands, "legacy_performance_command_curriculum_enabled", True)
                 and ued_adapter is None and (self.common_step_counter % self.max_episode_length ==0)):
             self._update_command_curriculum(env_ids)
 
-        self._resample_commands(env_ids)
+        self._resample_commands(env_ids, episode_start=True)
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
         self.simulator.reset_idx(env_ids)
@@ -346,7 +347,8 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.curriculum and ued_adapter is None:
             self.extras["episode"]["terrain_level"] = torch.mean(
                 self.simulator.terrain_levels.float())
-        if self.cfg.commands.curriculum and getattr(self.cfg.commands, "command_curriculum_enabled", True):
+        if (self.cfg.commands.curriculum
+                and getattr(self.cfg.commands, "legacy_performance_command_curriculum_enabled", True)):
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
         # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
@@ -556,7 +558,9 @@ class LeggedRobot(BaseTask):
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
         """
         env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt) == 0).nonzero(as_tuple=False).flatten()
-        self._resample_commands(env_ids)
+        # Mid-episode only: do not re-roll the standstill Bernoulli (see
+        # _resample_commands(episode_start=...)).
+        self._resample_commands(env_ids, episode_start=False)
         if self.cfg.commands.heading_command:
             forward = quat_apply(self.simulator.base_quat, self.forward_vec)
             self.heading = torch.atan2(forward[:, 1], forward[:, 0])
@@ -571,39 +575,57 @@ class LeggedRobot(BaseTask):
             self.simulator.push_links()
             # print(f"pushing links")
         
-    def _resample_commands(self, env_ids: EnvIds) -> None:
-        """ Randommly select commands of some environments
+    def _resample_commands(self, env_ids: EnvIds, *, episode_start: bool = False) -> None:
+        """Randomly select commands of some environments.
 
         Args:
             env_ids: Environments ids for which new commands are needed
+            episode_start: True only from reset / UED enable.  Standstill is a
+                once-per-episode latch when UED is active: mid-episode resamples
+                (``resampling_time``) re-apply zeros for latched envs and never
+                re-roll ``zero_cmd_prob``, so episodic returns stay pure
+                standstill or pure motion for LP validity.
         """
+        if len(env_ids) == 0:
+            return
         ued_adapter = self._active_ued_adapter()
+        # UED mid-episode: keep standstill holds at zero; only re-sample movers.
+        motion_ids = env_ids
+        if ued_adapter is not None and not episode_start:
+            motion_ids = ued_adapter.apply_standstill_hold(env_ids)
+            if len(motion_ids) == 0:
+                return
+
         if ued_adapter is None:
-            self.commands[env_ids, 0] = torch_rand_float(
-                self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids),1), self.device).squeeze(1)
+            self.commands[motion_ids, 0] = torch_rand_float(
+                self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(motion_ids),1), self.device).squeeze(1)
         else:
-            ued_adapter.resample_commands_within_active_bin(env_ids)
-        self.commands[env_ids, 1] = torch_rand_float(
-            self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids),1), self.device).squeeze(1)
+            ued_adapter.resample_commands_within_active_bin(motion_ids)
+        self.commands[motion_ids, 1] = torch_rand_float(
+            self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(motion_ids),1), self.device).squeeze(1)
         if self.cfg.commands.heading_command:
-            self.commands[env_ids, 3] = torch_rand_float(self.command_ranges["heading"][0], self.command_ranges["heading"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+            self.commands[motion_ids, 3] = torch_rand_float(self.command_ranges["heading"][0], self.command_ranges["heading"][1], (len(motion_ids), 1), device=self.device).squeeze(1)
         else:
-            self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        
-        if getattr(self.cfg.commands, "per_env_standstill", False):
-            standstill = torch.rand(len(env_ids), device=self.device) < self.cfg.commands.zero_cmd_prob
-            standstill_ids = env_ids[standstill]
-            self.commands[standstill_ids, :3] *= 0.0
-            if ued_adapter is not None and len(standstill_ids):
-                ued_adapter.mark_standstill(standstill_ids)
-        elif np.random.rand() < self.cfg.commands.zero_cmd_prob:
-            self.commands[env_ids, :3] *= 0.0  # legacy batch-wide standstill draw
-            if ued_adapter is not None:
-                ued_adapter.mark_standstill(env_ids)
-        
-        # set small commands to zero
-        self.commands[env_ids, :3] *= (torch.norm(
-            self.commands[env_ids, :3], dim=1) > 0.2).unsqueeze(1)
+            self.commands[motion_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(motion_ids), 1), device=self.device).squeeze(1)
+
+        # Standstill Bernoulli: episode-start only under UED (latched for the
+        # whole episode).  Legacy non-UED keeps the historical mid-episode re-roll.
+        draw_standstill = episode_start if ued_adapter is not None else True
+        if draw_standstill:
+            if getattr(self.cfg.commands, "per_env_standstill", False):
+                standstill = torch.rand(len(motion_ids), device=self.device) < self.cfg.commands.zero_cmd_prob
+                standstill_ids = motion_ids[standstill]
+                self.commands[standstill_ids, :3] *= 0.0
+                if ued_adapter is not None and len(standstill_ids):
+                    ued_adapter.mark_standstill(standstill_ids)
+            elif np.random.rand() < self.cfg.commands.zero_cmd_prob:
+                self.commands[motion_ids, :3] *= 0.0  # legacy batch-wide standstill draw
+                if ued_adapter is not None:
+                    ued_adapter.mark_standstill(motion_ids)
+
+        # set small commands to zero (movers only; standstill holds already 0)
+        self.commands[motion_ids, :3] *= (torch.norm(
+            self.commands[motion_ids, :3], dim=1) > 0.2).unsqueeze(1)
 
     def _update_command_curriculum(self, env_ids: EnvIds) -> None:
         """ Implements a curriculum of increasing commands

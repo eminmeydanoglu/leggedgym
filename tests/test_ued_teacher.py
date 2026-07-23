@@ -217,9 +217,18 @@ def test_public_scalar_inputs_and_softmax_remain_well_defined_at_extremes():
 
 
 def test_teacher_modules_have_no_forbidden_imports():
+    # Only the TEACHER CORE (task_space/episode_curriculum/checkpoint, plus
+    # the package __init__ that merely re-exports them) must stay free of
+    # simulator/PPO imports (solun_plani.md §12: "Teacher modülü Genesis,
+    # Torch, PPO veya policy import etmez"). genesis_adapter.py is
+    # deliberately excluded: it is the documented Torch/Genesis *boundary*
+    # (solun_plani.md §7 "GenesisUEDAdapter"), not the teacher itself, and is
+    # SUPPOSED to import torch.
     root = Path(__file__).resolve().parents[1] / "legged_gym" / "utils" / "ued"
+    teacher_core_files = ("__init__.py", "task_space.py", "episode_curriculum.py", "checkpoint.py")
     forbidden = {"genesis", "torch", "ppo", "policy"}
-    for path in root.glob("*.py"):
+    for name in teacher_core_files:
+        path = root / name
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

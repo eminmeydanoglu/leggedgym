@@ -183,7 +183,10 @@ class LeggedRobotCfg(BaseConfig):
         zero_cmd_prob = 0.4    # probability of sampling zero command when resampling commands, to encourage the robot to learn standing still behavior
         # Defaults preserve the original global standstill draw and command curriculum.
         per_env_standstill: bool = False
-        command_curriculum_enabled: bool = True
+        # Kill-switch for the legacy performance-based lin_vel_x range widening
+        # (``_update_command_curriculum``). Not the runner's iteration-based
+        # ``command_schedule`` — that lives on train_cfg.runner.
+        legacy_performance_command_curriculum_enabled: bool = True
         class ranges:
             lin_vel_x: List[float] = [-1.0, 1.0] # min max [m/s]
             lin_vel_y: List[float] = [-1.0, 1.0]   # min max [m/s]

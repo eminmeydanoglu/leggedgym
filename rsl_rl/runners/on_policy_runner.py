@@ -553,6 +553,15 @@ class OnPolicyRunner:
         # their Adam moments instead of resetting estimator/encoder learning.
         for name, opt in self._aux_optimizers().items():
             save_dict[name] = opt.state_dict()
+        # V5 UED (solun_plani.md §9): the teacher itself is never pickled, only
+        # its explicit, versioned, fingerprinted state_dict travels with the
+        # weights. No-op for every non-UED task (episode_curriculum stays None),
+        # and for lightweight test runners that never set self.env at all.
+        env = getattr(self, "env", None)
+        episode_curriculum = getattr(env, "episode_curriculum", None)
+        if getattr(getattr(env, "cfg", None), "env", None) is not None and \
+                getattr(env.cfg.env, "ued_enabled", False) and episode_curriculum is not None:
+            save_dict["episode_curriculum"] = episode_curriculum.state_dict()
         torch.save(save_dict, path)
 
     @staticmethod
@@ -597,6 +606,25 @@ class OnPolicyRunner:
                 if loaded_dict.get(name) is not None:
                     opt.load_state_dict(loaded_dict[name])
         self.current_learning_iteration = loaded_dict['iter']
+
+        # V5 UED (solun_plani.md §9): restore the teacher's sampling
+        # distribution/LP state/RNG. Fail-fast (not skip) when a UED-enabled
+        # run resumes from a checkpoint that carries no teacher state at all,
+        # and load_state_dict() itself fails closed on any task-space/config/
+        # algorithm fingerprint mismatch -- a resumed run can never silently
+        # start training under a different curriculum. `self.env` may be
+        # absent entirely for lightweight test runners built via __new__.
+        env = getattr(self, "env", None)
+        episode_curriculum = getattr(env, "episode_curriculum", None)
+        if getattr(getattr(env, "cfg", None), "env", None) is not None and \
+                getattr(env.cfg.env, "ued_enabled", False) and episode_curriculum is not None:
+            curriculum_state = loaded_dict.get("episode_curriculum")
+            if curriculum_state is None:
+                raise ValueError(
+                    "Resuming a UED-enabled run requires an 'episode_curriculum' "
+                    f"checkpoint entry; none found in {path}"
+                )
+            episode_curriculum.load_state_dict(curriculum_state)
 
         # Restore the full lexicographic selection state from the resumed model
         # or the sibling best_tracking checkpoint. Legacy best.pt has no V2 key;

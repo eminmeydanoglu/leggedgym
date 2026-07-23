@@ -3,7 +3,7 @@
 The module deliberately separates the deterministic bank and aggregation
 contract from simulator rollout.  A Genesis/V4 caller supplies a ``rollout``
 callable that consumes the generated rows and returns one measurement per row;
-tests can use the same boundary without constructing 4,032 environments.
+tests can use the same boundary without constructing a full GPU scene.
 """
 from __future__ import annotations
 
@@ -20,6 +20,10 @@ import yaml
 
 BANK_SCHEMA_VERSION = 1
 ARTIFACT_SCHEMA_VERSION = 1
+
+# Frozen V5 selection bank size (84 cells × replicas_per_cell).
+FROZEN_REPLICAS_PER_CELL = 12
+FROZEN_NUM_CELLS = 84
 
 
 def _canonical_json(value: object) -> str:
@@ -44,6 +48,10 @@ class BankRow:
 
     def key(self) -> tuple[int, int]:
         return self.cell_id, self.replica_id
+
+
+def replicas_per_cell(config: Mapping[str, Any]) -> int:
+    return int(config["validation_bank"]["replicas_per_cell"])
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -76,8 +84,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("validation bank requires exactly four terrain levels")
     if len(edges) != 5 or any(right <= left for left, right in zip(edges, edges[1:])):
         raise ValueError("validation bank requires four increasing velocity bins")
-    if int(bank.get("replicas_per_cell", 0)) != 48:
-        raise ValueError("frozen validation bank requires 48 replicas per cell")
+    if int(bank.get("replicas_per_cell", 0)) != FROZEN_REPLICAS_PER_CELL:
+        raise ValueError(
+            f"frozen validation bank requires {FROZEN_REPLICAS_PER_CELL} replicas per cell"
+        )
     pinned_fingerprint = bank.get("bank_fingerprint")
     if not isinstance(pinned_fingerprint, str) or len(pinned_fingerprint) != 64:
         raise ValueError("validation_bank must pin its deterministic fingerprint")
@@ -90,6 +100,18 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if int(config["validation_seed"]) != 31001 or int(config["eval_seed"]) != 41001:
         raise ValueError("frozen UED validation and held-out seeds are 31001 and 41001")
 
+    selection = config["selection"]
+    if not isinstance(selection, Mapping):
+        raise ValueError("selection must be a mapping")
+    min_iteration = int(selection.get("min_iteration", 1000))
+    iteration_stride = int(selection.get("iteration_stride", 500))
+    if min_iteration < 0:
+        raise ValueError("selection.min_iteration must be non-negative")
+    if iteration_stride <= 0:
+        raise ValueError("selection.iteration_stride must be positive")
+    if "always_include_final" in selection and not isinstance(selection["always_include_final"], bool):
+        raise ValueError("selection.always_include_final must be a boolean")
+
 
 def validation_cells(config: Mapping[str, Any]) -> list[tuple[str, int, int]]:
     """Return the stable 84-cell order: terrain/level (then flat) × velocity."""
@@ -101,24 +123,26 @@ def validation_cells(config: Mapping[str, Any]) -> list[tuple[str, int, int]]:
 
 
 def build_validation_bank(config: Mapping[str, Any]) -> list[BankRow]:
-    """Precompute every deterministic in-bin command draw in the 84 × 48 bank."""
+    """Precompute every deterministic in-bin command draw in the 84 × R bank."""
     cells = validation_cells(config)
-    if len(cells) != 84:
-        raise AssertionError(f"frozen UED bank must have 84 cells, got {len(cells)}")
+    if len(cells) != FROZEN_NUM_CELLS:
+        raise AssertionError(f"frozen UED bank must have {FROZEN_NUM_CELLS} cells, got {len(cells)}")
     bank = config["validation_bank"]
+    n_replicas = replicas_per_cell(config)
     edges = np.asarray(bank["velocity_bin_edges"], dtype=np.float64)
     rng = np.random.Generator(np.random.PCG64(int(config["validation_seed"])))
     rows: list[BankRow] = []
     for cell_id, (terrain_type, terrain_level, vx_bin) in enumerate(cells):
-        draws = rng.uniform(edges[vx_bin], edges[vx_bin + 1], size=48)
+        draws = rng.uniform(edges[vx_bin], edges[vx_bin + 1], size=n_replicas)
         for replica_id, command_vx in enumerate(draws):
             rows.append(BankRow(
                 cell_id=cell_id, terrain_type=terrain_type, terrain_level=terrain_level,
                 vx_bin=vx_bin, replica_id=replica_id, command_vx=float(command_vx),
                 geometry_hash=str(bank["geometry_hashes"][terrain_type]),
             ))
-    if len(rows) != 4032:
-        raise AssertionError(f"frozen UED bank must contain 4032 replicas, got {len(rows)}")
+    expected = FROZEN_NUM_CELLS * n_replicas
+    if len(rows) != expected:
+        raise AssertionError(f"frozen UED bank must contain {expected} replicas, got {len(rows)}")
     return rows
 
 
@@ -213,21 +237,24 @@ def aggregate_measurements(
     """Macro aggregate replica SPNTE to 84 cells and then equally weight cells."""
     rows = build_validation_bank(config) if bank is None else list(bank)
     measured = validate_measurements(measurements, config, rows)
+    n_replicas = replicas_per_cell(config)
     success = config["success"]
     min_survival, max_spnte = float(success["minimum_survival_steps"]), float(success["spnte_lin_lt"])
-    grouped: dict[int, list[dict[str, Any]]] = {cell_id: [] for cell_id in range(84)}
+    grouped: dict[int, list[dict[str, Any]]] = {cell_id: [] for cell_id in range(FROZEN_NUM_CELLS)}
     for row in measured:
         grouped[int(row["cell_id"])].append(row)
     cells: list[dict[str, Any]] = []
     for cell_id, members in grouped.items():
-        if len(members) != 48:
-            raise AssertionError("complete measurement validation must produce 48 replicas per cell")
+        if len(members) != n_replicas:
+            raise AssertionError(
+                f"complete measurement validation must produce {n_replicas} replicas per cell"
+            )
         spnte_values = np.asarray([member["spnte_lin"] for member in members], dtype=np.float64)
         fall_values = np.asarray([member["fall_rate"] for member in members], dtype=np.float64)
         replica_success = np.asarray([
             member["survival_steps"] >= min_survival and member["spnte_lin"] < max_spnte for member in members
         ], dtype=np.float64)
-        first = rows[cell_id * 48]
+        first = rows[cell_id * n_replicas]
         cells.append({
             "cell_id": cell_id, "terrain_type": first.terrain_type, "terrain_level": first.terrain_level,
             "vx_bin": first.vx_bin, "spnte_lin": float(spnte_values.mean()),

@@ -191,6 +191,17 @@ from legged_gym.envs.go2.go2_v4_config import (
     Go2V4HIMFixedCfg, Go2V4HIMFixedCfgPPO,
     Go2V4SupersetOracleCfg, Go2V4SupersetOracleCfgPPO,
 )
+# ---------------------------------------------------------------------------
+# V5 UED: same frozen V4 physics/reward/DR/actor-critic/budget substrate
+# (§2), reused Go2V3Mlp env implementation; only the episode-task sampler
+# (curriculum.algorithm) differs across the four arms (§3, §14.5).
+# ---------------------------------------------------------------------------
+from legged_gym.envs.go2.go2_v5_config import (
+    Go2V5HandcraftedCfg, Go2V5HandcraftedCfgPPO,
+    Go2V5UniformCfg, Go2V5UniformCfgPPO,
+    Go2V5LPACRLCfg, Go2V5LPACRLCfgPPO,
+    Go2V5ALPCfg, Go2V5ALPCfgPPO,
+)
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
@@ -241,3 +252,10 @@ task_registry.register(
     Go2V4SupersetOracleCfg(),
     Go2V4SupersetOracleCfgPPO(),
 )
+# V5 UED arms: same Go2V3Mlp env implementation (45D noisy proprio / 48D
+# privileged critic, no height map) as go2_v4_mlp; only the cfg (episode-task
+# sampler vs. legacy V4 curriculum) differs across arms.
+task_registry.register("go2_v5_handcrafted", Go2V3Mlp, Go2V5HandcraftedCfg(), Go2V5HandcraftedCfgPPO())
+task_registry.register("go2_v5_uniform", Go2V3Mlp, Go2V5UniformCfg(), Go2V5UniformCfgPPO())
+task_registry.register("go2_v5_lpacrl", Go2V3Mlp, Go2V5LPACRLCfg(), Go2V5LPACRLCfgPPO())
+task_registry.register("go2_v5_alp", Go2V3Mlp, Go2V5ALPCfg(), Go2V5ALPCfgPPO())

@@ -1,20 +1,25 @@
 # Frozen V5 UED checkpoint-selection protocol.  Do not change this bank after
 # a headline campaign starts: its fingerprint is stored with every validation
 # result and selected checkpoint.
+#
+# Offline only: training keeps online tracking eval -> best_tracking.pt.
+# After a run, score the scheduled iterations with ued_rollout, then
+# select_checkpoint -> best_spnte.pt.  Nothing here is auto-launched by train.
 campaign: v5_ued
 schema_version: 1
 validation_seed: 31001
 eval_seed: 41001
 
 validation_bank:
-  version: v5_ued_bank_v1
+  version: v5_ued_bank_v1_r12
   terrain_types: [stairs_up, stairs_down, slope_up, slope_down, rough]
   terrain_levels: [0, 1, 2, 3]
   flat_terrain_type: flat
   flat_terrain_level: 0
   velocity_bin_edges: [0.0, 0.5, 1.0, 1.5, 2.0]
-  replicas_per_cell: 48
-  bank_fingerprint: 141e9401f8e93817e3fe2d619d13694a048653d59ac5bae78bab465d2a798275
+  # 84 cells × 12 replicas = 1008 measurements (selection bank; not 48).
+  replicas_per_cell: 12
+  bank_fingerprint: 3e08ac398ef5f9166cd29c14af44868b0916991b736737712cf8388ebb607a9d
   # These are canonical hashes of the frozen terrain-builder descriptions.
   # A real rollout must report the matching geometry hash for every replica;
   # selection refuses artifacts that do not carry these pins.
@@ -42,6 +47,13 @@ selection:
   version: ued_checkpoint_selection_v1
   primary_tolerance: 0.000001
   worst_task_fraction: 0.10
+  # Offline schedule over existing model_<iter>.pt (save_interval may stay 200):
+  # start target min_iteration; for each target take largest available <= target
+  # (>= min_iteration, after previous pick); next target = pick + stride;
+  # always include the final periodic checkpoint.
+  min_iteration: 1000
+  iteration_stride: 500
+  always_include_final: true
   artifact_dir: ued_validation
   artifact_pattern: model_{iteration}.json
   best_artifact: best_spnte.pt

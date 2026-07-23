@@ -2,8 +2,19 @@
 
 Only existing ``model_<iteration>.pt`` files participate.  The selector is
 intentionally independent of the trainer: it consumes artifacts written by
-``ued_validation`` and materialises a separate ``best_spnte.pt`` without ever
-changing ``best_tracking.pt``.
+``ued_validation`` / ``ued_rollout`` and materialises a separate
+``best_spnte.pt`` without ever changing ``best_tracking.pt``.
+
+Offline evaluation is **not** launched from training.  After a run, score the
+scheduled iterations manually, then call this selector.
+
+Selection schedule (from ``configs/eval/v5_ued.yaml``):
+  * start target = ``min_iteration`` (default 1000)
+  * for each target T, take the largest existing checkpoint ``<= T``
+    (strictly after the previous pick, and ``>= min_iteration``)
+  * next target = chosen_iteration + ``iteration_stride`` (default 500)
+  * if nothing floors to T, advance T by the stride
+  * always include the final periodic checkpoint when configured
 """
 from __future__ import annotations
 
@@ -50,6 +61,59 @@ def periodic_checkpoints(run_dir: str | Path) -> list[tuple[int, Path]]:
         if match and path.is_file():
             candidates.append((int(match.group(1)), path))
     return sorted(candidates)
+
+
+def scheduled_iterations(
+    available: Sequence[int],
+    *,
+    min_iteration: int = 1000,
+    iteration_stride: int = 500,
+    always_include_final: bool = True,
+) -> list[int]:
+    """Choose offline-eval iterations from existing periodic checkpoints.
+
+    Example with saves every 200 through 3000:
+      1000 → 1400 (floor of 1500) → 1800 → 2200 → 2600 → 3000 (and final).
+    """
+    iters = sorted({int(value) for value in available})
+    if not iters:
+        return []
+    if iteration_stride <= 0:
+        raise ValueError("iteration_stride must be positive")
+    if min_iteration < 0:
+        raise ValueError("min_iteration must be non-negative")
+
+    final = iters[-1]
+    picks: list[int] = []
+    target = int(min_iteration)
+
+    while target <= final:
+        cands = [i for i in iters if min_iteration <= i <= target]
+        if picks:
+            cands = [i for i in cands if i > picks[-1]]
+        if not cands:
+            target += int(iteration_stride)
+            continue
+        pick = max(cands)
+        picks.append(pick)
+        target = pick + int(iteration_stride)
+
+    if always_include_final and final not in picks:
+        picks.append(final)
+    return picks
+
+
+def selection_schedule_from_config(
+    available: Sequence[int], config: Mapping[str, Any],
+) -> list[int]:
+    """Apply the frozen selection schedule fields from a loaded config."""
+    selection = config["selection"]
+    return scheduled_iterations(
+        available,
+        min_iteration=int(selection.get("min_iteration", 1000)),
+        iteration_stride=int(selection.get("iteration_stride", 500)),
+        always_include_final=bool(selection.get("always_include_final", True)),
+    )
 
 
 def artifact_path_for(run_dir: str | Path, iteration: int, config: Mapping[str, Any]) -> Path:
@@ -100,13 +164,22 @@ def _candidate_from_artifact(
 
 
 def load_candidates(run_dir: str | Path, config: Mapping[str, Any]) -> list[Candidate]:
-    """Load every periodic candidate, refusing selection if any bank is incomplete."""
+    """Load scheduled periodic candidates; refuse if any scheduled bank is incomplete."""
     checkpoints = periodic_checkpoints(run_dir)
     if not checkpoints:
         raise FileNotFoundError(f"{run_dir}: no existing periodic model_<iteration>.pt checkpoints")
+    by_iteration = {iteration: path for iteration, path in checkpoints}
+    schedule = selection_schedule_from_config(list(by_iteration), config)
+    if not schedule:
+        raise FileNotFoundError(f"{run_dir}: selection schedule produced no candidate iterations")
+    missing = [iteration for iteration in schedule if iteration not in by_iteration]
+    if missing:
+        raise FileNotFoundError(f"{run_dir}: scheduled iterations missing checkpoints: {missing}")
     return [
-        _candidate_from_artifact(iteration, checkpoint, artifact_path_for(run_dir, iteration, config), config)
-        for iteration, checkpoint in checkpoints
+        _candidate_from_artifact(
+            iteration, by_iteration[iteration], artifact_path_for(run_dir, iteration, config), config,
+        )
+        for iteration in schedule
     ]
 
 
@@ -151,6 +224,8 @@ def selection_metadata(candidate: Candidate, config: Mapping[str, Any]) -> dict[
         "selected_iteration": int(candidate.iteration),
         "source_checkpoint": candidate.checkpoint_path.name,
         "validation_artifact": candidate.artifact_path.name,
+        "selection_min_iteration": int(config["selection"].get("min_iteration", 1000)),
+        "selection_iteration_stride": int(config["selection"].get("iteration_stride", 500)),
         # Keep the two distributions visibly distinct in the selection record.
         "assignment_distribution": candidate.artifact.get("assignment_distribution"),
         "ppo_transition_occupancy": candidate.artifact.get("ppo_transition_occupancy"),
@@ -196,12 +271,21 @@ def select_run(run_dir: str | Path, config: Mapping[str, Any]) -> tuple[Candidat
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Select V5 UED best_spnte.pt from complete periodic validations")
+    parser = argparse.ArgumentParser(description="Select V5 UED best_spnte.pt from complete scheduled validations")
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", required=True)
     args = parser.parse_args(argv)
-    winner, target = select_run(args.run_dir, load_config(args.config))
-    print(json.dumps({"best_spnte": str(target), "selected_iteration": winner.iteration, "scores": winner.scores}, sort_keys=True))
+    config = load_config(args.config)
+    winner, target = select_run(args.run_dir, config)
+    schedule = selection_schedule_from_config(
+        [iteration for iteration, _ in periodic_checkpoints(args.run_dir)], config,
+    )
+    print(json.dumps({
+        "best_spnte": str(target),
+        "selected_iteration": winner.iteration,
+        "schedule": schedule,
+        "scores": winner.scores,
+    }, sort_keys=True))
     return 0
 
 

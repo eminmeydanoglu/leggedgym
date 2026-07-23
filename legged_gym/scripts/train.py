@@ -83,6 +83,12 @@ def write_run_manifest(log_dir, args, env_cfg, train_cfg):
                 "estimator_labels": getattr(env_cfg.env, "num_estimator_labels", None),
             },
             "command_schedule": getattr(runner, "command_schedule", None),
+            # V5 UED provenance: which episode-task sampler (if any) owns the
+            # command/terrain distribution for this run (see go2_v5_config.py).
+            "ued_enabled": bool(getattr(env_cfg.env, "ued_enabled", False)),
+            "ued_curriculum_algorithm": getattr(
+                getattr(env_cfg, "curriculum", None), "algorithm", None
+            ),
             "max_iterations": runner.max_iterations,
             "num_envs": env_cfg.env.num_envs,
             "num_observations": env_cfg.env.num_observations,
@@ -110,6 +116,17 @@ def train(args):
             logging_level='warning')
     # Make environment and algorithm runner
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
+    # V5 UED arms (uniform/lp_acrl/alp) opt into an episode-task sampler via
+    # cfg.env.ued_enabled; every existing v3/v4/bench task leaves this False
+    # and this block is a no-op, so their training stays byte-for-byte
+    # unaffected. Must run before make_alg_runner(): a --resume load happens
+    # inside that call and needs env.episode_curriculum already installed to
+    # restore the teacher state into (see rsl_rl OnPolicyRunner.load).
+    if getattr(env_cfg.env, "ued_enabled", False):
+        from legged_gym.envs.go2.go2_v5_config import build_ued_teacher
+
+        episode_curriculum, task_space = build_ued_teacher(env_cfg)
+        env.enable_ued(episode_curriculum, task_space)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
 
     # Copy env.py and env_config.py to log_dir for backup
@@ -138,6 +155,13 @@ def train(args):
         )
         if os.path.isfile(v4_config_path):
             shutil.copy(v4_config_path, log_dir)
+
+    if args.task.startswith("go2_v5_"):
+        v5_config_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", "go2", "go2_v5_config.py"
+        )
+        if os.path.isfile(v5_config_path):
+            shutil.copy(v5_config_path, log_dir)
 
     # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
     write_run_manifest(log_dir, args, env_cfg, train_cfg)
