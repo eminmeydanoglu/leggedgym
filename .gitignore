@@ -86,3 +86,12 @@ archive/
 
 # LPACR dashboard runtime dumps only (code under lpacr/dashboard/ is tracked)
 lpacr/dashboard/data/
+
+# Local browser-inspection output and one-off Curriculum Atlas visual checks.
+/.playwright-mcp/
+/atlas-final.png
+/atlas-polished.png
+/atlas-sharp.png
+/atlas-single-map.png
+/dashboard-fixed-lp.png
+/dashboard-full.png
