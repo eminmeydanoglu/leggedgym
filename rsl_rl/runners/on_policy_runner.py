@@ -101,6 +101,12 @@ class OnPolicyRunner:
         self.eval_fall_guard: float = self.cfg.get("eval_fall_guard", 0.25)
         self.best_eval_score: float = float("inf")
         self.best_tracking_key: Optional[Tuple[float, ...]] = None
+        # best_spnte.pt selection: mirrors best_tracking_key above but scored
+        # purely on spnte_lin (min is better), with iteration as a
+        # deterministic tie-break. Independent of the tracking selection so
+        # neither best-checkpoint file influences the other.
+        self.best_spnte_score: float = float("inf")
+        self.best_spnte_key: Optional[Tuple[float, float]] = None
 
         # Iteration-based command schedule (opt-in via runner cfg). A list of
         # {"start_iteration": int, "lin_vel_x": [lo, hi]} stages: at each boundary
@@ -517,6 +523,27 @@ class OnPolicyRunner:
                           'selection_key': list(key),
                       })
             print(f"[eval] new best_tracking.pt @ it={it} (key={key})")
+
+        # Independent SPNTE selection: does not read or affect best_tracking_key
+        # / best_eval_score above. spnte_lin may be absent from metrics returned
+        # by an older/mocked run_indist_eval; skip selection rather than KeyError.
+        if "spnte_lin" in metrics and self.log_dir is not None:
+            spnte_lin = float(metrics["spnte_lin"])
+            spnte_key = (spnte_lin, float(it))
+            if self.best_spnte_key is None or spnte_key < self.best_spnte_key:
+                self.best_spnte_key = spnte_key
+                self.best_spnte_score = spnte_lin
+                if self.writer is not None:
+                    self.writer.add_scalar('Eval/best_spnte_score', spnte_lin, it)
+                self.save(os.path.join(self.log_dir, 'best_spnte.pt'), iteration=it,
+                          infos={
+                              'eval_metrics': metrics,
+                              'selection_metric': 'spnte_v1',
+                              'spnte_lin': spnte_lin,
+                              'spnte_yaw': float(metrics.get('spnte_yaw', float('nan'))),
+                              'selected_iteration': it,
+                          })
+                print(f"[eval] new best_spnte.pt @ it={it} (spnte_lin={spnte_lin:.4f})")
         return metrics
 
     def save(
@@ -542,6 +569,11 @@ class OnPolicyRunner:
             # cannot treat an already-evaluated run as having no best model.
             'best_eval_score': self.best_eval_score,
             'best_tracking_key': self.best_tracking_key,
+            # SPNTE selection state, independent of best_tracking above. getattr
+            # fallback keeps hand-built runner test doubles (predating this
+            # field) working without setting it explicitly.
+            'best_spnte_score': getattr(self, 'best_spnte_score', float('inf')),
+            'best_spnte_key': getattr(self, 'best_spnte_key', None),
             # Provenance travelling with the weights (see codex_plan.md sec. 2):
             # the training seed and the active command-schedule stage.
             'training_seed': self.training_seed,
@@ -605,7 +637,11 @@ class OnPolicyRunner:
         # Checkpoints are commonly saved from CUDA training.  Explicitly map
         # storage to this runner's device so CPU playback/evaluation can load
         # them on machines where CUDA is unavailable.
-        loaded_dict = torch.load(path, map_location=self.device, weights_only=False)
+        # Lightweight tools/tests may construct a runner around an already
+        # placed actor without running the full initializer.  CPU is the safe
+        # fallback when no explicit runner device exists.
+        map_location = getattr(self, "device", "cpu")
+        loaded_dict = torch.load(path, map_location=map_location, weights_only=False)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
@@ -690,6 +726,51 @@ class OnPolicyRunner:
                     if os.path.exists(temporary):
                         os.remove(temporary)
                 print(f"[resume] carried best_tracking.pt into {self.log_dir}")
+
+        # Mirror of the best_tracking restore above, independently, for the
+        # SPNTE-selected sibling checkpoint. Older checkpoints carry neither
+        # 'best_spnte_key' nor a 'spnte_v1' infos block; both are treated as
+        # "no SPNTE selection yet" rather than an error.
+        spnte_choices = [loaded_dict]
+        spnte_path = os.path.join(os.path.dirname(path), 'best_spnte.pt')
+        loading_spnte_checkpoint = os.path.abspath(spnte_path) == os.path.abspath(path)
+        source_spnte_path = path if loading_spnte_checkpoint else spnte_path
+        if not loading_spnte_checkpoint and os.path.isfile(spnte_path):
+            spnte_choices.append(torch.load(spnte_path, map_location='cpu', weights_only=False))
+        spnte_keys = []
+        for item in spnte_choices:
+            key = item.get('best_spnte_key')
+            if key is None:
+                infos = item.get('infos') or {}
+                if infos.get('selection_metric') == 'spnte_v1':
+                    key = (infos.get('spnte_lin'), infos.get('selected_iteration'))
+            if isinstance(key, (list, tuple)) and len(key) == 2 and all(v is not None for v in key):
+                try:
+                    spnte_keys.append((float(key[0]), float(key[1])))
+                except (TypeError, ValueError):
+                    pass
+        self.best_spnte_key = min(spnte_keys) if spnte_keys else None
+        self.best_spnte_score = self.best_spnte_key[0] if self.best_spnte_key is not None else float('inf')
+
+        # Carry the SPNTE-selected weights into a fresh run directory, same
+        # rationale as best_tracking.pt above.
+        if self.best_spnte_key is not None and self.log_dir is not None:
+            destination = os.path.join(self.log_dir, 'best_spnte.pt')
+            if os.path.abspath(source_spnte_path) != os.path.abspath(destination):
+                if not os.path.isfile(source_spnte_path):
+                    raise FileNotFoundError(
+                        "Checkpoint contains a best_spnte selection key, but "
+                        f"the selected artifact is missing: {source_spnte_path}"
+                    )
+                os.makedirs(self.log_dir, exist_ok=True)
+                temporary = f"{destination}.tmp-{os.getpid()}"
+                try:
+                    shutil.copy2(source_spnte_path, temporary)
+                    os.replace(temporary, destination)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+                print(f"[resume] carried best_spnte.pt into {self.log_dir}")
         return loaded_dict['infos']
 
     def get_inference_policy(

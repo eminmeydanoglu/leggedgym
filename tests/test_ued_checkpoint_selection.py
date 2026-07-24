@@ -1,6 +1,7 @@
 """CPU-only contracts for the frozen V5 UED validation and selector path."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import itertools
 import json
@@ -601,7 +602,8 @@ class TestUEDCheckpointSelection(unittest.TestCase):
         )
         from legged_gym.utils import task_registry
 
-        env_cfg, _ = task_registry.get_cfgs(name="go2_v5_lpacrl")
+        registered_env_cfg, _ = task_registry.get_cfgs(name="go2_v5_lpacrl")
+        env_cfg = copy.deepcopy(registered_env_cfg)
         dt = float(env_cfg.control.dt)
         steps = int(self.config["rollout"]["steps"])
         warmup = int(self.config["rollout"]["warmup_steps"])

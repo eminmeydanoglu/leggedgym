@@ -902,6 +902,34 @@ def score_cell(
             "oracle_headroom_absolute": denominator}
 
 
+def _error_view(row: Mapping[str, Any], error_field: str) -> Dict[str, Any]:
+    """Row view for :func:`score_cell`, closing the gap on ``error_field``."""
+    return {**row, "tracking_error": float(row[error_field])}
+
+
+def score_cell_on(
+    error_field: str, baseline: Mapping[str, float], oracle_candidates: Sequence[Mapping[str, float]],
+    method: Mapping[str, float], score_cfg: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Score one cell by closing the gap on an arbitrary lower-is-better ``error_field``.
+
+    A thin remap in front of :func:`score_cell`: every gate (oracle stability
+    via fall_rate, the speed gate, the headroom gate, and the method
+    fall-gate) is reused byte-for-byte from the single scorecard rule -- only
+    the field being closed changes.  ``error_field="tracking_error"`` is a
+    no-op remap and is exactly the historical scorecard; SPNTE scoring calls
+    this with ``error_field="spnte_lin"``.
+    """
+    if error_field == "tracking_error":
+        return score_cell(baseline, oracle_candidates, method, score_cfg)
+    return score_cell(
+        _error_view(baseline, error_field),
+        [_error_view(row, error_field) for row in oracle_candidates],
+        _error_view(method, error_field),
+        score_cfg,
+    )
+
+
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -969,36 +997,61 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
             "tracking_error": float(np.median([row["tracking_error"] for row in baseline_rows])),
             "fall_rate": float(np.median([row["fall_rate"] for row in baseline_rows])),
         }
+        # Parallel SPNTE-scored view of the same (suite, scenario) cell:
+        # score_cell_on reuses the identical gate rule, only closing the gap
+        # on spnte_lin instead of tracking_error.  Only attempted once the
+        # baseline+oracle rows actually carry finite spnte_lin, so historical
+        # artifacts without SPNTE fields score exactly as they did before.
+        spnte_ready = (
+            all(np.isfinite(float(row.get("spnte_lin", float("nan")))) for row in baseline_rows)
+            and all(np.isfinite(float(row.get("spnte_lin", float("nan")))) for row in oracle_rows)
+        )
+        spnte_baseline = {
+            "spnte_lin": float(np.median([row["spnte_lin"] for row in baseline_rows])),
+            "fall_rate": baseline["fall_rate"],
+        } if spnte_ready else None
         for label in score_cfg["method_labels"]:
             for method in [row for row in rows if row["model"] == label]:
-                score = score_cell(baseline, oracle_rows, method, score_cfg)
+                score = score_cell_on("tracking_error", baseline, oracle_rows, method, score_cfg)
                 score_rows.append({
                     "suite": suite, "scenario": scenario, "scope": _scope(method), "model": label,
                     "training_seed": method["training_seed"], "payload_tier": method["payload_tier"],
                     "payload_name": method["payload_name"], "command_name": method["command_name"],
+                    "metric_kind": "tracking",
                     "baseline_tracking_error": baseline["tracking_error"], "baseline_fall_rate": baseline["fall_rate"],
                     "method_tracking_error": method["tracking_error"], "method_fall_rate": method["fall_rate"],
                     "method_achieved_speed_ratio": method["achieved_speed_ratio"], **score,
                 })
+                if spnte_ready and np.isfinite(float(method.get("spnte_lin", float("nan")))):
+                    spnte_score = score_cell_on("spnte_lin", spnte_baseline, oracle_rows, method, score_cfg)
+                    score_rows.append({
+                        "suite": suite, "scenario": scenario, "scope": _scope(method), "model": label,
+                        "training_seed": method["training_seed"], "payload_tier": method["payload_tier"],
+                        "payload_name": method["payload_name"], "command_name": method["command_name"],
+                        "metric_kind": "spnte",
+                        "baseline_spnte_error": spnte_baseline["spnte_lin"], "baseline_fall_rate": baseline["fall_rate"],
+                        "method_spnte_error": float(method["spnte_lin"]), "method_fall_rate": method["fall_rate"],
+                        "method_achieved_speed_ratio": method["achieved_speed_ratio"], **spnte_score,
+                    })
     _write_csv(root / "tables" / "scorecard_cells.csv", score_rows)
     seed_scores: List[Dict[str, Any]] = []
-    by_seed: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
+    by_seed: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = defaultdict(list)
     for row in score_rows:
         if row["headline_include"]:
-            by_seed[(row["model"], row["scope"], int(row["training_seed"]))].append(row)
-    for (model, scope, seed), rows in by_seed.items():
+            by_seed[(row["model"], row["scope"], str(row.get("metric_kind", "tracking")), int(row["training_seed"]))].append(row)
+    for (model, scope, metric_kind, seed), rows in by_seed.items():
         values = [float(row["headline_gap_closed"]) for row in rows]
-        seed_scores.append({"model": model, "scope": scope, "training_seed": seed, "n_cells": len(values),
-                            "gap_closed_median": float(np.median(values)), "gap_closed_min": float(np.min(values)),
-                            "gap_closed_max": float(np.max(values))})
+        seed_scores.append({"model": model, "scope": scope, "metric_kind": metric_kind, "training_seed": seed,
+                            "n_cells": len(values), "gap_closed_median": float(np.median(values)),
+                            "gap_closed_min": float(np.min(values)), "gap_closed_max": float(np.max(values))})
     _write_csv(root / "tables" / "scorecard_seed_scores.csv", seed_scores)
     headlines: List[Dict[str, Any]] = []
-    by_headline: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    by_headline: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in seed_scores:
-        by_headline[(row["model"], row["scope"])].append(row)
-    for (model, scope), rows in by_headline.items():
+        by_headline[(row["model"], row["scope"], str(row.get("metric_kind", "tracking")))].append(row)
+    for (model, scope, metric_kind), rows in by_headline.items():
         values = [float(row["gap_closed_median"]) for row in rows]
-        headlines.append({"model": model, "metric": scope, "n_training_seeds": len(rows),
+        headlines.append({"model": model, "metric": scope, "metric_kind": metric_kind, "n_training_seeds": len(rows),
                           "value_median": float(np.median(values)), "value_min": float(np.min(values)),
                           "value_max": float(np.max(values)), "all_seeds_positive": all(value > 0 for value in values)})
     # S0a is deliberately not transformed into gap_closed. It reports the
@@ -1037,9 +1090,16 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
                               "n_training_seeds": len(values), "value_median": float(np.median(tracking_delta)),
                               "value_min": float(np.min(tracking_delta)), "value_max": float(np.max(tracking_delta)),
                               "all_seeds_positive": None, "fall_delta_median": float(np.median(fall_delta))})
+    # Split by metric_kind so the historical tracking status_counts stays
+    # exactly what it was before SPNTE scoring existed; the parallel SPNTE
+    # view gets its own counter rather than being silently mixed in.
     status_counts: Dict[str, int] = defaultdict(int)
+    spnte_status_counts: Dict[str, int] = defaultdict(int)
     for row in score_rows:
-        status_counts[str(row["headline_status"])] += 1
+        if str(row.get("metric_kind", "tracking")) == "spnte":
+            spnte_status_counts[str(row["headline_status"])] += 1
+        else:
+            status_counts[str(row["headline_status"])] += 1
     # SPNTE is append-only for V3/V4: it is visible in the report and raw CSV,
     # but does not alter the established tracking/fall gap-closed scorecard.
     spnte_raw = []
@@ -1059,6 +1119,7 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
     summary = {"campaign": cfg["campaign"], "headline": headlines, "status_counts": dict(status_counts),
                "raw_cells": len(raw), "scorecard_cells": len(score_rows), "seed_scores": len(seed_scores)}
     summary["command_ood_diagnostic_raw_cells"] = len(diagnostic_raw)
+    summary["spnte_status_counts"] = dict(spnte_status_counts)
     summary["spnte_raw"] = spnte_raw
     (root / "tables" / "headline.json").write_text(_json(summary), encoding="utf-8")
     print(f"[v3_eval] aggregate raw={len(raw)} scorecard_cells={len(score_rows)} -> {root / 'tables'}")
@@ -1068,13 +1129,27 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
 def cmd_report(cfg: Mapping[str, Any]) -> int:
     root = artifact_root(cfg)
     summary = json.loads((root / "tables" / "headline.json").read_text(encoding="utf-8"))
+    # Older headline.json artifacts (and non gap-closed rows like ID_delta_*)
+    # carry no "metric_kind" key at all; default them into the historical
+    # tracking table so its rendering is unchanged when SPNTE isn't scored.
+    tracking_headline = [row for row in summary["headline"] if row.get("metric_kind", "tracking") == "tracking"]
+    spnte_headline = [row for row in summary["headline"] if row.get("metric_kind") == "spnte"]
     lines = ["# V3 Eval Scorecard", "", f"Campaign: `{summary['campaign']}`", "", "## Headline", "",
              "| Method | Metrik | Median | Min–max | Seed | İşaret tutarlılığı |", "|---|---|---:|---:|---:|---:|"]
-    for row in summary["headline"]:
+    for row in tracking_headline:
         lines.append(f"| {row['model']} | {row['metric']} | {row['value_median']:.4f} | {row['value_min']:.4f}–{row['value_max']:.4f} | {row['n_training_seeds']} | {row.get('all_seeds_positive', '')} |")
+    if spnte_headline:
+        lines += ["", "## SPNTE Gap-Closed (scored view, parallel to Headline)", "",
+                  "| Method | Metrik | Median | Min–max | Seed | İşaret tutarlılığı |", "|---|---|---:|---:|---:|---:|"]
+        for row in spnte_headline:
+            lines.append(f"| {row['model']} | {row['metric']} | {row['value_median']:.4f} | {row['value_min']:.4f}–{row['value_max']:.4f} | {row['n_training_seeds']} | {row.get('all_seeds_positive', '')} |")
     lines += ["", "## Hücre durumları", "", "| Durum | Hücre |", "|---|---:|"]
     for status, count in sorted(summary["status_counts"].items()):
         lines.append(f"| {status} | {count} |")
+    if summary.get("spnte_status_counts"):
+        lines += ["", "## SPNTE Hücre durumları (scored view)", "", "| Durum | Hücre |", "|---|---:|"]
+        for status, count in sorted(summary["spnte_status_counts"].items()):
+            lines.append(f"| {status} | {count} |")
     if summary.get("spnte_raw"):
         lines += ["", "## SPNTE (append-only raw cross-check)", "",
                   "| Suite | Method | SPNTE lin | SPNTE yaw | v scale | Raw cells |",

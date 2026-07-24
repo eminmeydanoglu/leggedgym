@@ -83,7 +83,9 @@ class TestV3Scorecard(unittest.TestCase):
 
 class TestV3SysIDTrace(unittest.TestCase):
     def test_mae_and_rmse_do_not_cancel_opposite_errors(self):
-        pred = torch.tensor([[2.0, -2.0], [-2.0, 2.0]])
+        # Genesis initialization in an earlier test may set Torch's global
+        # default device to CUDA; this unit contract intentionally uses NumPy.
+        pred = torch.tensor([[2.0, -2.0], [-2.0, 2.0]], device="cpu")
         truth = torch.zeros_like(pred)
         summary = _sysid_trace_summary(pred, truth)
         np.testing.assert_allclose(summary["error_mean"].numpy(), [0.0, 0.0])

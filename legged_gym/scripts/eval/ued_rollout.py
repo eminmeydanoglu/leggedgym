@@ -45,6 +45,7 @@ Usage (2 shards on a smaller GPU):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from pathlib import Path
@@ -172,7 +173,10 @@ def build_eval_env(task: str, num_envs: int, seed: int, cpu: bool):
     if SIMULATOR == "genesis":
         gs.init(backend=gs.cpu if cpu else gs.gpu, logging_level="warning")
 
-    env_cfg, train_cfg = task_registry.get_cfgs(name=task)
+    # Registry configs are singletons.  Bank-only overrides must not leak into
+    # a later training or config lookup in the same Python process.
+    registered_env_cfg, train_cfg = task_registry.get_cfgs(name=task)
+    env_cfg = copy.deepcopy(registered_env_cfg)
     env_cfg.env.num_envs = num_envs
     env_cfg.seed = seed
     apply_bank_eval_env_overrides(env_cfg)

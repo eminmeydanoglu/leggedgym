@@ -25,8 +25,10 @@ Protocol (why the numbers are comparable across checkpoints):
   * `auto_reset` stays ON so each env yields many episodes -> real distributions.
 
 Metrics are `MetricAccumulator`'s (fall_rate / mean_ep_len / falls_per_1k /
-mean_return / tracking_lin_err / tracking_ang_err), here reduced to scalars by
-averaging over envs.
+mean_return / tracking_lin_err / tracking_ang_err / spnte_lin / spnte_yaw),
+here reduced to scalars by averaging over envs. SPNTE's ``v_scale`` /
+``v_scale_yaw`` are derived dynamically from the pinned eval command range
+(see `_command_support_scale`) rather than left at the accumulator default.
 """
 
 from __future__ import annotations
@@ -56,6 +58,20 @@ def in_dist_command_ranges(env) -> Dict[str, list]:
     if hasattr(r, "heading"):
         ranges["heading"] = list(r.heading)
     return ranges
+
+
+def _command_support_scale(ranges: Dict[str, list], key: str, default: float = 1.0) -> float:
+    """SPNTE command-support scale for one command axis: max |endpoint|.
+
+    Falls back to ``default`` when ``key`` is absent from ``ranges`` (keeps
+    pre-SPNTE callers / configs without that axis working), and is floored at
+    a tiny epsilon so a degenerate [0, 0] range never divides by zero.
+    """
+    r = ranges.get(key)
+    if not r:
+        return default
+    lo, hi = r
+    return max(abs(float(lo)), abs(float(hi)), 1e-6)
 
 
 @torch.no_grad()
@@ -140,7 +156,9 @@ def run_indist_eval(
         # times out `warmup` steps early and its return is only partially counted.
         env.episode_length_buf.zero_()
 
-        acc = MetricAccumulator(env.num_envs, device)
+        v_scale = _command_support_scale(pin, "lin_vel_x")
+        v_scale_yaw = _command_support_scale(pin, "ang_vel_yaw")
+        acc = MetricAccumulator(env.num_envs, device, v_scale=v_scale, v_scale_yaw=v_scale_yaw)
         for _ in range(steps):
             state, rew, dones = adapter.step(env, adapter.act(state))
             cmd = env.commands
@@ -160,7 +178,11 @@ def run_indist_eval(
             )
 
         per_env = acc.compute()
-        metrics = {k: float(t.mean().item()) for k, t in per_env.items()}
+        # .float() before .mean(): some compute() entries (e.g. first_fall_step)
+        # are integer tensors, and recent torch versions raise on integer .mean()
+        # instead of implicitly casting. Pre-existing values are unaffected --
+        # this only changes which dtype computes the (already-float) average.
+        metrics = {k: float(t.float().mean().item()) for k, t in per_env.items()}
         # Eval V2 defines safety over the entire fixed observation window rather
         # than over a policy-dependent number of auto-reset episodes.
         metrics["episode_fall_rate"] = metrics["fall_rate"]

@@ -4,6 +4,7 @@ Pure helpers (filesystem + optional torch load of metadata only). Unit-testable
 without a simulator. Supports:
 
   * ``best_tracking`` -> ``best_tracking.pt``
+  * ``best_spnte`` -> ``best_spnte.pt`` (min spnte_lin checkpoint; see eval_v2)
   * ``best``     -> ``best_tracking.pt`` when present, otherwise legacy ``best.pt``
   * ``latest`` / ``-1`` -> highest ``model_<iter>.pt``
   * integer / digit string -> ``model_<iter>.pt``
@@ -27,14 +28,14 @@ def normalize_ckpt_spec(checkpoint: CkptSpec) -> Union[int, str]:
     if isinstance(checkpoint, str):
         s = checkpoint.strip()
         low = s.lower()
-        if low in ("best", "best_tracking", "latest"):
+        if low in ("best", "best_tracking", "best_spnte", "latest"):
             return low
         try:
             return int(s)
         except ValueError as e:
             raise ValueError(
                 f"Invalid checkpoint spec {checkpoint!r}: "
-                "expected 'best_tracking', 'best', 'latest', or an integer iteration"
+                "expected 'best_tracking', 'best_spnte', 'best', 'latest', or an integer iteration"
             ) from e
     raise TypeError(f"Invalid checkpoint spec type: {type(checkpoint)!r}")
 
@@ -42,7 +43,7 @@ def normalize_ckpt_spec(checkpoint: CkptSpec) -> Union[int, str]:
 def ckpt_kind(checkpoint: CkptSpec) -> str:
     """Short label for artifact metadata: named kind or '<iter>'."""
     spec = normalize_ckpt_spec(checkpoint)
-    if spec in ("best", "best_tracking"):
+    if spec in ("best", "best_tracking", "best_spnte"):
         return str(spec)
     if spec == "latest" or spec == -1:
         return "latest"
@@ -72,6 +73,8 @@ def resolve_checkpoint_path(run_dir: str, checkpoint: CkptSpec = -1) -> str:
 
     if spec == "best_tracking":
         path = os.path.join(run_dir, "best_tracking.pt")
+    elif spec == "best_spnte":
+        path = os.path.join(run_dir, "best_spnte.pt")
     elif spec == "best":
         tracking = os.path.join(run_dir, "best_tracking.pt")
         path = tracking if os.path.isfile(tracking) else os.path.join(run_dir, "best.pt")

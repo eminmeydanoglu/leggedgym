@@ -13,10 +13,19 @@
 campaign: v4_terrain
 artifact_root: logs/eval/v4_terrain
 simulator: genesis
-# Curriculum runs are promoted on ``best_tracking.pt`` and do not keep a fixed
-# model_3000.pt, so the final-checkpoint gate must be off.
+# Curriculum runs are promoted on a best_*.pt checkpoint and do not keep a
+# fixed model_3000.pt, so the final-checkpoint gate must be off.
 require_final_checkpoint: false
 training_seeds: [1]
+
+# Every model now resolves ``best_spnte.pt`` (the min spnte_lin checkpoint;
+# see eval_v2's checkpoint selection) rather than ``best_tracking.pt``, so the
+# campaign evaluates the SPNTE-selected policy. SPNTE is scored in parallel
+# with tracking in cmd_aggregate (see v3_eval.score_cell_on): the same gate
+# rule/thresholds below are reused unchanged for both metrics -- there are no
+# SPNTE-specific gate overrides because the gates (oracle stability on
+# fall_rate, the speed gate, the headroom gate) are physical, not tied to
+# which lower-is-better error field is being closed.
 
 # NOTE (data availability): only mlp / superset_oracle / dreamwaq / him_fixed are
 # currently trained under ``go2_v4_terrain_curriculum``.  sysid and rma exist so
@@ -29,32 +38,32 @@ models:
     task: go2_v4_mlp
     log_root: logs/go2_v4_terrain_curriculum
     run_pattern: "*_v4_mlp_genesis_seed{seed}"
-    checkpoint: best_tracking
+    checkpoint: best_spnte
   - label: SysID
     task: go2_v4_sysid
     log_root: logs/go2_v4_terrain_curriculum
     run_pattern: "*_v4_sysid_genesis_seed{seed}"
-    checkpoint: best_tracking
+    checkpoint: best_spnte
   - label: RMA
     task: go2_v4_rma
     log_root: logs/go2_v4_terrain_curriculum
     run_pattern: "*_v4_rma_genesis_seed{seed}"
-    checkpoint: best_tracking
+    checkpoint: best_spnte
   - label: DreamWaQ
     task: go2_v4_dreamwaq
     log_root: logs/go2_v4_terrain_curriculum
     run_pattern: "*_v4_dreamwaq_genesis_seed{seed}"
-    checkpoint: best_tracking
+    checkpoint: best_spnte
   - label: HIM-fixed
     task: go2_v4_him_fixed
     log_root: logs/go2_v4_terrain_curriculum
     run_pattern: "*_v4_him_fixed_genesis_seed{seed}"
-    checkpoint: best_tracking
+    checkpoint: best_spnte
   - label: Superset-Oracle
     task: go2_v4_superset_oracle
     log_root: logs/go2_v4_terrain_curriculum
     run_pattern: "*_v4_superset_oracle_genesis_seed{seed}"
-    checkpoint: best_tracking
+    checkpoint: best_spnte
 
 protocol:
   # A parallel environment is a measurement replica, not a training seed.  Must

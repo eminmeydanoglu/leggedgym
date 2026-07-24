@@ -174,6 +174,151 @@ class TestAdaptiveInferenceContract(unittest.TestCase):
             self.assertEqual(carried.read_bytes(), (old_run / "best_tracking.pt").read_bytes())
             self.assertEqual(resumed.best_tracking_key, (0.0, 0.25, 10.0))
 
+    def test_run_eval_selects_best_spnte_independently_of_best_tracking(self):
+        """best_spnte.pt tracks the min spnte_lin iteration; best_tracking.pt
+        keeps selecting on its own lexicographic tracking/fall rule. The two
+        checkpoints must be free to diverge to different iterations."""
+
+        def runner(log_dir):
+            obj = OnPolicyRunner.__new__(OnPolicyRunner)
+            actor_critic = torch.nn.Module()
+            actor_critic.actor = torch.nn.Linear(2, 1)
+            optimizer = torch.optim.Adam(actor_critic.parameters(), lr=1e-3)
+            obj.alg = mock.Mock(actor_critic=actor_critic, optimizer=optimizer)
+            obj.current_learning_iteration = 0
+            obj.best_eval_score = float("inf")
+            obj.best_tracking_key = None
+            obj.best_spnte_score = float("inf")
+            obj.best_spnte_key = None
+            obj.training_seed = 7
+            obj._active_schedule_start = 0
+            obj._active_schedule_range = [-0.5, 0.5]
+            obj._aux_optimizers = lambda: {}
+            obj.log_dir = str(log_dir)
+            obj.writer = None
+            # None (not a Mock): `save()` probes `env.cfg.env.ued_enabled` and
+            # a bare Mock auto-vivifies that as a truthy Mock, wrongly routing
+            # into the UED-only save/resume branch this test isn't exercising.
+            obj.env = None
+            obj.eval_steps, obj.eval_warmup, obj.eval_seed = 1100, 50, 12345
+            obj.eval_fall_guard = 0.25
+            return obj
+
+        # it=100: decent tracking, mediocre spnte. it=200: worse tracking but
+        # the best spnte. it=300: the best tracking but the worst spnte.
+        metrics_by_it = {
+            100: {"fall_rate": 0.0, "tracking_lin_err": 0.5, "tracking_ang_err": 0.5,
+                  "mean_return": 1.0, "mean_ep_len": 500.0, "spnte_lin": 0.6, "spnte_yaw": 0.5},
+            200: {"fall_rate": 0.0, "tracking_lin_err": 0.9, "tracking_ang_err": 0.9,
+                  "mean_return": 1.0, "mean_ep_len": 500.0, "spnte_lin": 0.2, "spnte_yaw": 0.5},
+            300: {"fall_rate": 0.0, "tracking_lin_err": 0.1, "tracking_ang_err": 0.1,
+                  "mean_return": 1.0, "mean_ep_len": 500.0, "spnte_lin": 0.9, "spnte_yaw": 0.9},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            obj = runner(tmp)
+            with mock.patch(
+                "legged_gym.scripts.eval.indist.run_indist_eval",
+                side_effect=[metrics_by_it[100], metrics_by_it[200], metrics_by_it[300]],
+            ):
+                for it in (100, 200, 300):
+                    obj._run_eval(it, adapter=mock.Mock())
+
+            best_tracking = torch.load(Path(tmp) / "best_tracking.pt", weights_only=False)
+            best_spnte = torch.load(Path(tmp) / "best_spnte.pt", weights_only=False)
+
+            # Best tracking score belongs to it=300 (lowest tracking error,
+            # all iterations equally "safe" at fall_rate=0).
+            self.assertEqual(best_tracking["infos"]["selected_iteration"], 300)
+            self.assertEqual(best_tracking["iter"], 300)
+
+            # Best SPNTE belongs to it=200 (lowest spnte_lin), independently.
+            self.assertEqual(best_spnte["infos"]["selected_iteration"], 200)
+            self.assertEqual(best_spnte["infos"]["selection_metric"], "spnte_v1")
+            self.assertAlmostEqual(best_spnte["infos"]["spnte_lin"], 0.2)
+            self.assertEqual(best_spnte["iter"], 200)
+            self.assertEqual(obj.best_spnte_key, (0.2, 200.0))
+
+    def test_resume_carries_best_spnte_artifact_to_new_run(self):
+        def runner(log_dir):
+            obj = OnPolicyRunner.__new__(OnPolicyRunner)
+            actor_critic = torch.nn.Module()
+            actor_critic.actor = torch.nn.Linear(2, 1)
+            optimizer = torch.optim.Adam(actor_critic.parameters(), lr=1e-3)
+            obj.alg = mock.Mock(actor_critic=actor_critic, optimizer=optimizer)
+            obj.current_learning_iteration = 10
+            obj.best_eval_score = float("inf")
+            # No best_tracking selection in this run -- isolates the
+            # best_spnte carry-forward from the (separately tested)
+            # best_tracking carry-forward logic.
+            obj.best_tracking_key = None
+            obj.best_spnte_score = 0.2
+            obj.best_spnte_key = (0.2, 10.0)
+            obj.training_seed = 7
+            obj._active_schedule_start = 0
+            obj._active_schedule_range = [-0.5, 0.5]
+            obj._aux_optimizers = lambda: {}
+            obj.log_dir = str(log_dir)
+            return obj
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_run, new_run = root / "old", root / "new"
+            old_run.mkdir()
+            source = runner(old_run)
+            source.save(str(old_run / "best_spnte.pt"), iteration=10)
+            source.save(str(old_run / "model_10.pt"), iteration=10)
+
+            resumed = runner(new_run)
+            resumed.best_tracking_key = None
+            resumed.best_spnte_key = None
+            resumed.load(str(old_run / "model_10.pt"))
+
+            carried = new_run / "best_spnte.pt"
+            self.assertTrue(carried.is_file())
+            self.assertEqual(carried.read_bytes(), (old_run / "best_spnte.pt").read_bytes())
+            self.assertEqual(resumed.best_spnte_key, (0.2, 10.0))
+
+    def test_best_tracking_resume_unaffected_by_missing_spnte_state(self):
+        """Checkpoints saved before this feature existed carry neither
+        best_spnte_key nor a best_spnte.pt sibling; resuming from one must
+        behave exactly as it did before (best_tracking.pt logic untouched)."""
+
+        def runner(log_dir):
+            obj = OnPolicyRunner.__new__(OnPolicyRunner)
+            actor_critic = torch.nn.Module()
+            actor_critic.actor = torch.nn.Linear(2, 1)
+            optimizer = torch.optim.Adam(actor_critic.parameters(), lr=1e-3)
+            obj.alg = mock.Mock(actor_critic=actor_critic, optimizer=optimizer)
+            obj.current_learning_iteration = 10
+            obj.best_eval_score = 0.25
+            obj.best_tracking_key = (0.0, 0.25, 10.0)
+            obj.training_seed = 7
+            obj._active_schedule_start = 0
+            obj._active_schedule_range = [-0.5, 0.5]
+            obj._aux_optimizers = lambda: {}
+            obj.log_dir = str(log_dir)
+            return obj
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_run, new_run = root / "old", root / "new"
+            old_run.mkdir()
+            source = runner(old_run)  # note: no best_spnte_score/key set at all
+            source.save(str(old_run / "best_tracking.pt"), iteration=10)
+            source.save(str(old_run / "model_10.pt"), iteration=10)
+
+            resumed = runner(new_run)
+            resumed.best_tracking_key = None
+            resumed.load(str(old_run / "model_10.pt"))
+
+            carried = new_run / "best_tracking.pt"
+            self.assertTrue(carried.is_file())
+            self.assertEqual(carried.read_bytes(), (old_run / "best_tracking.pt").read_bytes())
+            self.assertEqual(resumed.best_tracking_key, (0.0, 0.25, 10.0))
+            self.assertIsNone(resumed.best_spnte_key)
+            self.assertFalse((new_run / "best_spnte.pt").exists())
+
     def test_resume_fails_loudly_when_persisted_best_artifact_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
