@@ -107,17 +107,21 @@ main {
   display: flex;
   align-items: baseline;
   gap: 10px;
+  max-width: min(360px, 46vw);
 }
 
 .step-readout span {
   font: 500 28px/1 "Noto Mono", "DejaVu Sans Mono", ui-monospace, monospace;
   letter-spacing: -0.02em;
+  flex: 0 0 auto;
 }
 
 .step-readout small {
   color: var(--muted);
   font-size: 12px;
   text-transform: lowercase;
+  line-height: 1.25;
+  white-space: normal;
 }
 
 /* —— Controls —— */
@@ -173,48 +177,28 @@ main {
 /* —— Atlas —— */
 .atlas-section {
   position: relative;
-  min-height: 440px;
-  padding: 32px 32px 28px 64px;
+  min-height: 320px;
+  padding: 28px;
   background: var(--panel);
   border: 1px solid var(--hairline);
   box-shadow: var(--shadow);
-  overflow: hidden;
-}
-
-.panel-key {
-  position: absolute;
-  left: 18px;
-  top: 32px;
-  bottom: 28px;
-  width: 28px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.panel-key strong {
-  color: var(--ink);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.panel-key i {
-  width: 1px;
-  flex: 1;
-  min-height: 28px;
-  background: var(--hairline);
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .atlas {
   display: grid;
-  /* Keep panels large; wrap to a second row rather than shrinking below ~360px */
+  /* Multi-panel mode: keep panels large; wrap rather than shrinking below ~360px */
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
   gap: 44px 36px;
   align-items: start;
+}
+
+/* Default V5 view: one full-width map */
+.atlas.single {
+  grid-template-columns: 1fr;
+  gap: 0;
+  justify-items: start;
 }
 
 .heatmap-figure {
@@ -224,8 +208,13 @@ main {
   justify-self: stretch;
 }
 
+.heatmap-figure.single-map {
+  width: fit-content;
+  max-width: none;
+}
+
 .heatmap-figure h3 {
-  margin: 0 0 12px 54px;
+  margin: 0 0 10px 0;
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -239,15 +228,13 @@ main {
 
 .heatmap-figure h3 strong {
   color: var(--ink);
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
 }
 
 .heatmap-figure canvas {
-  width: 100%;
-  height: auto;
-  aspect-ratio: 1 / 1;
   display: block;
+  /* Size always set inline by setupCanvas (explicit CSS px × DPR) */
 }
 
 /* —— Sections —— */
@@ -311,11 +298,8 @@ main {
 }
 
 .signal-figure canvas {
-  width: 100%;
-  height: auto;
-  /* Slightly taller so axis ticks + arrows have room */
-  aspect-ratio: 1.15 / 1;
   display: block;
+  max-width: 100%;
 }
 
 .timelines {

@@ -59,6 +59,25 @@ test("lists recorded runs", async () => {
   assert.equal(payload.runs[0].last_step, 10);
 });
 
+test("persists optional run provenance and preserves it in the frame stream", async () => {
+  const annotated = structuredClone(frame);
+  annotated.metadata = {
+    run: { source: "leggedgym_v5_ued", curriculum_algorithm: "lp_acrl" },
+    frame: { stage_index: 3, sampler_revision: 3 },
+  };
+  const post = await fetch(`${origin}/api/runs/v5-run/frames`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(annotated),
+  });
+  assert.equal(post.status, 202);
+  const runs = await (await fetch(`${origin}/api/runs`)).json();
+  const run = runs.runs.find((item) => item.run_id === "v5-run");
+  assert.equal(run.run_metadata.curriculum_algorithm, "lp_acrl");
+  const history = await (await fetch(`${origin}/api/runs/v5-run/frames`)).json();
+  assert.equal(history.frames[0].metadata.frame.stage_index, 3);
+});
+
 test("rejects malformed frames", async () => {
   const bad = structuredClone(frame);
   bad.step = -1;

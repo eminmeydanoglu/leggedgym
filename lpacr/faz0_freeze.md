@@ -50,20 +50,21 @@ print(curriculum.config_fingerprint)
   `test_geometry_command_bank_and_eval_seed_shared_across_ued_arms`):
 
   ```
-  cb948539ac69de87003ffa9c9d6bffa42ae080d5418dd6459d942cf2e843a51a
+  dc10826138afc720cf828dd332f9415269cffd934a77054a464a6a0c451e2bce
   ```
 
   (regenerated from `build_ued_teacher(Go2V5LPACRLCfg())[1].fingerprint()` via
-  the command above, on this working tree, 2026-07-23). The fingerprint
+  the command above, on this working tree, 2026-07-24). The fingerprint
   payload is `{terrain_type_names, velocity_bin_edges, builder_parameters}`
   (`task_space.py:75-87`); a bare `TaskSpace()` with no `builder_parameters`
   (used only by CPU-only unit tests) hashes to a different, harmless value
   (`ce331c8b10c2f8b642b6c4795492adb3913e90293ff040cbebbb963ae9a8ef7c`) since it
   carries no geometry description at all.
 - **Curriculum config fingerprint** (`{algorithm, stage_length_control_steps,
-  beta}`, `legged_gym/utils/ued/episode_curriculum.py:103-106`) for
-  `lp_acrl` at the frozen stage length/beta below:
-  `c1a0682c13675e2b1d64a3159ef58622797ae8c4221848b7a4c7c6e48de7724a`.
+  beta, epsilon, adaptive-temperature controller parameters}`,
+  `legged_gym/utils/ued/episode_curriculum.py`) for `lp_acrl` at the frozen
+  stage length/controller settings below:
+  `d4125e462b3e8b6f06df77251d37ab2dc686e3c21fbaa407c5c8439ca461d321`.
 
 ## 2. Standstill rho (solun_plani.md §4 "Standstill kontratı", §14.4)
 
@@ -107,22 +108,28 @@ print(curriculum.config_fingerprint)
   completed moving-task episode that stage (standstill never reaches the
   curriculum): `observed = self._stage_episode_counts > 0`
   (`legged_gym/utils/ued/episode_curriculum.py:186`).
-- Cells that were *not* observed this stage do **not** get a fabricated LP
-  score. Their existing probability mass is retained verbatim
-  (`episode_curriculum.py:192-199`: `progress_mask = observed &
-  self._observed_masks`; only `progress_mask` cells get a new softmax score,
-  scaled so the retained mass plus the redistributed mass still sums to 1).
-  This is the concrete mechanism behind §5's "Bir stage'de yeterli gözlem
-  almayan hücre için sahte reward yazılmaz."
+- Cells that were *not* observed in two consecutive stages do **not** get a
+  fabricated return or reported LP value. Eq. 7 rebuilds the whole
+  distribution over the complete task set; cells without a measurable delta
+  receive the neutral softmax input `LP=0`, while `current_returns` and the
+  reported `learning_progress` remain `NaN`. Thus missing data stays explicit
+  in artifacts and cannot become a permanently starved retained-mass state.
 - The very first stage builds only `R_0` and produces no LP (`_observed_masks`
   starts all-`False`, so `progress_mask` is empty until the second valid
   measurement — §5 "İlk stage yalnız `R_0`yı kurar").
 
 ## 5. Beta procedure + chosen value (solun_plani.md §5, §11 Faz B)
 
-- `V5_BETA = 1.0` (`go2_v5_config.py:49-53`) is the **frozen starting value**
-  for the Faz-0 pilot, explicitly documented as pilot-revisable but only via a
-  re-freeze in this file and in `go2_v5_config.py`, never tuned in-flight.
+- `V5_BETA = 2.5` is the adaptive controller's starting temperature and
+  `V5_EPSILON = 0.03` is its fixed uniform exploration floor
+  (`go2_v5_config.py`). `temperature_mode = "adaptive_ess"` uses the
+  confidence-gated per-stage signal to choose a target effective sample size,
+  solves within `beta_min = 0.75` and `beta_max = 8.0`, then smooths with
+  `beta_ema = 0.8`. The frozen guardrails are
+  `target_ess_ratio_min = 0.5`, `max_cell_probability = 0.08`,
+  `min_stage_episodes_for_lp = 16`, and `confidence_scale = 1.0`. Any future
+  revision requires a new validation sweep and re-freeze here and in config;
+  these parameters are never tuned in-flight.
 - Softmax temperature use: `_softmax(values, beta)` divides the max-shifted
   score by `beta` before `exp`/normalize, in `float64`, and raises on
   non-finite input or non-finite/non-positive normalizer

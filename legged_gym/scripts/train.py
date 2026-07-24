@@ -46,6 +46,12 @@ def _simulator_versions():
     return versions
 
 
+def _dashboard_requested(args) -> bool:
+    """Keep Curriculum Atlas strictly opt-in (CLI or explicit environment)."""
+    env_value = os.getenv("LPACRL_DASHBOARD", "").strip().lower()
+    return bool(getattr(args, "dashboard", False)) or env_value in {"1", "true", "yes", "on"}
+
+
 def write_run_manifest(log_dir, args, env_cfg, train_cfg):
     """Write run_manifest.json into the run folder: full provenance for the run
     so a checkpoint can be traced back to its exact protocol (see codex_plan.md
@@ -166,8 +172,42 @@ def train(args):
     # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
     write_run_manifest(log_dir, args, env_cfg, train_cfg)
 
-    # Start training session
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    # Curriculum Atlas is deliberately attached only after the UED teacher and
+    # runner exist.  Disabled runs import no dashboard module, create no worker
+    # thread, and do not touch their reset/training semantics.
+    dashboard_bridge = None
+    if _dashboard_requested(args):
+        from lpacr.dashboard.v5_integration import create_v5_dashboard_bridge
+
+        dashboard_url = (
+            getattr(args, "dashboard_url", None)
+            or os.getenv("LPACRL_DASHBOARD_URL")
+            or "http://127.0.0.1:8765"
+        )
+        default_run_id = f"{args.task}-{os.path.basename(os.path.normpath(log_dir))}"
+        dashboard_bridge = create_v5_dashboard_bridge(
+            env,
+            task=args.task,
+            training_seed=train_cfg.seed,
+            server_url=dashboard_url,
+            run_id=getattr(args, "dashboard_run_id", None) or default_run_id,
+        )
+        if dashboard_bridge is None:
+            print("[ued-dashboard] requested, but this non-UED arm has no stage frames to publish")
+        else:
+            env.set_ued_snapshot_listener(dashboard_bridge.publish)
+            print(
+                f"[ued-dashboard] enabled: run={dashboard_bridge.run_id} "
+                f"server={dashboard_url}"
+            )
+
+    # Start training session.  ``close`` flushes the final stage frame without
+    # changing error propagation from PPO training.
+    try:
+        ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    finally:
+        if dashboard_bridge is not None:
+            dashboard_bridge.close()
 
 if __name__ == '__main__':
     args = get_args()

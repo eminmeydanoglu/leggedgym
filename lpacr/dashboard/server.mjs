@@ -44,6 +44,11 @@ export function validateFrame(frame) {
       throw new Error(`Metric ${name} contains a non-finite value.`);
     }
   }
+  if (frame.metadata !== undefined && (
+    !frame.metadata || typeof frame.metadata !== "object" || Array.isArray(frame.metadata)
+  )) {
+    throw new Error("metadata must be an object when supplied.");
+  }
   return frame;
 }
 
@@ -88,11 +93,13 @@ async function storeFrame(runId, frame) {
   await mkdir(runDir, { recursive: true });
   const metadataPath = join(runDir, "metadata.json");
   if (!existsSync(metadataPath)) {
+    const runMetadata = frame.metadata?.run;
     await writeFile(metadataPath, JSON.stringify({
       run_id: runId,
       created_at: frame.wall_time,
       task_space: frame.task_space,
       metric_names: Object.keys(frame.metrics),
+      ...(runMetadata ? { run_metadata: runMetadata } : {}),
     }, null, 2));
   }
   await appendFile(join(runDir, "frames.ndjson"), `${JSON.stringify(frame)}\n`);

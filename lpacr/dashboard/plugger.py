@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import math
 import queue
 import threading
 import time
@@ -51,6 +52,7 @@ class CurriculumDashboardPlugger:
         run_id: str,
         task_space: TaskSpace,
         *,
+        metadata: Mapping[str, object] | None = None,
         server_url: str = "http://127.0.0.1:8765",
         queue_size: int = 32,
         timeout_seconds: float = 2.0,
@@ -58,6 +60,11 @@ class CurriculumDashboardPlugger:
     ) -> None:
         self.run_id = run_id
         self.task_space = task_space
+        # Run metadata is deliberately optional.  Existing generic users keep
+        # precisely the old frame shape, while a training adapter can attach
+        # provenance without teaching this framework-agnostic transport about
+        # PPO, Genesis, or a particular curriculum implementation.
+        self.metadata = dict(metadata) if metadata is not None else None
         self.endpoint = f"{server_url.rstrip('/')}/api/runs/{run_id}/frames"
         self.timeout_seconds = timeout_seconds
         self.retry_seconds = retry_seconds
@@ -67,7 +74,14 @@ class CurriculumDashboardPlugger:
         self._thread.start()
         atexit.register(self.close)
 
-    def log(self, step: int, metrics: Mapping[str, object], *, wall_time: float | None = None) -> bool:
+    def log(
+        self,
+        step: int,
+        metrics: Mapping[str, object],
+        *,
+        wall_time: float | None = None,
+        frame_metadata: Mapping[str, object] | None = None,
+    ) -> bool:
         """Queue one snapshot. Returns False only when an older frame was dropped."""
         if self._closed:
             raise RuntimeError("Plugger is closed.")
@@ -83,13 +97,24 @@ class CurriculumDashboardPlugger:
             data = values.tolist() if hasattr(values, "tolist") else list(values)
             if len(data) != expected:
                 raise ValueError(f"{name} has {len(data)} values; expected {expected}")
-            flattened[name] = [None if value is None else float(value) for value in data]
+            # V5 uses NaN to mean "this cell has not been observed".  JSON and
+            # the dashboard schema represent that truthfully as null instead of
+            # emitting non-standard NaN tokens that Node must reject.
+            flattened[name] = [
+                None if value is None or not math.isfinite(float(value)) else float(value)
+                for value in data
+            ]
         frame = {
             "step": int(step),
             "wall_time": float(wall_time if wall_time is not None else time.time()),
             "task_space": self.task_space.as_dict(),
             "metrics": flattened,
         }
+        if self.metadata is not None or frame_metadata is not None:
+            frame["metadata"] = {
+                **({"run": self.metadata} if self.metadata is not None else {}),
+                **({"frame": dict(frame_metadata)} if frame_metadata is not None else {}),
+            }
         dropped = False
         try:
             self._queue.put_nowait(frame)

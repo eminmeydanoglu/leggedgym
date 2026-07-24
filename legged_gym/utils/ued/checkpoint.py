@@ -7,7 +7,9 @@ from typing import Mapping
 # v2 dropped the standstill-era ``invalid_outcome_count`` and
 # ``valid_task_completion_counts`` fields: standstill is now a reserved mixture
 # bucket that never reaches the curriculum, so every observed outcome is valid.
-SCHEMA_VERSION = 2
+# v3 adds per-cell return uncertainty and deterministic adaptive-temperature
+# controller state.
+SCHEMA_VERSION = 3
 
 
 def validate_checkpoint_state(
@@ -17,9 +19,12 @@ def validate_checkpoint_state(
     required = {
         "schema_version", "algorithm", "task_space_fingerprint", "config_fingerprint",
         "rng_bit_generator_state", "stage_index", "sampler_revision", "stage_start_global_steps",
-        "probabilities", "previous_returns", "current_returns", "learning_progress", "observed_masks",
-        "stage_return_sums", "stage_episode_counts", "task_assignment_counts", "task_completion_counts",
-        "transition_occupancy", "source_label",
+        "probabilities", "previous_returns", "current_returns",
+        "previous_return_sems", "current_return_sems", "learning_progress",
+        "effective_learning_progress", "observed_masks", "stage_return_sums",
+        "stage_return_sq_sums", "stage_episode_counts", "task_assignment_counts",
+        "task_completion_counts", "transition_occupancy", "source_label",
+        "effective_beta", "target_ess", "signal_quality", "ess_guard_uniform_mix",
     }
     missing = required.difference(state)
     if missing:

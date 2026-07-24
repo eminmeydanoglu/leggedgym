@@ -1,6 +1,8 @@
 import json
 import sys
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -20,6 +22,39 @@ class TaskSpaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected 2"):
             plugger.log(1, {"performance": [0.1]})
         plugger.close()
+
+    def test_nan_and_optional_metadata_use_valid_dashboard_json(self):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["content-length"])
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(202)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            plugger = CurriculumDashboardPlugger(
+                "unit-metadata", TaskSpace(("a",), {"a": [1, 2]}),
+                server_url=f"http://127.0.0.1:{server.server_port}",
+                metadata={"source": "v5"},
+            )
+            plugger.log(10, {"performance": [float("nan"), 3.0]}, frame_metadata={"stage_index": 1})
+            self.assertTrue(plugger.flush())
+            plugger.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(received[0]["metrics"]["performance"], [None, 3.0])
+        self.assertEqual(received[0]["metadata"]["run"]["source"], "v5")
+        self.assertEqual(received[0]["metadata"]["frame"]["stage_index"], 1)
 
 
 if __name__ == "__main__":

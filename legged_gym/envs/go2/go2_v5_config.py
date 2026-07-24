@@ -50,21 +50,21 @@ V5_STANDSTILL_RHO = 0.12
 # update fires -- enough for a per-cell mean-return estimate.
 V5_STAGE_LENGTH_CONTROL_STEPS = 2000
 
-# LP-ACRL/ALP softmax temperature for the stateless Eq. 7 rebuild (unnormalized
-# LP).  The article does not specify beta.  beta=1.0 collapses the softmax below
-# the sampling-coverage floor at our raw ~20-30 return scale (a single hot cell
-# drives the rest to ~2e-9, an absorbing state), so it was re-frozen from the
-# coverage sweep: tests/verify_coverage_regime.py shows beta=5 keeps the coldest
-# cell observable (>=16 episodes/stage) across LP deltas up to 30 while still
-# concentrating (max_cell_prob 0.2-0.83), so no epsilon floor is needed.  Any
-# future revision must be re-frozen here from that sweep, not tuned in-flight.
-V5_BETA = 5.0
+# Initial/fixed LP temperature.  Adaptive mode treats this as the controller's
+# starting value, then solves a confidence-gated target ESS every stage.
+V5_BETA = 2.5
 
-# Uniform exploration floor mixed into the Eq. 7 softmax (episode_curriculum
-# EpisodeCurriculum.epsilon).  0.0 keeps the update identical to the paper; the
-# coverage sweep shows beta alone holds coverage at the V5 budget, so it stays
-# off.  Raise (e.g. 0.03-0.05) only if a smaller-budget regime starves cells.
-V5_EPSILON = 0.0
+# Fixed uniform exploration floor; adaptive behavior belongs to the ESS
+# controller so coverage protection and exploitation remain separate.
+V5_EPSILON = 0.03
+V5_TEMPERATURE_MODE = "adaptive_ess"
+V5_BETA_MIN = 0.75
+V5_BETA_MAX = 8.0
+V5_BETA_EMA = 0.8
+V5_TARGET_ESS_RATIO_MIN = 0.5
+V5_MAX_CELL_PROBABILITY = 0.08
+V5_MIN_STAGE_EPISODES_FOR_LP = 16
+V5_CONFIDENCE_SCALE = 1.0
 
 # Deterministic UED training-grid geometry seed (terrain.ued_training_seed).
 # Shared by all three UED-teacher arms so their static 4x6 taxonomy grid is
@@ -144,6 +144,14 @@ class Go2V5CommonCfg(Go2BenchmarkV4TerrainCfg):
         stage_length_control_steps: int = V5_STAGE_LENGTH_CONTROL_STEPS
         beta: float = V5_BETA
         epsilon: float = V5_EPSILON
+        temperature_mode: str = V5_TEMPERATURE_MODE
+        beta_min: float = V5_BETA_MIN
+        beta_max: float = V5_BETA_MAX
+        beta_ema: float = V5_BETA_EMA
+        target_ess_ratio_min: float = V5_TARGET_ESS_RATIO_MIN
+        max_cell_probability: float = V5_MAX_CELL_PROBABILITY
+        min_stage_episodes_for_lp: int = V5_MIN_STAGE_EPISODES_FOR_LP
+        confidence_scale: float = V5_CONFIDENCE_SCALE
         seed: int | None = None
 
 
@@ -307,6 +315,14 @@ def build_ued_teacher(env_cfg):
         stage_length_control_steps=int(env_cfg.curriculum.stage_length_control_steps),
         beta=float(env_cfg.curriculum.beta),
         epsilon=float(getattr(env_cfg.curriculum, "epsilon", 0.0)),
+        temperature_mode=str(getattr(env_cfg.curriculum, "temperature_mode", "fixed")),
+        beta_min=float(getattr(env_cfg.curriculum, "beta_min", 0.75)),
+        beta_max=float(getattr(env_cfg.curriculum, "beta_max", 8.0)),
+        beta_ema=float(getattr(env_cfg.curriculum, "beta_ema", 0.8)),
+        target_ess_ratio_min=float(getattr(env_cfg.curriculum, "target_ess_ratio_min", 0.5)),
+        max_cell_probability=float(getattr(env_cfg.curriculum, "max_cell_probability", 0.08)),
+        min_stage_episodes_for_lp=int(getattr(env_cfg.curriculum, "min_stage_episodes_for_lp", 16)),
+        confidence_scale=float(getattr(env_cfg.curriculum, "confidence_scale", 1.0)),
         seed=seed,
     )
     return curriculum, task_space

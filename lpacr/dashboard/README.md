@@ -51,9 +51,11 @@ task_space = TaskSpace(
 
 dashboard = CurriculumDashboardPlugger("lpacrl-seed-1", task_space)
 
-# Her curriculum update'inden sonra:
+# Her curriculum update'inden sonra.
+# `step` is the publisher's timeline key (V5 UED uses global_control_steps,
+# not PPO iteration). The UI labels it "control step".
 dashboard.log(
-    iteration,
+    step,  # e.g. global_control_steps
     {
         "performance": reward_tensor,
         "learning_progress": lp_tensor,
@@ -73,6 +75,39 @@ Training sonunda bekleyen son frame'leri göndermek için:
 ```python
 dashboard.close()
 ```
+
+### V5 UED gerçek eğitim entegrasyonu
+
+`go2_v5_uniform`, `go2_v5_lpacrl` ve `go2_v5_alp` için köprü artık gerçek
+`EpisodeCurriculum.advance()` sonucunu yayınlar; demo verisi üretmez. Varsayılan
+olarak kapalıdır: dashboard modülü import edilmez, thread oluşturulmaz ve
+eğitimin reset/sampling davranışı değişmez.
+
+Önce dashboard sunucusunu açın, ardından training'i açıkça opt-in başlatın:
+
+```bash
+cd /home/emin/code/online-estimation/genesis-wp/LeggedGym-Ex/lpacr/dashboard
+npm start
+
+cd /home/emin/code/online-estimation/genesis-wp/LeggedGym-Ex
+env SIMULATOR=genesis WANDB_MODE=disabled .venv/bin/python -m legged_gym.scripts.train \
+  --task go2_v5_lpacrl --headless --dashboard
+```
+
+`--dashboard_url http://127.0.0.1:9000` ve `--dashboard_run_id benim-runim`
+isteğe bağlıdır. CLI yerine `LPACRL_DASHBOARD=1` ile,
+sunucu adresi için `LPACRL_DASHBOARD_URL` ile de açılabilir.
+
+Her tamamlanmış stage için tek frame yazılır: `performance` (cell return),
+`learning_progress`, `sampling_probability`, stage episode sayısı, assignment
+ve completion sayıları. V5'in gözlenmemiş cell'leri `null` olarak kalır; sahte
+sıfır return üretilmez. Run metadata, task/seed/algorithm ve V5 fingerprint'lerini;
+frame metadata ise stage/revision, curriculum diagnostics ve ayrık standstill
+bucket özetini taşır. NDJSON replay ve SSE frame'i bu opsiyonel metadata alanını
+aynen korur.
+
+`go2_v5_handcrafted` UED teacher/stage üretmediği için dashboard istenirse
+anlamlı bir no-op yapar ve eğitim normal sürer.
 
 Context manager zorunlu değildir; process normal kapanırsa `atexit` de son
 frame'leri göndermeyi dener.

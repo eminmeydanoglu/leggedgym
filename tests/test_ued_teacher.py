@@ -121,18 +121,21 @@ def test_negative_lp_is_absolute_only_for_alp():
     assert absolute.probabilities()[0] > absolute.probabilities()[1]
 
 
-def test_missing_task_fallback_retains_its_previous_probability():
+def test_missing_task_uses_neutral_lp_without_fabricating_a_return():
     curriculum = LPACRLEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10, beta=0.2, seed=5)
     _advance_with_return(curriculum, [0, 1, 2], [0.0, 0.0, 0.0], 10)
-    before = curriculum.probabilities()
-    # Cell 2 is not observed this stage, so its probability must not move.
     rev = curriculum.sampler_revision
     curriculum.observe(_outcomes([0, 1], [1.0, 0.0], assigned_revision=rev, completion_revision=rev))
     snapshot = curriculum.advance(20)
     assert snapshot is not None
     after = curriculum.probabilities()
-    assert after[2] == pytest.approx(before[2])
+    # Eq. 7 rebuilds the whole distribution. Missing consecutive-stage LP is
+    # the neutral softmax input 0, but remains NaN in reports so it cannot be
+    # mistaken for a measured return/progress.
+    assert after[0] > after[1]
+    assert after[2] == pytest.approx(after[1])
     assert np.isnan(snapshot.current_returns[2])
+    assert np.isnan(snapshot.learning_progress[2])
     assert snapshot.transition_occupancy[f"{rev}:{rev}"] == 2
 
 
@@ -267,6 +270,112 @@ def test_public_scalar_inputs_and_softmax_remain_well_defined_at_extremes():
         curriculum.advance(10.5)
     probabilities = curriculum._softmax(np.array([-1e308, 1e308]), curriculum.beta)
     np.testing.assert_allclose(probabilities, [0.0, 1.0])
+
+
+def _adaptive_stage(curriculum, means, *, spread=0.0, episodes=20, step):
+    task_ids = np.repeat(np.arange(84, dtype=np.int64), episodes)
+    offsets = np.tile(np.linspace(-spread, spread, episodes), 84)
+    returns = np.repeat(np.asarray(means, dtype=np.float64), episodes) + offsets
+    return _advance_with_return(curriculum, task_ids, returns, step)
+
+
+def test_adaptive_temperature_hits_target_ess_for_reliable_lp():
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(),
+        stage_length_control_steps=10,
+        beta=2.5,
+        epsilon=0.03,
+        temperature_mode="adaptive_ess",
+        beta_min=0.05,
+        beta_max=8.0,
+        beta_ema=0.0,
+        target_ess_ratio_min=0.5,
+        min_stage_episodes_for_lp=16,
+        seed=13,
+    )
+    _adaptive_stage(curriculum, np.zeros(84), step=10)
+    snapshot = _adaptive_stage(curriculum, np.linspace(-2.0, 2.0, 84), step=20)
+    diagnostics = snapshot.diagnostics
+    assert diagnostics["signal_quality"] == pytest.approx(1.0)
+    assert diagnostics["target_ess"] == pytest.approx(42.0)
+    assert diagnostics["effective_sample_size"] == pytest.approx(42.0, rel=1e-6)
+    assert diagnostics["min_cell_probability"] >= 0.03 / 84
+    assert 0.05 <= diagnostics["effective_beta"] <= 8.0
+
+
+def test_adaptive_temperature_returns_toward_uniform_when_lp_is_noisy():
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(),
+        stage_length_control_steps=10,
+        beta=2.5,
+        epsilon=0.03,
+        temperature_mode="adaptive_ess",
+        beta_min=0.05,
+        beta_max=8.0,
+        beta_ema=0.0,
+        target_ess_ratio_min=0.5,
+        min_stage_episodes_for_lp=16,
+        seed=14,
+    )
+    _adaptive_stage(curriculum, np.zeros(84), spread=10.0, step=10)
+    snapshot = _adaptive_stage(
+        curriculum, np.linspace(-0.1, 0.1, 84), spread=10.0, step=20
+    )
+    diagnostics = snapshot.diagnostics
+    assert diagnostics["signal_quality"] < 0.1
+    assert diagnostics["target_ess"] > 79.0
+    # The configured beta floor may make the distribution safer (more
+    # uniform) than requested; it must never make it more concentrated.
+    assert diagnostics["effective_sample_size"] >= diagnostics["target_ess"]
+
+
+def test_adaptive_checkpoint_restores_uncertainty_and_controller_state():
+    kwargs = dict(
+        stage_length_control_steps=10,
+        beta=2.5,
+        epsilon=0.03,
+        temperature_mode="adaptive_ess",
+        beta_ema=0.4,
+        seed=15,
+    )
+    source = LPACRLEpisodeCurriculum(TaskSpace(), **kwargs)
+    _adaptive_stage(source, np.zeros(84), spread=1.0, step=10)
+    _adaptive_stage(source, np.linspace(-1.0, 1.0, 84), spread=1.0, step=20)
+    state = source.state_dict()
+    restored = LPACRLEpisodeCurriculum(TaskSpace(), **{**kwargs, "seed": 999})
+    restored.load_state_dict(state)
+    np.testing.assert_array_equal(source.probabilities(), restored.probabilities())
+    assert restored.diagnostics()["effective_beta"] == pytest.approx(
+        source.diagnostics()["effective_beta"]
+    )
+    np.testing.assert_array_equal(
+        source.sample(500, global_control_steps=20).task_ids,
+        restored.sample(500, global_control_steps=20).task_ids,
+    )
+
+
+def test_adaptive_guards_survive_abrupt_lp_scale_change():
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(),
+        stage_length_control_steps=10,
+        beta=0.75,
+        epsilon=0.03,
+        temperature_mode="adaptive_ess",
+        beta_min=0.05,
+        beta_max=8.0,
+        beta_ema=0.95,
+        target_ess_ratio_min=0.5,
+        max_cell_probability=0.08,
+        min_stage_episodes_for_lp=16,
+        seed=16,
+    )
+    _adaptive_stage(curriculum, np.zeros(84), step=10)
+    _adaptive_stage(curriculum, np.linspace(-0.05, 0.05, 84), step=20)
+    snapshot = _adaptive_stage(curriculum, np.linspace(-20.0, 20.0, 84), step=30)
+    diagnostics = snapshot.diagnostics
+    assert diagnostics["effective_sample_size"] >= diagnostics["target_ess"] - 1e-6
+    assert diagnostics["max_cell_probability"] <= 0.08 + 1e-12
+    assert diagnostics["min_cell_probability"] >= 0.03 / 84
 
 
 def test_teacher_modules_have_no_forbidden_imports():

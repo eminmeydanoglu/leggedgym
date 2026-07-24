@@ -95,6 +95,9 @@ class LeggedRobot(BaseTask):
         # complete legacy reset and command path for every existing task.
         self.ued_adapter = None
         self.episode_curriculum = None
+        # Optional observability hook.  The UED environment never imports the
+        # dashboard: a launcher may install a callable after construction.
+        self._ued_snapshot_listener = None
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, sim_device, headless)
         
@@ -141,6 +144,30 @@ class LeggedRobot(BaseTask):
         self._assign_ued_batch(env_ids)
         self._resample_commands(env_ids)
         self.ued_adapter.clear_episode_accumulators(env_ids)
+
+    def set_ued_snapshot_listener(self, listener) -> None:
+        """Install an optional completed-stage observer for UED telemetry.
+
+        ``None`` removes the observer.  This is a deliberately narrow hook so
+        curriculum sampling and reset semantics stay independent of any UI.
+        """
+        if listener is not None and not callable(listener):
+            raise TypeError("UED snapshot listener must be callable or None")
+        self._ued_snapshot_listener = listener
+
+    def _emit_ued_snapshot(self, snapshot) -> None:
+        """Best-effort observer boundary: telemetry may never stop training."""
+        listener = getattr(self, "_ued_snapshot_listener", None)
+        if listener is None:
+            return
+        try:
+            listener(snapshot)
+        except Exception as exc:
+            # Disable a broken observer after the first failure.  The snapshot
+            # itself is already committed by the teacher, so retrying here
+            # would only risk repeating an I/O/configuration failure.
+            self._ued_snapshot_listener = None
+            print(f"[ued-dashboard] disabled after publish error: {exc}")
 
     def _active_ued_adapter(self):
         if getattr(self.cfg.env, "ued_enabled", False):
@@ -356,7 +383,9 @@ class LeggedRobot(BaseTask):
         # standstill off from the curriculum) before drawing their replacements.
         if ued_adapter is not None:
             self._observe_ued_outcomes(env_ids)
-            self.episode_curriculum.advance(self.common_step_counter)
+            snapshot = self.episode_curriculum.advance(self.common_step_counter)
+            if snapshot is not None:
+                self._emit_ued_snapshot(snapshot)
             self._assign_ued_batch(env_ids)
         # update curriculum
         if self.cfg.terrain.curriculum and ued_adapter is None:

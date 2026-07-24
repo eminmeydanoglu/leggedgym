@@ -17,7 +17,10 @@
           <button id="liveButton" class="active">Live</button>
           <button id="historyButton">History</button>
         </nav>
-        <div class="step-readout"><span id="stepValue">—</span><small>iteration</small></div>
+        <div class="step-readout">
+          <span id="stepValue">—</span>
+          <small id="stepLabel">control step</small>
+        </div>
       </header>
 
       <section class="controls" aria-label="Chart controls">
@@ -30,11 +33,6 @@
       </section>
 
       <section class="atlas-section">
-        <div class="panel-key">
-          <span>Panels</span>
-          <strong id="panelDimension">—</strong>
-          <i aria-hidden="true"></i>
-        </div>
         <div id="atlas" class="atlas" aria-live="polite"></div>
       </section>
 
