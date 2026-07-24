@@ -31,6 +31,12 @@ class EpisodeOutcomeBatch:
     off before calling ``observe`` (see the standstill mixture in
     ``legged_robot._assign_ued_batch``), so every outcome in this batch is a
     real LP cell with a finite return.  There is no per-episode validity flag.
+
+    Learning-progress admission (see :meth:`_FiniteEpisodeCurriculum.observe`):
+    only outcomes with ``assigned_revision`` equal to the currently open
+    ``sampler_revision`` and ``episode_lengths > 0`` update stage return
+    averages.  Late completions (assigned under a previous revision) stay in
+    provenance counters but do not contaminate the open stage.
     """
 
     task_ids: np.ndarray
@@ -78,15 +84,21 @@ class _FiniteEpisodeCurriculum:
         *,
         stage_length_control_steps: int,
         beta: float = 1.0,
+        epsilon: float = 0.0,
         seed: int | None = None,
     ) -> None:
         if stage_length_control_steps <= 0:
             raise ValueError("stage_length_control_steps must be positive")
         if not np.isfinite(beta) or beta <= 0:
             raise ValueError("beta must be finite and positive")
+        if not np.isfinite(epsilon) or not (0.0 <= epsilon < 1.0):
+            raise ValueError("epsilon must be finite and in [0, 1)")
         self.task_space = task_space
         self.stage_length_control_steps = int(stage_length_control_steps)
         self.beta = float(beta)
+        # Uniform exploration floor mixed into the Eq. 7 softmax (0 disables it,
+        # keeping the update byte-identical to the paper).  See ``advance``.
+        self.epsilon = float(epsilon)
         self._rng = np.random.Generator(np.random.PCG64(seed))
         self._n = task_space.size
         self._probabilities = np.full(self._n, 1.0 / self._n, dtype=np.float64)
@@ -103,11 +115,14 @@ class _FiniteEpisodeCurriculum:
         self._task_assignment_counts = np.zeros(self._n, dtype=np.int64)
         self._task_completion_counts = np.zeros(self._n, dtype=np.int64)
         self._transition_occupancy: dict[str, int] = {}
+        # Completions assigned under a previous sampler_revision (stage already
+        # closed).  Tracked for diagnostics only; never enter stage return sums.
+        self._late_outcome_count = 0
         self._snapshots: list[StageSnapshot] = []
 
     @property
     def config_fingerprint(self) -> str:
-        payload = {"algorithm": self.algorithm, "stage_length_control_steps": self.stage_length_control_steps, "beta": self.beta}
+        payload = {"algorithm": self.algorithm, "stage_length_control_steps": self.stage_length_control_steps, "beta": self.beta, "epsilon": self.epsilon}
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
@@ -151,6 +166,19 @@ class _FiniteEpisodeCurriculum:
         )
 
     def observe(self, outcomes: EpisodeOutcomeBatch) -> None:
+        """Ingest completed moving-task episodes.
+
+        Provenance (completion counts, transition occupancy) records every
+        outcome.  Stage return / LP accumulators only accept outcomes assigned
+        under the currently open ``sampler_revision``: late completions
+        (previous revision) are censored from LP rather than written into the
+        open stage, and assigned revisions ahead of the open sampler are
+        rejected fail-closed.
+
+        Callers pass only genuinely-run episodes; never-stepped startup ghosts
+        are filtered upstream at the episode-lifecycle boundary (see
+        ``LeggedRobot._observe_ued_outcomes``), not re-checked here.
+        """
         arrays = (
             outcomes.task_ids, outcomes.assigned_revision, outcomes.episodic_returns,
             outcomes.episode_lengths, outcomes.terminal_reasons,
@@ -164,6 +192,10 @@ class _FiniteEpisodeCurriculum:
         assigned_revisions = np.asarray(outcomes.assigned_revision)
         if not np.issubdtype(assigned_revisions.dtype, np.integer) or np.any(assigned_revisions < 0):
             raise ValueError("outcome assigned_revision must be non-negative integers")
+        if np.any(assigned_revisions > self.sampler_revision):
+            raise ValueError(
+                "outcome assigned_revision cannot be ahead of the open sampler revision"
+            )
         completion_revision = self._non_negative_integer(
             outcomes.completion_revision, name="outcome completion_revision"
         )
@@ -172,7 +204,7 @@ class _FiniteEpisodeCurriculum:
         if not np.issubdtype(episode_lengths.dtype, np.integer) or np.any(episode_lengths < 0):
             raise ValueError("outcome episode_lengths must be non-negative integers")
         # Every outcome is a real moving-task episode (standstill is split off
-        # upstream), so all returns must be finite and all feed learning progress.
+        # upstream), so all returns must be finite.  LP admission is narrower.
         if np.any(~np.isfinite(returns)):
             raise ValueError("curriculum outcomes require finite returns")
         ids = task_ids.astype(np.int64, copy=False)
@@ -180,8 +212,19 @@ class _FiniteEpisodeCurriculum:
         for assigned in assigned_revisions:
             key = f"{int(assigned)}:{completion_revision}"
             self._transition_occupancy[key] = self._transition_occupancy.get(key, 0) + 1
-        self._stage_return_sums += np.bincount(ids, weights=returns, minlength=self._n)
-        self._stage_episode_counts += np.bincount(ids, minlength=self._n)
+
+        same_stage = assigned_revisions == self.sampler_revision
+        late = ~same_stage
+        self._late_outcome_count += int(late.sum())
+        admitted = same_stage
+        if not np.any(admitted):
+            return
+        admitted_ids = ids[admitted]
+        admitted_returns = returns[admitted]
+        self._stage_return_sums += np.bincount(
+            admitted_ids, weights=admitted_returns, minlength=self._n
+        )
+        self._stage_episode_counts += np.bincount(admitted_ids, minlength=self._n)
 
     def _score(self, progress: np.ndarray) -> np.ndarray:
         return progress if self.algorithm == "lp_acrl" else np.abs(progress)
@@ -209,23 +252,35 @@ class _FiniteEpisodeCurriculum:
         observed = self._stage_episode_counts > 0
         current = np.full(self._n, np.nan, dtype=np.float64)
         current[observed] = self._stage_return_sums[observed] / self._stage_episode_counts[observed]
+        # Eq. 6: learning progress is only defined for a cell with a real return
+        # in TWO consecutive stages.  A cell without that delta is imputed LP = 0
+        # -- the neutral value, not a fabricated reward: it writes nothing to the
+        # return accumulators and yields the reference softmax weight e^{0/beta},
+        # so an unobserved cell is neither boosted nor starved.
         progress_mask = observed & self._observed_masks
-        progress = np.full(self._n, np.nan, dtype=np.float64)
+        progress = np.zeros(self._n, dtype=np.float64)
         progress[progress_mask] = current[progress_mask] - self._current_returns[progress_mask]
-        if self.algorithm != "uniform" and np.any(progress_mask):
-            retained = ~progress_mask
-            retained_mass = float(self._probabilities[retained].sum())
-            available = 1.0 - retained_mass
-            if available > 0:
-                updated = self._probabilities.copy()
-                updated[progress_mask] = available * self._softmax(self._score(progress[progress_mask]), self.beta)
-                self._probabilities = updated
-                self._source_label = "lp" if self.algorithm == "lp_acrl" else "alp"
+        if self.algorithm != "uniform":
+            # Eq. 7: rebuild the WHOLE distribution as a softmax of LP over all of
+            # T.  No probability is carried across stages -- the previous c_j is
+            # not an input -- so a cell can never be permanently starved (an
+            # absorbing state the old freeze-retained-mass update could reach).
+            weights = self._softmax(self._score(progress), self.beta)
+            if self.epsilon > 0.0:
+                # Optional uniform exploration floor (PLR-style).  Disabled by
+                # default (epsilon=0), leaving the update identical to Eq. 7.
+                weights = (1.0 - self.epsilon) * weights + self.epsilon / self._n
+            self._probabilities = weights
+            self._source_label = "lp" if self.algorithm == "lp_acrl" else "alp"
         if not np.all(np.isfinite(self._probabilities)) or not np.isclose(self._probabilities.sum(), 1.0):
             raise ValueError("curriculum probabilities are not finite and normalized")
+        # Report imputed cells as NaN LP so downstream analysis can tell an
+        # imputed 0 from a genuinely measured zero learning progress.
+        progress_report = np.full(self._n, np.nan, dtype=np.float64)
+        progress_report[progress_mask] = progress[progress_mask]
         self._previous_returns = self._current_returns.copy()
         self._current_returns = current
-        self._learning_progress = progress
+        self._learning_progress = progress_report
         self._observed_masks = observed
         self.stage_index += 1
         self.sampler_revision += 1
@@ -253,6 +308,7 @@ class _FiniteEpisodeCurriculum:
             "max_cell_probability": float(np.max(p)),
             "task_assignment_coverage": float(np.count_nonzero(self._task_assignment_counts) / self._n),
             "completed_outcome_coverage": float(np.count_nonzero(self._task_completion_counts) / self._n),
+            "late_outcome_count": int(self._late_outcome_count),
         }
 
     def state_dict(self) -> dict:

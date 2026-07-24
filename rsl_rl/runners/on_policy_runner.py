@@ -35,6 +35,7 @@ import os
 import math
 import shutil
 from collections import deque
+from numbers import Integral
 import statistics
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -557,11 +558,19 @@ class OnPolicyRunner:
         # its explicit, versioned, fingerprinted state_dict travels with the
         # weights. No-op for every non-UED task (episode_curriculum stays None),
         # and for lightweight test runners that never set self.env at all.
+        #
+        # The teacher's stage clock is env.common_step_counter (passed into
+        # advance/sample as global_control_steps). stage_start_global_steps lives
+        # inside episode_curriculum.state_dict(); without also persisting the env
+        # counter, resume restores "stage opened at 40000" while the fresh env
+        # sits at 0 -> advance raises "cannot move backwards", or (stage 0)
+        # silently re-counts a full stage on top of partial accumulators.
         env = getattr(self, "env", None)
         episode_curriculum = getattr(env, "episode_curriculum", None)
         if getattr(getattr(env, "cfg", None), "env", None) is not None and \
                 getattr(env.cfg.env, "ued_enabled", False) and episode_curriculum is not None:
             save_dict["episode_curriculum"] = episode_curriculum.state_dict()
+            save_dict["common_step_counter"] = int(env.common_step_counter)
         torch.save(save_dict, path)
 
     @staticmethod
@@ -608,12 +617,13 @@ class OnPolicyRunner:
         self.current_learning_iteration = loaded_dict['iter']
 
         # V5 UED (solun_plani.md §9): restore the teacher's sampling
-        # distribution/LP state/RNG. Fail-fast (not skip) when a UED-enabled
-        # run resumes from a checkpoint that carries no teacher state at all,
-        # and load_state_dict() itself fails closed on any task-space/config/
-        # algorithm fingerprint mismatch -- a resumed run can never silently
-        # start training under a different curriculum. `self.env` may be
-        # absent entirely for lightweight test runners built via __new__.
+        # distribution/LP state/RNG *and* the env global control clock it reads.
+        # Fail-fast (not skip) when a UED-enabled run resumes from a checkpoint
+        # that carries no teacher state or no common_step_counter -- otherwise
+        # stage 0 mid-stage resume silently corrupts LP. load_state_dict() itself
+        # fails closed on any task-space/config/algorithm fingerprint mismatch.
+        # `self.env` may be absent entirely for lightweight test runners built
+        # via __new__.
         env = getattr(self, "env", None)
         episode_curriculum = getattr(env, "episode_curriculum", None)
         if getattr(getattr(env, "cfg", None), "env", None) is not None and \
@@ -624,7 +634,19 @@ class OnPolicyRunner:
                     "Resuming a UED-enabled run requires an 'episode_curriculum' "
                     f"checkpoint entry; none found in {path}"
                 )
+            if "common_step_counter" not in loaded_dict:
+                raise ValueError(
+                    "Resuming a UED-enabled run requires a 'common_step_counter' "
+                    f"checkpoint entry (stage clock); none found in {path}"
+                )
+            counter = loaded_dict["common_step_counter"]
+            if isinstance(counter, bool) or not isinstance(counter, Integral) or int(counter) < 0:
+                raise ValueError(
+                    "checkpoint common_step_counter must be a non-negative integer, "
+                    f"got {counter!r}"
+                )
             episode_curriculum.load_state_dict(curriculum_state)
+            env.common_step_counter = int(counter)
 
         # Restore the full lexicographic selection state from the resumed model
         # or the sibling best_tracking checkpoint. Legacy best.pt has no V2 key;

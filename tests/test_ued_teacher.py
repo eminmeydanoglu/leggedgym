@@ -23,21 +23,27 @@ from legged_gym.utils.ued import (
 )
 
 
-def _outcomes(task_ids, returns, *, assigned_revision=0, completion_revision=0):
+def _outcomes(task_ids, returns, *, assigned_revision=0, completion_revision=0, episode_lengths=20):
     task_ids = np.asarray(task_ids, dtype=np.int64)
     count = len(task_ids)
+    lengths = np.asarray(episode_lengths, dtype=np.int64)
+    if lengths.ndim == 0:
+        lengths = np.full(count, int(lengths), dtype=np.int64)
     return EpisodeOutcomeBatch(
         task_ids=task_ids,
         assigned_revision=np.full(count, assigned_revision, dtype=np.int64),
         completion_revision=completion_revision,
         episodic_returns=np.asarray(returns, dtype=np.float64),
-        episode_lengths=np.full(count, 20, dtype=np.int64),
+        episode_lengths=lengths,
         terminal_reasons=np.full(count, "timeout", dtype="U16"),
     )
 
 
 def _advance_with_return(curriculum, task_ids, returns, step):
-    curriculum.observe(_outcomes(task_ids, returns, completion_revision=curriculum.sampler_revision))
+    rev = curriculum.sampler_revision
+    curriculum.observe(
+        _outcomes(task_ids, returns, assigned_revision=rev, completion_revision=rev)
+    )
     snapshot = curriculum.advance(step)
     assert snapshot is not None
     return snapshot
@@ -53,7 +59,7 @@ def test_task_space_round_trip_and_vectorized_batch():
     assert batch.terrain_types.tolist() == [0, 5, 0, 5]
     assert batch.terrain_levels.tolist() == [0, 0, 0, 0]
     assert batch.vx_bins.tolist() == [0, 0, 1, 3]
-    assert batch.vx_lower.tolist() == [0.0, 0.0, 0.5, 1.5]
+    assert batch.vx_lower.tolist() == [0.2, 0.2, 0.5, 1.5]
     assert batch.vx_upper.tolist() == [0.5, 0.5, 1.0, 2.0]
     with pytest.raises(ValueError):
         space.encode(TaskSpec(5, 1, 0))
@@ -120,13 +126,54 @@ def test_missing_task_fallback_retains_its_previous_probability():
     _advance_with_return(curriculum, [0, 1, 2], [0.0, 0.0, 0.0], 10)
     before = curriculum.probabilities()
     # Cell 2 is not observed this stage, so its probability must not move.
-    curriculum.observe(_outcomes([0, 1], [1.0, 0.0], completion_revision=1))
+    rev = curriculum.sampler_revision
+    curriculum.observe(_outcomes([0, 1], [1.0, 0.0], assigned_revision=rev, completion_revision=rev))
     snapshot = curriculum.advance(20)
     assert snapshot is not None
     after = curriculum.probabilities()
     assert after[2] == pytest.approx(before[2])
     assert np.isnan(snapshot.current_returns[2])
-    assert snapshot.transition_occupancy["0:1"] == 2
+    assert snapshot.transition_occupancy[f"{rev}:{rev}"] == 2
+
+
+def test_late_revision_outcomes_do_not_contaminate_open_stage_returns():
+    """Returns belong to the assignment stage, not the completion wall-clock.
+
+    Review probe: rev-0 mean 0, a rev-0 episode finishing in rev-1 with return
+    100, plus a genuine rev-1 return 0 must yield rev-1 mean 0 and LP 0 — not
+    mean 50 / LP +50 from contaminating the open stage.
+    """
+    curriculum = LPACRLEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10, beta=0.2, seed=11)
+    _advance_with_return(curriculum, [0], [0.0], 10)
+    assert curriculum.sampler_revision == 1
+
+    # Genuine open-stage (rev-1) outcome.
+    curriculum.observe(
+        _outcomes([0], [0.0], assigned_revision=1, completion_revision=1)
+    )
+    # Late rev-0 completion: provenance only, must not enter stage-1 averages.
+    curriculum.observe(
+        _outcomes([0], [100.0], assigned_revision=0, completion_revision=1)
+    )
+    diag = curriculum.diagnostics()
+    assert diag["late_outcome_count"] == 1
+    assert curriculum._stage_episode_counts[0] == 1
+    assert curriculum._stage_return_sums[0] == pytest.approx(0.0)
+
+    snapshot = curriculum.advance(20)
+    assert snapshot is not None
+    assert snapshot.current_returns[0] == pytest.approx(0.0)
+    assert snapshot.learning_progress[0] == pytest.approx(0.0)
+    assert snapshot.transition_occupancy["1:1"] == 1
+    assert snapshot.transition_occupancy["0:1"] == 1
+
+
+def test_future_assigned_revision_is_rejected():
+    curriculum = UniformEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10)
+    with pytest.raises(ValueError, match="ahead of the open sampler"):
+        curriculum.observe(
+            _outcomes([0], [1.0], assigned_revision=1, completion_revision=1)
+        )
 
 
 def test_draw_placements_are_bookkeeping_free():
@@ -201,10 +248,10 @@ def test_checkpoint_schema_configuration_and_counter_types_fail_closed():
 def test_public_batch_contract_rejects_bad_outcomes():
     curriculum = UniformEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10)
     with pytest.raises(ValueError, match="finite"):
-        curriculum.observe(_outcomes([0], [np.nan]))
+        curriculum.observe(_outcomes([0], [np.nan], assigned_revision=0))
     with pytest.raises(ValueError, match="outside"):
-        curriculum.observe(_outcomes([84], [0.0]))
-    fractional_revision = _outcomes([0], [0.0])
+        curriculum.observe(_outcomes([84], [0.0], assigned_revision=0))
+    fractional_revision = _outcomes([0], [0.0], assigned_revision=0)
     fractional_revision = EpisodeOutcomeBatch(
         **{**fractional_revision.__dict__, "assigned_revision": np.array([0.5])}
     )

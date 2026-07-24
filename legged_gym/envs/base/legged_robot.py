@@ -182,8 +182,19 @@ class LeggedRobot(BaseTask):
         return torch.rand(count, device=self.device) < rho
 
     def _observe_ued_outcomes(self, env_ids: EnvIds) -> None:
-        """Route completed episodes: movers update LP, standstill its own bucket."""
+        """Route completed episodes: movers update LP, standstill its own bucket.
+
+        An episode is a completion only if it actually ran.  The very first
+        ``reset()`` resets every env before any step, so it would otherwise
+        report ``num_envs`` never-stepped (length-0) ghosts.  Filtering here --
+        once, at the lifecycle boundary that owns episode length -- keeps both
+        downstream buckets (LP and standstill) ghost-free without either having
+        to re-check length itself.
+        """
         adapter = self.ued_adapter
+        env_ids = env_ids[adapter.episode_length[env_ids] > 0]
+        if len(env_ids) == 0:
+            return
         standstill = adapter.episode_standstill[env_ids]
         mover_done = env_ids[~standstill]
         standstill_done = env_ids[standstill]
@@ -647,7 +658,11 @@ class LeggedRobot(BaseTask):
             elif np.random.rand() < self.cfg.commands.zero_cmd_prob:
                 self.commands[motion_ids, :3] *= 0.0  # legacy batch-wide standstill draw
 
-        # set small commands to zero (movers only; standstill holds already 0)
+        # set small commands to zero (movers only; standstill holds already 0).
+        # The 0.2 threshold is the mover-speed floor: under UED the mover bins are
+        # built so their support stays above it (see TaskSpace.VELOCITY_BIN_EDGES),
+        # so this never fires for a UED mover and cannot silently relabel one as a
+        # standstill in its bin. Keep this threshold in sync with that lower edge.
         self.commands[motion_ids, :3] *= (torch.norm(
             self.commands[motion_ids, :3], dim=1) > 0.2).unsqueeze(1)
 

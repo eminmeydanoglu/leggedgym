@@ -103,36 +103,43 @@ class TestTaxonomyGeometry(unittest.TestCase):
     def test_l3_ascending_stairs_step_height(self):
         cfg = _minimal_taxonomy_cfg()
         terrain = Terrain(cfg)
-        # Col 0 = ascending stairs, row 3 = L3 → 0.20 m
+        # Col 0 = ascending stairs, row 3 = L3 → 0.20 m.
+        # Robot spawns on the center platform and walks outward, so
+        # "ascending" means the platform is a pit and stairs climb toward
+        # the tile edges (negative step_height in the generator).
         tile = _tile_slice(terrain, row=3, col=0)
         step_m = _stair_step_height_m(tile, cfg.vertical_scale)
         expected = TAXONOMY_STEP_HEIGHTS[3]
         # Quantization-aligned tolerance (vertical_scale = 0.005).
         self.assertAlmostEqual(step_m, expected, delta=cfg.vertical_scale + 1e-9)
-        # Positive heights for ascending stairs
-        self.assertGreater(tile.max(), 0)
+        # Negative heights for ascending stairs (platform is the low point).
+        self.assertLess(tile.min(), 0)
 
     def test_l3_descending_stairs_negative(self):
         cfg = _minimal_taxonomy_cfg()
         terrain = Terrain(cfg)
+        # Robot spawns on the platform and walks outward, so "descending"
+        # means the platform is the peak (positive step_height).
         tile = _tile_slice(terrain, row=3, col=1)
         step_m = _stair_step_height_m(tile, cfg.vertical_scale)
         self.assertAlmostEqual(step_m, TAXONOMY_STEP_HEIGHTS[3], delta=cfg.vertical_scale + 1e-9)
-        self.assertLess(tile.min(), 0)
+        self.assertGreater(tile.max(), 0)
 
     def test_slope_amplitude_ordering(self):
         cfg = _minimal_taxonomy_cfg()
         terrain = Terrain(cfg)
-        # Col 2 = upslope; peak height should increase L0→L3 (L0 gradient=0 → flat).
-        peaks = []
+        # Col 2 = upslope; robot spawns on the platform and walks outward
+        # toward higher ground, so the platform is a pit (negative depth)
+        # whose magnitude should increase L0→L3 (L0 gradient=0 → flat).
+        depths = []
         for level in range(4):
             tile = _tile_slice(terrain, row=level, col=2)
-            peaks.append(float(tile.max()) * cfg.vertical_scale)
-        self.assertAlmostEqual(peaks[0], 0.0, delta=cfg.vertical_scale)
-        self.assertLess(peaks[1], peaks[2])
-        self.assertLess(peaks[2], peaks[3])
-        # L3 should be substantially taller than L1
-        self.assertGreater(peaks[3], peaks[1] * 1.5)
+            depths.append(-float(tile.min()) * cfg.vertical_scale)
+        self.assertAlmostEqual(depths[0], 0.0, delta=cfg.vertical_scale)
+        self.assertLess(depths[1], depths[2])
+        self.assertLess(depths[2], depths[3])
+        # L3 should be substantially deeper than L1
+        self.assertGreater(depths[3], depths[1] * 1.5)
 
     def test_rough_amplitude_ordering(self):
         cfg = _minimal_taxonomy_cfg(taxonomy_seed=0)
@@ -148,6 +155,32 @@ class TestTaxonomyGeometry(unittest.TestCase):
             self.assertLessEqual(amp, TAXONOMY_ROUGH_AMPLITUDES[level] * 1.5 + cfg.vertical_scale)
         # L3 should be rougher than L0
         self.assertGreater(amps[3], amps[0])
+
+    def test_traversal_direction_matches_type_name(self):
+        """Regression for the spawn/traversal mismatch: probe height at the
+        tile's spawn platform vs. +2m outward along local x (fixed yaw=0,
+        vy=0, yaw_rate=0 — the robot's actual walk-away-from-spawn profile)
+        and assert the sign matches what the type name promises. Geometry is
+        radially symmetric, so +x stands in for every outward direction.
+        """
+        cfg = _minimal_taxonomy_cfg()
+        terrain = Terrain(cfg)
+        offset_px = int(round(2.0 / cfg.horizontal_scale))  # 2 m outward
+        # (type_idx, expect_climb_outward): stairs_up/slope_up should rise
+        # walking away from spawn; stairs_down/slope_down should fall.
+        expectations = {0: True, 1: False, 2: True, 3: False}
+        for level in range(1, 4):  # L0 is degenerate (zero amplitude)
+            for type_idx, expect_climb in expectations.items():
+                tile = _tile_slice(terrain, row=level, col=type_idx)
+                cx, cy = tile.shape[0] // 2, tile.shape[1] // 2
+                center_h = float(tile[cx, cy])
+                outward_h = float(tile[cx + offset_px, cy])
+                delta = outward_h - center_h
+                label = taxonomy_tile_label(level, type_idx)
+                if expect_climb:
+                    self.assertGreater(delta, 0, f"{label}: expected outward climb, got delta={delta}")
+                else:
+                    self.assertLess(delta, 0, f"{label}: expected outward descent, got delta={delta}")
 
     def test_flat_column_near_zero(self):
         cfg = _minimal_taxonomy_cfg()

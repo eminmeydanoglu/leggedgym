@@ -137,6 +137,25 @@ class TestV5TrainingContract(unittest.TestCase):
             self.assertEqual((env_cfg.terrain.num_rows, env_cfg.terrain.num_cols), (4, 6))
             self.assertTrue(env_cfg.terrain.ued_training_grid)
 
+    def test_v5_disables_online_indist_eval(self):
+        """Online indist eval must not run on the live V5 training env.
+
+        V3's eval_interval=200 would reset the shared env and feed partial /
+        deterministic-policy outcomes into the UED teacher (and advance the
+        stage clock). All four V5 arms inherit eval_interval=0 so
+        OnPolicyRunner skips _run_eval.
+        """
+        for name in V5_TASKS:
+            _, train_cfg = self._cfgs(name)
+            runner = class_to_dict(train_cfg)["runner"]
+            self.assertEqual(
+                runner["eval_interval"],
+                0,
+                f"{name}: online eval must be disabled (got eval_interval={runner['eval_interval']})",
+            )
+            # Attribute access path used by the runner after class_to_dict flatten.
+            self.assertEqual(train_cfg.runner.eval_interval, 0)
+
     def test_shared_forward_command_support_and_v_scale(self):
         # All four arms share the same [0, 2] m/s support -> SPNTE v_scale=2.0.
         for name in V5_TASKS:
@@ -144,6 +163,17 @@ class TestV5TrainingContract(unittest.TestCase):
             self.assertEqual(env_cfg.commands.ranges.lin_vel_x, [0.0, 2.0])
             v_scale = max(abs(env_cfg.commands.ranges.lin_vel_x[0]), abs(env_cfg.commands.ranges.lin_vel_x[1]))
             self.assertEqual(v_scale, 2.0)
+
+    def test_shared_three_axis_command_convention(self):
+        # 3-axis command with directly-commanded yaw RATE (omega_z), not a
+        # heading pose: heading_command must be False and the vy / omega_z
+        # nuisance support must be identical across all four arms (it is the
+        # same support the offline validation bank freezes; solun_plani.md §2).
+        for name in V5_TASKS:
+            env_cfg, _ = self._cfgs(name)
+            self.assertFalse(env_cfg.commands.heading_command)
+            self.assertEqual(env_cfg.commands.ranges.lin_vel_y, [-1.0, 1.0])
+            self.assertEqual(env_cfg.commands.ranges.ang_vel_yaw, [-1.0, 1.0])
 
     def test_shared_ppo_reward_dr_actor_critic_and_budget(self):
         rewards_by_arm = set()
@@ -167,6 +197,7 @@ class TestV5TrainingContract(unittest.TestCase):
             self.assertEqual(runner["max_iterations"], 3000)
             self.assertEqual(runner["num_steps_per_env"], 24)
             self.assertEqual(runner["save_interval"], 200)
+            self.assertEqual(runner["eval_interval"], 0)
             self.assertEqual(runner["eval_seed"], 12345)
             algorithm = class_to_dict(train_cfg)["algorithm"]
             policy = class_to_dict(train_cfg)["policy"]

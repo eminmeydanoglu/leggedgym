@@ -11,26 +11,61 @@ validation_seed: 31001
 eval_seed: 41001
 
 validation_bank:
-  version: v5_ued_bank_v1_r12
+  version: v5_ued_bank_v2_r12_3axis
   terrain_types: [stairs_up, stairs_down, slope_up, slope_down, rough]
   terrain_levels: [0, 1, 2, 3]
   flat_terrain_type: flat
   flat_terrain_level: 0
   velocity_bin_edges: [0.0, 0.5, 1.0, 1.5, 2.0]
+  # 3-axis command: vx binned above; vy / omega_z frozen per replica from this
+  # shared nuisance support.  MUST equal Go2V5CommonCfg.commands.ranges
+  # (lin_vel_y / ang_vel_yaw) so the offline bank and the online sampler share
+  # one command distribution (solun_plani.md §2/§14.1).
+  command_support:
+    lin_vel_y: [-1.0, 1.0]
+    ang_vel_yaw: [-1.0, 1.0]
   # 84 cells × 12 replicas = 1008 measurements (selection bank; not 48).
   replicas_per_cell: 12
-  bank_fingerprint: 3e08ac398ef5f9166cd29c14af44868b0916991b736737712cf8388ebb607a9d
-  # These are canonical hashes of the frozen terrain-builder descriptions.
-  # A real rollout must report the matching geometry hash for every replica;
-  # selection refuses artifacts that do not carry these pins.
-  geometry_hash_version: v5_ued_geometry_v1
+  # Two disjoint command streams over the SAME terrain grid: the validation
+  # bank (validation_seed) selects best_spnte.pt; the held-out bank (eval_seed)
+  # measures that winner ONCE and never feeds selection (§7 / reviewer item 7).
+  bank_fingerprint: dd1a2cd006a3774fd5f58ffe573e40a3fb63c2d3d917a5427bfa064abab09bcc
+  holdout_bank_fingerprint: a00aa2ed52fd7a975c74004c75f83905f4dc5bfb7749a4b47ffe52c5faebebd5
+  # Per-(terrain_type, level) SHA-256 over the ACTUAL int16 heightfield bytes of
+  # each built tile (+ scale metadata), regenerable headless via
+  #   python -m legged_gym.scripts.eval.ued_validation --config <this> --emit-geometry-pins
+  # The rollout recomputes these from the real Genesis scene per replica, so a
+  # mismatch means the policy ran on the wrong / corrupted geometry.  Level-0
+  # slopes/flat share a hash because a 0.0-gradient tile IS flat (expected).
+  geometry_hash_version: v5_ued_geometry_v2_hfbytes
   geometry_hashes:
-    stairs_up: 40b2b0ff04612b9c0d689980ea6fc0a3c1de821c33cf913bf6f08cd7ba39d370
-    stairs_down: e2997b9f4f9e292ee164fbdbb7c32eb74c7916bb47c090b1e68a8ea882d60169
-    slope_up: 337c2c313d7f53ec31cae2717f739c00cac467e599f10fa3aa2d12320335602d
-    slope_down: 65d4d791e7beb48a55f1a4b6ed1ce7cb4998e5b4f1bf7f87f2ecf959114a9f4e
-    rough: 72cbb6ad6aa9a076a75529bf0ee5b0e51bfd39d11c58f1e24f0ec6f5bcee1937
-    flat: e33f97d09419af424c36adfbbed63a47a733ca4c9a90c86d156bb8c149f237f0
+    stairs_up:
+      0: 31cc9460312530587cb4b4c840b7f6c206ca620dd1231aa2f7dca9e2ed47865f
+      1: 686b1a5d3289b5e946969d7535ea57cc19588d66fad373066efacd5013dffe3b
+      2: 2d6111aa3dad8338cd1169e6af057bbafa265a903e539e0a1d5dc07b56438a3c
+      3: 6c72ea569ee8d5e24d10cda327c9f491d2afb171b838c16dadb22ef8f3778180
+    stairs_down:
+      0: aef1719c841b86188fd323b374dc0696182901fc465722d1c609c77c8b5894e9
+      1: 6ab6ec5de234da1f8d8471965bba3c147a7bcd69b5222725ff100db701bd7615
+      2: 3adab7738573685da4e78653b7f9f2c6de6481b9d7dfc01579f47d7001757b4a
+      3: 3f6c5edde5acaf08957cd8e5ef95d7b6a21ca33a8916f798f033788977538945
+    slope_up:
+      0: c532db70fdcdaadeadcd22d94cf7b3c2f83fd0745d9887a9b86bd93a112feb50
+      1: 599cf4b58dbf183e5fd1b764655148162a065e713f91a8f1cab546683de14e2d
+      2: 17037f5cf578f695c245e4f9862de5065af5fb9378721253e733a8eb338eb308
+      3: cd40b83d0eddabd7bb13bbcb8e99d2a52c86d486a643f44b4c8e5f4d8c472cd8
+    slope_down:
+      0: c532db70fdcdaadeadcd22d94cf7b3c2f83fd0745d9887a9b86bd93a112feb50
+      1: 8c59ddb0883ad5c83f82986f673846543f787d43bdd5d9cc8b1ed82d13c2760a
+      2: d2b801362c452fed2086b37c4353794b16ddc93092b2fdfa106e72b2b91a3cd3
+      3: 24aec37a9160cdecb8ee5b565f78a1e770224be524d9d3ea8dffa9a8932ee59b
+    rough:
+      0: d2908381d11ae2c6e6c5bf5d3d15f085ea32b09add4ed4800a322f42e6d9cd1f
+      1: 07b123a3fd74f3277e22edf313855a7ab013fa42b76ea06952eb6fb6e279c07c
+      2: 085939114ec6210c5a35f6c4d98bb8261a545e697fef2bb4a314693680b03533
+      3: 17d18b222edf8db4927c6548402513b9b10ed8eaa16598b4723ba7bb1dad16a8
+    flat:
+      0: c532db70fdcdaadeadcd22d94cf7b3c2f83fd0745d9887a9b86bd93a112feb50
 
 rollout:
   warmup_steps: 100

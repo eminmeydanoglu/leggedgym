@@ -41,7 +41,14 @@ class TaskSpace:
     TERRAIN_TYPE_NAMES = (
         "stairs_up", "stairs_down", "slope_up", "slope_down", "rough", "flat",
     )
-    VELOCITY_BIN_EDGES = (0.0, 0.5, 1.0, 1.5, 2.0)
+    # bin-0's lower edge is the mover-speed threshold, NOT 0.0: a mover bin must
+    # never produce a command below the ``norm > 0.2`` deadband in
+    # ``LeggedRobot._resample_commands`` (legged_robot.py). If it did, the
+    # deadband would silently zero the command while the env stayed attributed to
+    # this bin, folding a standstill into the bin's learning-progress signal.
+    # Standstill is the reserved birth-label mixture; keep the two supports
+    # disjoint. Keep this value in sync with that deadband threshold.
+    VELOCITY_BIN_EDGES = (0.2, 0.5, 1.0, 1.5, 2.0)
 
     def __init__(
         self,

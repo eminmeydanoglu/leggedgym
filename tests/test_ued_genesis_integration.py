@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 import torch
 
+from legged_gym.envs.base.legged_robot import LeggedRobot
 from legged_gym.utils.terrain import Terrain, ued_training_builder_parameters
 from legged_gym.utils.ued import EpisodeOutcomeBatch, TaskAssignmentBatch, TaskSpace, TaskSpec, UniformEpisodeCurriculum
 from legged_gym.utils.ued.genesis_adapter import GenesisUEDAdapter
@@ -114,6 +115,39 @@ class TestGenesisUEDAdapter(unittest.TestCase):
         self.adapter.assign(torch.tensor([0]), _assignments([3], revision=2))
         self.assertFalse(bool(self.adapter.episode_standstill[0]))
 
+    def test_never_stepped_ghosts_reach_neither_bucket(self):
+        """The lifecycle boundary drops length-0 births for LP *and* standstill.
+
+        The first ``reset()`` resets every env before any step, so the fix must
+        filter never-stepped episodes once, upstream, rather than have each
+        bucket re-check length.  Here envs 1 (mover) and 0 (standstill) ran;
+        envs 4 (mover) and 3 (standstill) are never-stepped ghosts.  Only the
+        two that ran may land in their respective bucket.
+        """
+        self.adapter.assign(torch.tensor([1, 4]), _assignments([21, 5], revision=0))
+        self.adapter.assign_standstill(torch.tensor([0, 3]), _assignments([0, 42], revision=0))
+        # Only envs 0 and 1 actually took steps; 3 and 4 are born-and-reset ghosts.
+        self.adapter.episode_length[torch.tensor([0, 1])] = 5
+        self.adapter.episode_return[torch.tensor([0, 1])] = torch.tensor([2.0, 7.0])
+
+        curriculum = UniformEpisodeCurriculum(self.space, stage_length_control_steps=10, seed=3)
+        shim = SimpleNamespace(
+            ued_adapter=self.adapter,
+            episode_curriculum=curriculum,
+            time_out_buf=torch.zeros(8, dtype=torch.bool),
+        )
+        LeggedRobot._observe_ued_outcomes(shim, torch.arange(8))
+
+        # Standstill bucket saw only the env that ran (env 0), never the ghost.
+        diag = self.adapter.standstill_diagnostics()
+        self.assertEqual(diag["standstill_episode_count"], 1.0)
+        self.assertAlmostEqual(diag["standstill_mean_return"], 2.0)
+        self.assertAlmostEqual(diag["standstill_mean_length"], 5.0)
+        # LP stage saw only the mover that ran (task 21), never the ghost mover.
+        self.assertEqual(int(curriculum._stage_episode_counts[21]), 1)
+        self.assertEqual(int(curriculum._stage_episode_counts[5]), 0)
+        self.assertAlmostEqual(float(curriculum._stage_return_sums[21]), 7.0)
+
     def test_resampling_stays_inside_the_active_bin(self):
         ids = torch.tensor([0, 1, 2, 3])
         self.adapter.assign(ids, _assignments([0, 21, 42, 63]))
@@ -129,13 +163,23 @@ class TestGenesisUEDAdapter(unittest.TestCase):
         self.adapter.assign(torch.tensor([0]), _assignments([0], revision=0))
         self.adapter.collect_outcomes(torch.tensor([0]), completion_revision=0, timed_out=torch.zeros(8, dtype=torch.bool))
         self.assertEqual(before["rng_bit_generator_state"], teacher.state_dict()["rng_bit_generator_state"])
+        # assigned_revision must match the open sampler_revision for LP admission;
+        # completion_revision is free provenance (may differ when logging).
         teacher.observe(EpisodeOutcomeBatch(
-            task_ids=np.array([0]), assigned_revision=np.array([1]), completion_revision=2,
+            task_ids=np.array([0]), assigned_revision=np.array([0]), completion_revision=2,
             episodic_returns=np.array([1.0]), episode_lengths=np.array([10]),
             terminal_reasons=np.array(["timeout"]),
         ))
         teacher.advance(1)
-        self.assertEqual(teacher.state_dict()["transition_occupancy"], {"1:2": 1})
+        self.assertEqual(teacher.state_dict()["transition_occupancy"], {"0:2": 1})
+        # A previous-revision completion after advance is provenance-only.
+        teacher.observe(EpisodeOutcomeBatch(
+            task_ids=np.array([0]), assigned_revision=np.array([0]), completion_revision=1,
+            episodic_returns=np.array([100.0]), episode_lengths=np.array([10]),
+            terminal_reasons=np.array(["timeout"]),
+        ))
+        self.assertEqual(teacher.diagnostics()["late_outcome_count"], 1)
+        self.assertEqual(int(teacher._stage_episode_counts[0]), 0)
 
 
 class TestUEDTrainingTerrain(unittest.TestCase):
@@ -201,11 +245,12 @@ class TestZGenesisTeleportSmoke(unittest.TestCase):
             heightfield_id = id(env.simulator._terrain.height_field_raw)
             env.enable_ued(teacher, task_space)
             ids = torch.arange(8, device=env.device)
-            # reset_idx observes old assignments first, then applies exactly the
-            # eight requested replacement tiles and teleports their root states.
+            # The first reset_idx runs before any step, so the just-born episodes
+            # never ran: they are filtered at the lifecycle boundary and observed
+            # by nobody (no startup ghosts).  It still applies exactly the eight
+            # requested replacement tiles and teleports their root states.
             env.reset_idx(ids)
-            self.assertEqual(len(teacher.observed), 1)
-            self.assertTrue(np.all(teacher.observed[0].task_ids == 0))
+            self.assertEqual(len(teacher.observed), 0)
             decoded = task_space.decode_batch(env.ued_adapter.active_task_id[ids].cpu().numpy())
             self.assertTrue(torch.equal(env.simulator.terrain_types[ids].cpu(), torch.tensor(decoded.terrain_types, device="cpu")))
             self.assertTrue(torch.equal(env.simulator.terrain_levels[ids].cpu(), torch.tensor(decoded.terrain_levels, device="cpu")))

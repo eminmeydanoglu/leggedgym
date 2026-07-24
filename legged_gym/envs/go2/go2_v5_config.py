@@ -50,11 +50,21 @@ V5_STANDSTILL_RHO = 0.12
 # update fires -- enough for a per-cell mean-return estimate.
 V5_STAGE_LENGTH_CONTROL_STEPS = 2000
 
-# LP-ACRL/ALP softmax temperature.  The article does not specify beta; 1.0 is
-# the frozen STARTING value for the Faz-0 pilot (solun_plani.md §5, §11 "beta
-# development pilotu").  A beta-pilot run may revise this before headline
-# seeds, but the revised value must be re-frozen here, not tuned in-flight.
-V5_BETA = 1.0
+# LP-ACRL/ALP softmax temperature for the stateless Eq. 7 rebuild (unnormalized
+# LP).  The article does not specify beta.  beta=1.0 collapses the softmax below
+# the sampling-coverage floor at our raw ~20-30 return scale (a single hot cell
+# drives the rest to ~2e-9, an absorbing state), so it was re-frozen from the
+# coverage sweep: tests/verify_coverage_regime.py shows beta=5 keeps the coldest
+# cell observable (>=16 episodes/stage) across LP deltas up to 30 while still
+# concentrating (max_cell_prob 0.2-0.83), so no epsilon floor is needed.  Any
+# future revision must be re-frozen here from that sweep, not tuned in-flight.
+V5_BETA = 5.0
+
+# Uniform exploration floor mixed into the Eq. 7 softmax (episode_curriculum
+# EpisodeCurriculum.epsilon).  0.0 keeps the update identical to the paper; the
+# coverage sweep shows beta alone holds coverage at the V5 budget, so it stays
+# off.  Raise (e.g. 0.03-0.05) only if a smaller-budget regime starves cells.
+V5_EPSILON = 0.0
 
 # Deterministic UED training-grid geometry seed (terrain.ued_training_seed).
 # Shared by all three UED-teacher arms so their static 4x6 taxonomy grid is
@@ -64,10 +74,12 @@ V5_BETA = 1.0
 # tests/test_v5_training_contract.py).
 V5_TERRAIN_SEED = 0
 
-# Forward-only command schedule shared task-support ceiling: all four arms
-# use [0, 2] m/s (SPNTE v_scale=2.0, solun_plani.md §2/§10/§14.1).
-# handcrafted_v4 reaches it via this iteration-based runner schedule; the
-# other arms reach it directly through the episode-task sampler's vx bins.
+# Forward (vx) command-support ceiling shared by all four arms: [0, 2] m/s
+# (SPNTE lin v_scale=2.0, solun_plani.md §2/§10/§14.1).  This schedule only
+# ramps the vx support; vy / omega_z are full-support 3-axis nuisance from the
+# start (see Go2V5CommonCfg.commands.ranges).  handcrafted_v4 reaches the vx
+# ceiling via this iteration-based runner schedule; the other arms reach it
+# directly through the episode-task sampler's vx bins.
 V5_COMMAND_SCHEDULE = [
     {"start_iteration": 0, "lin_vel_x": [0.0, 1.0]},
     {"start_iteration": 500, "lin_vel_x": [0.0, 2.0]},
@@ -98,11 +110,27 @@ class Go2V5CommonCfg(Go2BenchmarkV4TerrainCfg):
         # Shared standstill mixture for all four arms (handcrafted + UED).
         zero_cmd_prob = V5_STANDSTILL_RHO
 
+        # 3-axis velocity command (vx, vy, ang_vel_yaw).  We command angular
+        # VELOCITY omega_z directly (heading_command=False) rather than a
+        # world-frame heading pose: omega_z is what the gyro measures directly,
+        # so it survives sim-to-real without an absolute (drift-prone) yaw
+        # estimate, and it matches the velocity-command convention of the
+        # LP-ACRL reference (see docstring, solun_plani.md §2).  The vx bin is
+        # the UED task axis; vy and omega_z ride along as within-cell nuisance,
+        # sampled uniformly in training and frozen per-replica in the offline
+        # validation bank so training and eval share one command distribution.
+        heading_command = False
+
         class ranges(Go2BenchmarkV4TerrainCfg.commands.ranges):
-            # Shared forward-only [0, 2] m/s support for every arm (§2, §14.1):
-            # SPNTE's v_scale is derived from this field, so it must be
+            # Shared [0, 2] m/s forward support for every arm (§2, §14.1):
+            # SPNTE's lin v_scale is derived from this field, so it must be
             # identical everywhere for the arms to be comparable.
             lin_vel_x = [0.0, 2.0]
+            # Shared lateral / yaw-rate nuisance support (identical across arms
+            # and mirrored by the eval bank).  Symmetric so both turn/strafe
+            # directions are covered; |bound| sets each axis' SPNTE scale.
+            lin_vel_y = [-1.0, 1.0]
+            ang_vel_yaw = [-1.0, 1.0]
 
     class curriculum:
         """UED episode-task sampler knobs (§4/§5, Faz 0 freeze).
@@ -115,6 +143,7 @@ class Go2V5CommonCfg(Go2BenchmarkV4TerrainCfg):
         algorithm: str = "handcrafted_v4"
         stage_length_control_steps: int = V5_STAGE_LENGTH_CONTROL_STEPS
         beta: float = V5_BETA
+        epsilon: float = V5_EPSILON
         seed: int | None = None
 
 
@@ -195,8 +224,15 @@ class Go2V5CfgPPO(Go2V3CfgPPO):
         experiment_name = "go2_v5_ued"
         # V3's three-stage schedule (incl. its 1500-iter re-widen to [-1, 2])
         # does not apply to V5: only handcrafted_v4 overrides this, with the
-        # forward-only two-stage schedule above.
+        # two-stage vx-support schedule above.
         command_schedule = None
+        # V3 inherits online in-distribution eval (eval_interval=200) that runs
+        # on the *same live training env*. Under UED that path observes partial
+        # episodes into the teacher, advances common_step_counter, and mutates
+        # sampler RNG / assignments -- so it trains the curriculum, not just
+        # measures it. 0 disables OnPolicyRunner._run_eval entirely. Checkpoint
+        # selection for V5 is offline (SPNTE / UED validation), not best_tracking.
+        eval_interval = 0
 
 
 class Go2V5HandcraftedCfgPPO(Go2V5CfgPPO):
@@ -270,6 +306,7 @@ def build_ued_teacher(env_cfg):
         task_space,
         stage_length_control_steps=int(env_cfg.curriculum.stage_length_control_steps),
         beta=float(env_cfg.curriculum.beta),
+        epsilon=float(getattr(env_cfg.curriculum, "epsilon", 0.0)),
         seed=seed,
     )
     return curriculum, task_space

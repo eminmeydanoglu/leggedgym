@@ -62,45 +62,74 @@ from legged_gym.scripts.eval.ckpt_utils import sha256_file
 from legged_gym.scripts.eval.dr_axes import pin_others_to_nominal
 from legged_gym.scripts.eval.metrics import MetricAccumulator
 from legged_gym.scripts.eval.ued_validation import (
+    BANK_KINDS,
     BankRow,
-    build_validation_bank,
+    build_bank,
     load_config,
+    make_shard_payload,
     make_validation_artifact,
+    merge_shard_payloads,
     support_scale,
+    yaw_support_scale,
 )
+from legged_gym.utils.terrain import UED_TERRAIN_TYPE_INDEX, taxonomy_tile_geometry_hash
 from legged_gym.utils.ued.task_space import TaskSpace
 
 
-def _partial_path(run_dir: Path, iteration: int, shard_index: int, num_shards: int) -> Path:
-    return run_dir / "ued_validation" / f"model_{iteration}.shard{shard_index}of{num_shards}.json"
+def _artifact_dir(config: dict, bank_kind: str) -> str:
+    """Route validation artifacts to the selection dir; held-out to its own dir.
+
+    The held-out final measurements MUST live outside ``selection.artifact_dir``
+    so ``select_checkpoint.load_candidates`` can never discover -- let alone
+    select on -- them (§7 leakage guard)."""
+    if bank_kind == "validation":
+        return str(config["selection"]["artifact_dir"])
+    return "heldout_final"
 
 
-def _final_path(run_dir: Path, iteration: int, config: dict) -> Path:
+def _partial_path(run_dir: Path, iteration: int, shard_index: int, num_shards: int,
+                  config: dict, bank_kind: str) -> Path:
+    return (run_dir / _artifact_dir(config, bank_kind)
+            / f"model_{iteration}.{bank_kind}.shard{shard_index}of{num_shards}.json")
+
+
+def _final_path(run_dir: Path, iteration: int, config: dict, bank_kind: str) -> Path:
     selection = config["selection"]
-    return run_dir / str(selection["artifact_dir"]) / str(selection["artifact_pattern"]).format(iteration=iteration)
+    return (run_dir / _artifact_dir(config, bank_kind)
+            / str(selection["artifact_pattern"]).format(iteration=iteration))
 
 
-def build_eval_env(task: str, num_envs: int, seed: int, cpu: bool):
-    """Build a V5 env at the frozen UED taxonomy grid, no teacher installed.
+def _git_commit() -> str:
+    """Best-effort short provenance of the working tree; 'unknown' if unavailable."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", LEGGED_GYM_ROOT_DIR, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else "unknown"
+    except Exception:
+        return "unknown"
 
-    The validation bank is one shared fixed grid across all four arms (§10);
-    ``env_cfg.env.ued_enabled`` stays False here regardless of ``task`` -- this
-    driver assigns terrain/command directly (see ``assign_rows_to_env``)
-    instead of going through an ``EpisodeCurriculum``/``GenesisUEDAdapter``.
+
+# Far past any frozen-bank warmup+measure window (see configs/eval/v5_ued.yaml:
+# 100 + 1000 steps at dt=0.02 s ≈ 22 s). Same sentinel as campaign.py / transient.py
+# / play.py. Training default is 10 s (~500 control steps) and would inject one
+# random 3-axis command mid-window while SPNTE is scored against the pinned bank
+# command.
+_BANK_EVAL_RESAMPLING_TIME_S = 1e6
+
+
+def apply_bank_eval_env_overrides(env_cfg) -> None:
+    """Pin a task env_cfg for frozen-bank scoring (no teacher, fixed command).
+
+    Pure cfg mutation so unit tests can pin the contract without building a
+    Genesis scene.  ``build_eval_env`` applies this before ``make_env``.
     """
-    import genesis as gs  # local import: only needed when SIMULATOR == "genesis"
-
     from legged_gym.envs.go2.go2_v5_config import V5_TERRAIN_SEED
     from legged_gym.utils.terrain import TAXONOMY_NUM_LEVELS, TAXONOMY_NUM_TYPES
 
-    if SIMULATOR == "genesis":
-        gs.init(backend=gs.cpu if cpu else gs.gpu, logging_level="warning")
-
-    env_cfg, train_cfg = task_registry.get_cfgs(name=task)
-    env_cfg.env.num_envs = num_envs
-    env_cfg.env.ued_enabled = False  # this driver owns assignment directly
-    env_cfg.seed = seed
-
+    env_cfg.env.ued_enabled = False  # bank driver owns assignment directly
     env_cfg.terrain.mesh_type = "heightfield"
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.selected = False
@@ -122,6 +151,31 @@ def build_eval_env(task: str, num_envs: int, seed: int, cpu: bool):
     env_cfg.commands.heading_command = False
     env_cfg.commands.zero_cmd_prob = 0.0
     env_cfg.commands.per_env_standstill = False
+    # Disable in-episode random resampling for the whole window: the bank pins
+    # (vx, vy, yaw) externally.  Without this, legged_robot._post_physics_step_callback
+    # resamples when episode_length % int(resampling_time/dt) == 0 (~step 500 at
+    # the training default of 10 s), so the policy briefly sees a random 3-axis
+    # command while SPNTE is written against the pinned bank setpoint.
+    env_cfg.commands.resampling_time = _BANK_EVAL_RESAMPLING_TIME_S
+
+
+def build_eval_env(task: str, num_envs: int, seed: int, cpu: bool):
+    """Build a V5 env at the frozen UED taxonomy grid, no teacher installed.
+
+    The validation bank is one shared fixed grid across all four arms (§10);
+    ``env_cfg.env.ued_enabled`` stays False here regardless of ``task`` -- this
+    driver assigns terrain/command directly (see ``assign_rows_to_env``)
+    instead of going through an ``EpisodeCurriculum``/``GenesisUEDAdapter``.
+    """
+    import genesis as gs  # local import: only needed when SIMULATOR == "genesis"
+
+    if SIMULATOR == "genesis":
+        gs.init(backend=gs.cpu if cpu else gs.gpu, logging_level="warning")
+
+    env_cfg, train_cfg = task_registry.get_cfgs(name=task)
+    env_cfg.env.num_envs = num_envs
+    env_cfg.seed = seed
+    apply_bank_eval_env_overrides(env_cfg)
 
     reg_args = SimpleNamespace(
         task=task, headless=True, cpu=cpu, num_envs=num_envs, max_iterations=None,
@@ -140,6 +194,27 @@ def build_eval_env(task: str, num_envs: int, seed: int, cpu: bool):
     return env, ppo_runner
 
 
+def _command_tensors(rows: Sequence[BankRow], device):
+    """Frozen (vx, vy, omega_z) command columns for one shard, in row order."""
+    vx = torch.as_tensor([row.command_vx for row in rows], dtype=torch.float, device=device)
+    vy = torch.as_tensor([row.command_vy for row in rows], dtype=torch.float, device=device)
+    yaw = torch.as_tensor([row.command_yaw for row in rows], dtype=torch.float, device=device)
+    return vx, vy, yaw
+
+
+def _set_commands(env, ids, rows: Sequence[BankRow]) -> None:
+    """Pin the frozen 3-axis command (vx, vy, omega_z) onto the given envs.
+
+    heading_command is False for the bank rollout, so commands[:, 2] is the
+    directly-tracked yaw-rate setpoint; commands[:, 3] (heading) is unused.
+    """
+    vx, vy, yaw = _command_tensors(rows, env.device)
+    env.commands[ids, 0] = vx
+    env.commands[ids, 1] = vy
+    env.commands[ids, 2] = yaw
+    env.commands[ids, 3] = 0.0
+
+
 def assign_rows_to_env(env, rows: Sequence[BankRow]) -> None:
     """Force each env onto its bank replica's terrain tile and fixed command."""
     n = len(rows)
@@ -156,22 +231,50 @@ def assign_rows_to_env(env, rows: Sequence[BankRow]) -> None:
     env.simulator.terrain_levels[ids] = level_idx
     env.simulator.env_origins[ids] = origins[level_idx, type_idx]
     env.reset()
-    command_vx = torch.as_tensor([row.command_vx for row in rows], dtype=torch.float, device=env.device)
-    env.commands[ids, 0] = command_vx
-    env.commands[ids, 1:] = 0.0
+    _set_commands(env, ids, rows)
+
+
+def _runtime_geometry_hash(env, terrain_type: str, terrain_level: int, cache: dict) -> str:
+    """Hash the ACTUAL built heightfield tile the replica is standing on.
+
+    This is the reviewer item-7 fix: the reported hash is recomputed from the
+    live Genesis terrain (``env.simulator._terrain``), NOT copied from the bank
+    row, so ``validate_measurements`` compares an independent runtime observation
+    against the frozen pin.  Cached per (type, level) since every tile is shared."""
+    key = (terrain_type, int(terrain_level))
+    if key not in cache:
+        terrain = getattr(env.simulator, "_terrain", None)
+        if terrain is None or getattr(terrain, "height_field_raw", None) is None:
+            raise RuntimeError(
+                "cannot verify geometry: simulator exposes no built heightfield terrain"
+            )
+        cache[key] = taxonomy_tile_geometry_hash(
+            terrain, int(terrain_level), UED_TERRAIN_TYPE_INDEX[terrain_type],
+        )
+    return cache[key]
 
 
 def rollout_measurements(
     env, policy, rows: Sequence[BankRow], *, warmup_steps: int, steps: int, v_scale: float,
+    v_scale_yaw: float,
 ) -> list[dict[str, Any]]:
-    """Run one fixed-command/fixed-terrain rollout and return per-row measurements."""
+    """Run one fixed-command/fixed-terrain rollout and return per-row measurements.
+
+    The command is the frozen 3-axis (vx, vy, omega_z) bank draw, re-pinned
+    every step so auto-reset cannot leak a resampled command back in.  spnte_lin
+    (forward, the selection headline) plus diagnostic yaw-tracking (spnte_yaw,
+    tracking_ang_err) are reported per replica.  ``geometry_hash`` is recomputed
+    from the live terrain per replica (see ``_runtime_geometry_hash``).
+    """
     n = len(rows)
     ids = torch.arange(n, device=env.device)
-    command_vx = torch.as_tensor([row.command_vx for row in rows], dtype=torch.float, device=env.device)
+    command_vx, command_vy, command_yaw = _command_tensors(rows, env.device)
 
     def _pin_commands():
         env.commands[ids, 0] = command_vx
-        env.commands[ids, 1:] = 0.0
+        env.commands[ids, 1] = command_vy
+        env.commands[ids, 2] = command_yaw
+        env.commands[ids, 3] = 0.0
 
     obs = env.get_observations()
     for _ in range(warmup_steps):
@@ -180,7 +283,7 @@ def rollout_measurements(
         _pin_commands()
     env.episode_length_buf[ids] = 0
 
-    acc = MetricAccumulator(n, env.device, v_scale=v_scale)
+    acc = MetricAccumulator(n, env.device, v_scale=v_scale, v_scale_yaw=v_scale_yaw)
     for _ in range(steps):
         actions = policy(obs.detach())
         obs, _, rew, dones, _ = env.step(actions.detach())
@@ -194,16 +297,21 @@ def rollout_measurements(
         acc.update(rew[:n], dones[:n], env.time_out_buf[:n], lin_err, ang_err, lin_x_err=lin_x_err)
 
     metrics = acc.compute()
+    geometry_cache: dict = {}
     measurements = []
     for i, row in enumerate(rows):
         measurements.append({
             "cell_id": row.cell_id,
             "replica_id": row.replica_id,
             "spnte_lin": float(metrics["spnte_lin"][i]),
+            "spnte_yaw": float(metrics["spnte_yaw"][i]),
+            "tracking_ang_err": float(metrics["tracking_ang_err"][i]),
             "fall_rate": float(metrics["ever_fell"][i]),
             "survival_steps": float(metrics["first_fall_step"][i]),
             "command_vx": row.command_vx,
-            "geometry_hash": row.geometry_hash,
+            "command_vy": row.command_vy,
+            "command_yaw": row.command_yaw,
+            "geometry_hash": _runtime_geometry_hash(env, row.terrain_type, row.terrain_level, geometry_cache),
         })
     return measurements
 
@@ -212,10 +320,27 @@ def _load_checkpoint_into(ppo_runner, checkpoint_path: str) -> None:
     ppo_runner.load(checkpoint_path, load_optimizer=False)
 
 
+def _rollout_provenance(args, config: dict, checkpoint_path: Path) -> dict[str, Any]:
+    """Auditable rollout context stored in the artifact (reviewer item 7)."""
+    return {
+        "bank_kind": args.bank,
+        "seed": int(args.seed),
+        "simulator": SIMULATOR,
+        "task": str(args.task),
+        "run_dir": str(Path(args.run_dir).resolve()),
+        "checkpoint": checkpoint_path.name,
+        "git_commit": _git_commit(),
+        "rollout_steps": int(args.rollout_steps or config["rollout"]["steps"]),
+        "warmup_steps": int(args.warmup_steps or config["rollout"]["warmup_steps"]),
+        "domain_randomization": str(config["rollout"].get("domain_randomization", "pinned_nominal")),
+    }
+
+
 def run_shard(args) -> None:
     config = load_config(args.config)
-    bank = build_validation_bank(config)
+    bank = build_bank(config, seed_key=BANK_KINDS[args.bank])
     v_scale = support_scale(config)
+    v_scale_yaw = yaw_support_scale(config)
     run_dir = Path(args.run_dir)
     checkpoint_path = str(run_dir / f"model_{args.iteration}.pt")
     if not os.path.isfile(checkpoint_path):
@@ -238,34 +363,92 @@ def run_shard(args) -> None:
         env, policy, shard_rows,
         warmup_steps=args.warmup_steps or int(config["rollout"]["warmup_steps"]),
         steps=args.rollout_steps or int(config["rollout"]["steps"]),
-        v_scale=v_scale,
+        v_scale=v_scale, v_scale_yaw=v_scale_yaw,
     )
 
-    out_path = _partial_path(run_dir, args.iteration, args.shard_index, args.num_shards)
+    payload = make_shard_payload(
+        checkpoint_iteration=args.iteration,
+        checkpoint_sha256=sha256_file(checkpoint_path),
+        bank_kind=args.bank,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
+        config=config,
+        measurements=measurements,
+        rollout_steps=args.rollout_steps,
+        warmup_steps=args.warmup_steps,
+        provenance=_rollout_provenance(args, config, Path(checkpoint_path)),
+    )
+    out_path = _partial_path(run_dir, args.iteration, args.shard_index, args.num_shards, config, args.bank)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(measurements), encoding="utf-8")
-    print(f"[ued_rollout] wrote {len(measurements)} measurements -> {out_path}")
+    out_path.write_text(json.dumps(payload), encoding="utf-8")
+    print(f"[ued_rollout] wrote {len(measurements)} {args.bank} measurements -> {out_path}")
 
 
 def run_merge(args) -> None:
     config = load_config(args.config)
     run_dir = Path(args.run_dir)
     checkpoint_path = run_dir / f"model_{args.iteration}.pt"
-    measurements: list[dict[str, Any]] = []
+    checkpoint_sha256 = sha256_file(str(checkpoint_path))
+    payloads: list[dict[str, Any]] = []
     for shard_index in range(args.num_shards):
-        shard_path = _partial_path(run_dir, args.iteration, shard_index, args.num_shards)
-        measurements.extend(json.loads(shard_path.read_text(encoding="utf-8")))
+        shard_path = _partial_path(run_dir, args.iteration, shard_index, args.num_shards, config, args.bank)
+        payloads.append(json.loads(shard_path.read_text(encoding="utf-8")))
+    # Effective horizon the shards already agreed on (CLI smoke override, else
+    # the first shard's provenance). Merge checks consensus against this horizon
+    # rather than always forcing the frozen headline protocol -- so a short
+    # smoke shard set can produce a complete artifact. Selection still rejects
+    # any non-frozen protocol_fingerprint (reviewer 8b).
+    first_prov = (payloads[0].get("provenance") or {}) if payloads else {}
+    merge_rollout_steps = (
+        args.rollout_steps if args.rollout_steps is not None
+        else first_prov.get("rollout_steps")
+    )
+    merge_warmup_steps = (
+        args.warmup_steps if args.warmup_steps is not None
+        else first_prov.get("warmup_steps")
+    )
+    # Fail closed unless every shard header binds to this exact checkpoint SHA,
+    # identity and the agreed protocol before its measurements are trusted.
+    measurements = merge_shard_payloads(
+        payloads,
+        checkpoint_iteration=args.iteration,
+        checkpoint_sha256=checkpoint_sha256,
+        bank_kind=args.bank,
+        num_shards=args.num_shards,
+        config=config,
+        rollout_steps=merge_rollout_steps,
+        warmup_steps=merge_warmup_steps,
+    )
+
+    # Final artifact provenance must report the same effective horizon the
+    # shards used; never re-default to the frozen config when shards were smoke.
+    provenance = _rollout_provenance(args, config, checkpoint_path)
+    if args.rollout_steps is None and merge_rollout_steps is not None:
+        provenance["rollout_steps"] = int(merge_rollout_steps)
+    if args.warmup_steps is None and merge_warmup_steps is not None:
+        provenance["warmup_steps"] = int(merge_warmup_steps)
 
     artifact = make_validation_artifact(
         checkpoint_iteration=args.iteration,
         measurements=measurements,
         config=config,
-        checkpoint_sha256=sha256_file(str(checkpoint_path)),
+        checkpoint_sha256=checkpoint_sha256,
+        bank_kind=args.bank,
+        provenance=provenance,
     )
-    out_path = _final_path(run_dir, args.iteration, config)
+    # Refuse to rewrite a smoke shard set as a frozen-horizon headline artifact
+    # (or the reverse) if provenance was dropped or CLI/horizon disagreed.
+    agreed_protocol = payloads[0].get("protocol_fingerprint")
+    if artifact.get("protocol_fingerprint") != agreed_protocol:
+        raise ValueError(
+            "merged artifact protocol_fingerprint diverges from shard consensus; "
+            "pass the same --rollout_steps/--warmup_steps used for the shards "
+            "(or ensure shard provenance records the effective horizon)"
+        )
+    out_path = _final_path(run_dir, args.iteration, config, args.bank)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(artifact), encoding="utf-8")
-    print(f"[ued_rollout] merged {args.num_shards} shard(s) -> {out_path}")
+    print(f"[ued_rollout] merged {args.num_shards} {args.bank} shard(s) -> {out_path}")
     print(json.dumps(artifact["scores"], sort_keys=True))
 
 
@@ -278,6 +461,9 @@ def parse_args(argv=None):
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--shard_index", type=int, default=0)
     p.add_argument("--merge", action="store_true", help="combine existing shard partials into the final artifact")
+    p.add_argument("--bank", choices=sorted(BANK_KINDS), default="validation",
+                   help="'validation' scores checkpoints for selection; 'holdout' is the "
+                        "single unbiased final measurement (eval_seed) and is never selected on")
     p.add_argument("--num_envs", type=int, default=None, help="override parallel envs (default: this shard's replica count)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--cpu", action="store_true", default=False)

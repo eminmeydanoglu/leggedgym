@@ -28,6 +28,8 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+from typing import Sequence
+
 import numpy as np
 import trimesh
 
@@ -156,6 +158,126 @@ def ued_training_builder_parameters(cfg) -> dict:
         "terrain_length": float(cfg.terrain_length),
         "terrain_width": float(cfg.terrain_width),
     }
+
+
+# ---------------------------------------------------------------------------
+# Runtime geometry verification (solun_plani.md §7; reviewer item 7).
+#
+# The frozen UED validation/held-out banks pin one SHA-256 per (terrain_type,
+# level) tile.  These hashes are computed over the ACTUAL int16 heightfield
+# bytes of the built tile (plus the scale metadata that turns those integers
+# into metres), NOT over a builder description.  Both the offline pin generator
+# (`build_taxonomy_geometry_hashes`, headless/CPU) and the online rollout
+# (`ued_rollout.py`, on the real Genesis scene) call the SAME `hash_terrain_tile`
+# so a mismatch means the policy really ran on the wrong / corrupted geometry.
+# ---------------------------------------------------------------------------
+GEOMETRY_HASH_VERSION = "v5_ued_geometry_v2_hfbytes"
+
+# Frozen terrain-builder parameters for the UED grid, mirrored from
+# Go2BenchmarkV4TerrainCfg.terrain / Go2V5*Cfg.terrain (common_cfgs.py:514-528,
+# go2_v5_config.py:164-171).  Kept here so the geometry pins can be regenerated
+# headless (no Genesis/GPU); a runtime mismatch against the real scene is caught
+# by the rollout's per-tile hash, and drift from the cfg is caught by
+# tests/test_ued_checkpoint_selection.py.
+UED_TRAINING_TERRAIN_PARAMS = {
+    "mesh_type": "heightfield",
+    "simplify_mesh": True,
+    "horizontal_scale": 0.1,
+    "vertical_scale": 0.005,
+    "border_size": 20.0,
+    "terrain_length": 8.0,
+    "terrain_width": 8.0,
+    "platform_size": 4.0,
+    "num_rows": TAXONOMY_NUM_LEVELS,
+    "num_cols": TAXONOMY_NUM_TYPES,
+    "terrain_proportions": [0.2, 0.1, 0.25, 0.25, 0.2],
+    "curriculum": False,
+    "selected": False,
+    "ued_training_grid": True,
+    "ued_training_seed": 0,
+    "slope_treshold": 0.75,
+}
+
+# Bank terrain-type name -> physical column index in the 4x6 UED grid, matching
+# `_make_taxonomy_subterrain`'s type_idx branches and TaskSpace.TERRAIN_TYPE_NAMES.
+UED_TERRAIN_TYPE_INDEX = {
+    "stairs_up": 0, "stairs_down": 1, "slope_up": 2, "slope_down": 3, "rough": 4, "flat": 5,
+}
+
+
+def extract_terrain_tile(terrain, level: int, type_idx: int) -> np.ndarray:
+    """Return the (length_per_env x width_per_env) int16 heightfield sub-block
+    for grid cell (``level`` row, ``type_idx`` column) of a built ``Terrain``."""
+    sx = terrain.border + int(level) * terrain.length_per_env_pixels
+    ex = terrain.border + (int(level) + 1) * terrain.length_per_env_pixels
+    sy = terrain.border + int(type_idx) * terrain.width_per_env_pixels
+    ey = terrain.border + (int(type_idx) + 1) * terrain.width_per_env_pixels
+    return terrain.height_field_raw[sx:ex, sy:ey]
+
+
+def hash_height_field_tile(block, horizontal_scale: float, vertical_scale: float) -> str:
+    """Canonical SHA-256 over one tile's raw int16 heightfield bytes + scales.
+
+    The little-endian int16 byte layout plus the (horizontal, vertical) scales
+    fully determine the physical tile geometry, so this hash changes iff the
+    realized heightfield changes.  Used identically offline and at runtime."""
+    import hashlib
+    import json
+
+    arr = np.ascontiguousarray(np.asarray(block, dtype="<i2"))
+    header = {
+        "v": GEOMETRY_HASH_VERSION,
+        "shape": [int(arr.shape[0]), int(arr.shape[1])],
+        "horizontal_scale": float(horizontal_scale),
+        "vertical_scale": float(vertical_scale),
+    }
+    digest = hashlib.sha256()
+    digest.update(json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(arr.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def taxonomy_tile_geometry_hash(terrain, level: int, type_idx: int) -> str:
+    """Runtime geometry hash for one built taxonomy tile (rollout entry point)."""
+    block = extract_terrain_tile(terrain, level, type_idx)
+    return hash_height_field_tile(block, terrain.cfg.horizontal_scale, terrain.cfg.vertical_scale)
+
+
+def build_ued_training_terrain(params: dict | None = None):
+    """Build the frozen UED 4x6 grid headless (pure numpy, no Genesis)."""
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(**(params or UED_TRAINING_TERRAIN_PARAMS))
+    return Terrain(cfg)
+
+
+def build_taxonomy_geometry_hashes(
+    terrain_types: Sequence[str] = ("stairs_up", "stairs_down", "slope_up", "slope_down", "rough"),
+    *,
+    flat_terrain_type: str = "flat",
+    flat_terrain_level: int = 0,
+    params: dict | None = None,
+) -> dict[str, dict[int, str]]:
+    """Regenerate the per-(type, level) heightfield geometry pins headless.
+
+    Returns ``{terrain_type: {level: sha256}}`` for every moving type across all
+    four levels plus the single flat cell.  This is the source of truth for the
+    ``validation_bank.geometry_hashes`` pins in ``configs/eval/v5_ued.yaml``;
+    the online rollout must reproduce the matching value per replica."""
+    terrain = build_ued_training_terrain(params)
+    hashes: dict[str, dict[int, str]] = {}
+    for name in terrain_types:
+        type_idx = UED_TERRAIN_TYPE_INDEX[name]
+        hashes[name] = {
+            level: taxonomy_tile_geometry_hash(terrain, level, type_idx)
+            for level in range(TAXONOMY_NUM_LEVELS)
+        }
+    flat_idx = UED_TERRAIN_TYPE_INDEX[flat_terrain_type]
+    hashes[flat_terrain_type] = {
+        int(flat_terrain_level): taxonomy_tile_geometry_hash(terrain, flat_terrain_level, flat_idx)
+    }
+    return hashes
 
 
 def clamp_taxonomy_spawn(level: int, type_idx: int, num_rows: int = TAXONOMY_NUM_LEVELS,
@@ -405,16 +527,17 @@ class Terrain:
         # rings remain visible on a 6 m tile.
         platform = min(float(self.platform_size), 2.0)
 
-        if type_idx == 0:  # ascending stairs
-            terrain_utils.pyramid_stairs_terrain(
-                terrain,
-                step_width=TAXONOMY_STEP_WIDTH,
-                step_height=TAXONOMY_STEP_HEIGHTS[level],
-                platform_size=platform,
-                terrain_type=self.type,
-                simplify_mesh=self.simplify_mesh,
-            )
-        elif type_idx == 1:  # descending stairs
+        # pyramid_stairs_terrain / pyramid_sloped_terrain always place the
+        # *highest* point at the tile's center platform for a positive
+        # parameter (rings/slope descend outward toward the tile edges) —
+        # and the robot always spawns on that center platform (env_origins
+        # = tile center, see add_terrain_to_map) with commands sampled
+        # symmetrically in every direction. So an agent's actual traversal
+        # is always "spawn on platform, walk outward": a positive parameter
+        # is experienced as descending, negative as ascending. Signs below
+        # are chosen so the *_up / *_down type names match that experienced
+        # direction, not the raw generator-parameter sign.
+        if type_idx == 0:  # ascending stairs: robot climbs walking away from spawn
             terrain_utils.pyramid_stairs_terrain(
                 terrain,
                 step_width=TAXONOMY_STEP_WIDTH,
@@ -423,17 +546,26 @@ class Terrain:
                 terrain_type=self.type,
                 simplify_mesh=self.simplify_mesh,
             )
-        elif type_idx == 2:  # upslope
-            terrain_utils.pyramid_sloped_terrain(
+        elif type_idx == 1:  # descending stairs: robot descends walking away from spawn
+            terrain_utils.pyramid_stairs_terrain(
                 terrain,
-                slope=TAXONOMY_SLOPE_GRADIENTS[level],
+                step_width=TAXONOMY_STEP_WIDTH,
+                step_height=TAXONOMY_STEP_HEIGHTS[level],
                 platform_size=platform,
                 terrain_type=self.type,
+                simplify_mesh=self.simplify_mesh,
             )
-        elif type_idx == 3:  # downslope
+        elif type_idx == 2:  # upslope: robot climbs walking away from spawn
             terrain_utils.pyramid_sloped_terrain(
                 terrain,
                 slope=-TAXONOMY_SLOPE_GRADIENTS[level],
+                platform_size=platform,
+                terrain_type=self.type,
+            )
+        elif type_idx == 3:  # downslope: robot descends walking away from spawn
+            terrain_utils.pyramid_sloped_terrain(
+                terrain,
+                slope=TAXONOMY_SLOPE_GRADIENTS[level],
                 platform_size=platform,
                 terrain_type=self.type,
             )

@@ -20,9 +20,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
-import functools
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -34,7 +34,9 @@ from legged_gym.scripts.eval.ued_validation import (
     aggregate_measurements,
     bank_fingerprint,
     build_validation_bank,
+    geometry_pins,
     load_config,
+    protocol_fingerprint,
     support_scale,
     validate_measurements,
 )
@@ -147,12 +149,24 @@ def _candidate_from_artifact(
     artifact = _read_artifact(artifact_path)
     if int(artifact.get("checkpoint_iteration", -1)) != iteration:
         raise ValueError(f"{artifact_path}: checkpoint_iteration does not match {checkpoint.name}")
+    # Leakage guard: only the validation (selection) bank may pick a checkpoint;
+    # the held-out final bank must never influence selection (§7).
+    bank_kind = str(artifact.get("bank_kind", "validation"))
+    if bank_kind != "validation":
+        raise ValueError(
+            f"{artifact_path}: refusing '{bank_kind}' bank for checkpoint selection "
+            "(the held-out bank must not feed selection)"
+        )
     if artifact.get("checkpoint_sha256") != _sha256_file(checkpoint):
         raise ValueError(f"{artifact_path}: checkpoint SHA-256 mismatch")
-    expected_fingerprint = bank_fingerprint(config)
+    expected_fingerprint = bank_fingerprint(config, kind="validation")
     if artifact.get("validation_bank_fingerprint") != expected_fingerprint:
         raise ValueError(f"{artifact_path}: validation-bank fingerprint mismatch")
-    if artifact.get("geometry_hashes") != dict(config["validation_bank"]["geometry_hashes"]):
+    # Protocol binding: a short smoke override (or any changed horizon/success/
+    # selection knob) fingerprints differently and must never select (reviewer 8b).
+    if artifact.get("protocol_fingerprint") != protocol_fingerprint(config):
+        raise ValueError(f"{artifact_path}: protocol fingerprint mismatch")
+    if artifact.get("geometry_hashes") != geometry_pins(config):
         raise ValueError(f"{artifact_path}: geometry hash pins mismatch")
     if float(artifact.get("spnte_v_scale", -1.0)) != support_scale(config):
         raise ValueError(f"{artifact_path}: SPNTE support scale mismatch")
@@ -183,33 +197,41 @@ def load_candidates(run_dir: str | Path, config: Mapping[str, Any]) -> list[Cand
     ]
 
 
-def is_better(candidate: Candidate, incumbent: Candidate, tolerance: float) -> bool:
-    """Compare exactly according to the frozen primary/tie-break contract."""
-    primary = float(candidate.scores["macro_mean_spnte_lin"])
-    current_primary = float(incumbent.scores["macro_mean_spnte_lin"])
-    if primary < current_primary - tolerance:
-        return True
-    if primary > current_primary + tolerance:
-        return False
-    # Only this branch may consult secondary metrics.
-    for key, direction in (
-        ("worst_10pct_cvar_spnte_lin", "lower"),
-        ("macro_fall_rate", "lower"),
-        ("macro_success_rate", "higher"),
-    ):
-        left, right = float(candidate.scores[key]), float(incumbent.scores[key])
-        if left == right:
-            continue
-        return left < right if direction == "lower" else left > right
-    return candidate.iteration < incumbent.iteration
+def _tie_break_key(candidate: Candidate) -> tuple[float, float, float, int]:
+    """Total order for candidates already inside the primary-tolerance band.
+
+    Smaller tuples win: lower worst-10% CVaR, then lower fall rate, then higher
+    success rate (negated), then the earlier iteration.  A total sort key makes
+    the winner independent of candidate ordering (reviewer 9).
+    """
+    scores = candidate.scores
+    return (
+        float(scores["worst_10pct_cvar_spnte_lin"]),
+        float(scores["macro_fall_rate"]),
+        -float(scores["macro_success_rate"]),
+        int(candidate.iteration),
+    )
 
 
 def select_best(candidates: Iterable[Candidate], config: Mapping[str, Any]) -> Candidate:
+    """Permutation-invariant selection: tie-break only inside a global band.
+
+    First find the global best (lowest) primary score, then apply the secondary
+    tie-break ONLY among candidates within ``primary + tolerance``.  This avoids
+    the non-transitive pairwise-tolerance chaining that let a candidate more than
+    a tolerance worse than the field win by riding a chain of near-ties
+    (reviewer 9).
+    """
     candidates = list(candidates)
     if not candidates:
         raise ValueError("cannot select from no complete validation candidates")
     tolerance = float(config["selection"]["primary_tolerance"])
-    return functools.reduce(lambda best, candidate: candidate if is_better(candidate, best, tolerance) else best, candidates[1:], candidates[0])
+    best_primary = min(float(c.scores["macro_mean_spnte_lin"]) for c in candidates)
+    band = [
+        c for c in candidates
+        if float(c.scores["macro_mean_spnte_lin"]) <= best_primary + tolerance
+    ]
+    return min(band, key=_tie_break_key)
 
 
 def selection_metadata(candidate: Candidate, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -218,8 +240,8 @@ def selection_metadata(candidate: Candidate, config: Mapping[str, Any]) -> dict[
         "selection_metric": str(config["selection"]["metric"]),
         "selection_version": str(config["selection"]["version"]),
         "score_components": dict(candidate.scores),
-        "validation_bank_fingerprint": bank_fingerprint(config),
-        "geometry_hashes": dict(config["validation_bank"]["geometry_hashes"]),
+        "validation_bank_fingerprint": bank_fingerprint(config, kind="validation"),
+        "geometry_hashes": geometry_pins(config),
         "spnte_v_scale": support_scale(config),
         "selected_iteration": int(candidate.iteration),
         "source_checkpoint": candidate.checkpoint_path.name,
@@ -256,11 +278,21 @@ def materialize_best_spnte(run_dir: str | Path, candidate: Candidate, config: Ma
     target = run / str(config["selection"]["best_artifact"])
     if candidate.checkpoint_path.resolve() == target.resolve():
         raise ValueError("best_spnte artifact must be materialised from a periodic model checkpoint")
-    shutil.copy2(candidate.checkpoint_path, target)
-    checkpoint = torch.load(target, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, Mapping):
-        raise ValueError(f"{target}: checkpoint payload must be a mapping")
-    torch.save(_merge_best_spnte_metadata(checkpoint, selection_metadata(candidate, config)), target)
+    # Atomic publish: build the fully-annotated checkpoint in a sibling temp file
+    # and os.replace() it into place only on success.  An interrupted selection
+    # can never leave a truncated best_spnte.pt or clobber a good one mid-write
+    # (reviewer 8c).  os.replace is atomic within the same directory/filesystem.
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        shutil.copy2(candidate.checkpoint_path, tmp)
+        checkpoint = torch.load(tmp, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError(f"{target}: checkpoint payload must be a mapping")
+        torch.save(_merge_best_spnte_metadata(checkpoint, selection_metadata(candidate, config)), tmp)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return target
 
 

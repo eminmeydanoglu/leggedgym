@@ -153,6 +153,13 @@ print(curriculum.config_fingerprint)
   auto-reset-safe realisation of §14.3: `MetricAccumulator` keeps `auto_reset`
   ON (old metrics still consume the full horizon) while SPNTE freezes its own
   stream via `first_fall_step`.
+- **Command is 3-axis** (`vx, vy, omega_z`): `heading_command=False` on
+  `Go2V5CommonCfg.commands`, so the yaw axis commands angular VELOCITY omega_z
+  directly (gyro-observable, sim-to-real robust) instead of a world-frame
+  heading pose. The vx bin is the UED task axis; vy / omega_z ride along as
+  within-cell nuisance over the shared `[-1, 1]` support
+  (`commands.ranges.lin_vel_y` / `ang_vel_yaw`), identical across all four arms
+  and mirrored by the offline validation bank.
 - **v_scale is never hardcoded**: `v_scale = max(|lin_vel_x_min|,
   |lin_vel_x_max|)`, derived from the active eval config's command bank
   (§14.1). For V5 (`commands.ranges.lin_vel_x = [0.0, 2.0]`,
@@ -191,28 +198,45 @@ All frozen in `configs/eval/v5_ued.yaml` and enforced by
   (`replicas_per_cell: 12`, `v5_ued.yaml:21`; `FROZEN_REPLICAS_PER_CELL = 12`,
   `ued_validation.py:25`) → `84 × 12 = 1008` total env-replicas
   (`FROZEN_NUM_CELLS * n_replicas` check, `ued_validation.py:143-145`).
-- Per-replica in-bin command draws are generated once, deterministically, by
+- Per-replica **3-axis** command draws are generated once, deterministically, by
   `np.random.Generator(PCG64(validation_seed))`
-  (`ued_validation.py:125-146` `build_validation_bank`) and reused verbatim by
-  every checkpoint/method (`validate_measurements` rejects any reported
-  `command_vx` that diverges from the frozen draw, `ued_validation.py:211-214`).
-- Frozen bank fingerprint (config + full replica matrix hash, `sha256` over
-  `{schema_version, validation_seed, eval_seed, geometry_hash_version,
-  geometry_hashes, rows}` — `ued_validation.py:149-160`), verified by
-  recomputing it live in this working tree
-  (`bank_fingerprint(load_config("configs/eval/v5_ued.yaml"))`):
+  (`build_validation_bank`) and reused verbatim by every checkpoint/method:
+  each replica freezes `command_vx` (uniform in its velocity bin) plus
+  `command_vy` and `command_yaw` (omega_z, uniform over the shared `[-1, 1]`
+  nuisance support pinned in `validation_bank.command_support`).
+  `validate_measurements` rejects any reported vx/vy/yaw that diverges from the
+  frozen draw. This mirrors the online 3-axis training command
+  (`heading_command=False`, so omega_z is commanded directly, not derived from a
+  heading pose) so training and offline eval share ONE command distribution.
+- Two disjoint command streams over the SAME terrain grid (§7 / reviewer item
+  7): the **validation** bank (`validation_seed=31001`) selects the checkpoint;
+  the **held-out** bank (`eval_seed=41001`) draws INDEPENDENT commands and
+  measures the winner ONCE via `ued_rollout.py --bank holdout`, writing to
+  `run_dir/heldout_final/` — a directory `select_checkpoint` never scans, so the
+  held-out result can never leak back into selection.
+- Frozen bank fingerprints (config + full replica matrix hash, `sha256` over
+  `{schema_version, bank_kind, validation_seed, eval_seed, geometry_hash_version,
+  geometry_hashes, rows}`, `schema_version=3`), verified by recomputing them
+  live (`bank_fingerprint(load_config("configs/eval/v5_ued.yaml"), kind=...)`):
 
   ```
-  3e08ac398ef5f9166cd29c14af44868b0916991b736737712cf8388ebb607a9d
+  validation dd1a2cd006a3774fd5f58ffe573e40a3fb63c2d3d917a5427bfa064abab09bcc
+  holdout    a00aa2ed52fd7a975c74004c75f83905f4dc5bfb7749a4b47ffe52c5faebebd5
   ```
 
-  pinned in `configs/eval/v5_ued.yaml:22` and asserted in
+  pinned in `configs/eval/v5_ued.yaml` (`bank_fingerprint` /
+  `holdout_bank_fingerprint`) and asserted in
   `tests/test_ued_checkpoint_selection.py`.
-- Geometry hashes: one pinned 64-hex-char SHA-256 identity string per terrain
-  type + `flat` (`v5_ued.yaml:27-33`); a real rollout caller (e.g.
-  `legged_gym/scripts/eval/ued_rollout.py`) reports the bank's own
-  `row.geometry_hash` passthrough rather than recomputing it
-  (`ued_validation.py:215-218` refuses any mismatch).
+- Geometry hashes: one pinned 64-hex-char SHA-256 per **(terrain type, level)**
+  tile, computed over the ACTUAL int16 heightfield bytes of the built tile plus
+  its scale metadata (`geometry_hash_version=v5_ued_geometry_v2_hfbytes`,
+  regenerable headless via `ued_validation.py --emit-geometry-pins` /
+  `terrain.build_taxonomy_geometry_hashes`). The rollout RECOMPUTES this hash
+  from the live Genesis scene per replica (`ued_rollout._runtime_geometry_hash`),
+  so `validate_measurements` compares an independent runtime observation against
+  the pin and fails closed on the wrong / corrupted geometry — it is no longer a
+  self-referential passthrough. Level-0 slopes and flat share a hash because a
+  0.0-gradient tile IS flat (expected, not a bug).
 - **Success threshold** (`v5_ued.yaml:40-43`): `minimum_survival_steps=900`
   (of 1000), `spnte_lin_lt=0.30`, `replica_success_rate_threshold=0.90` (a
   cell counts "successful" if ≥90% of its 12 replicas individually satisfy
@@ -319,7 +343,8 @@ rng_bit_generator_state
   (`tests/test_v5_training_contract.py`): `num_envs=4096`,
   `episode_length_s=20`, `max_iterations=3000`, `num_steps_per_env=24`,
   `save_interval=200`, `eval_seed=12345`, identical reward/DR/actor-critic
-  dicts, forward-only `lin_vel_x=[0,2]` (`v_scale=2.0`).
+  dicts, 3-axis command with vx support `lin_vel_x=[0,2]` (`v_scale=2.0`) plus
+  shared `lin_vel_y`/`ang_vel_yaw=[-1,1]` nuisance and `heading_command=False`.
 - ≥3 paired training seeds (not parallel-env replicas) per §3/§11 Faz B; the
   Faz B launcher (`scripts/run_v5_fazB.sh`) defaults to seeds `1 2 3`.
 - Checkpoint **saving** may stay every 200 PPO updates; offline SPNTE bank
