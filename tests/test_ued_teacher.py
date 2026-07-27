@@ -39,10 +39,23 @@ def _outcomes(task_ids, returns, *, assigned_revision=0, completion_revision=0, 
     )
 
 
-def _advance_with_return(curriculum, task_ids, returns, step):
+def _advance_with_return(curriculum, task_ids, returns, step, reps=None):
+    """Feed one stage of outcomes, then advance.
+
+    Each (task, return) is repeated ``min_stage_episodes_for_lp`` times so the
+    episode gate admits the resulting LP -- a one-episode mean is precisely the
+    noise the gate exists to reject, not a curriculum signal.  Tests that probe
+    the gate itself pass ``reps`` explicitly to stay under it.
+    """
     rev = curriculum.sampler_revision
+    reps = curriculum.min_stage_episodes_for_lp if reps is None else reps
     curriculum.observe(
-        _outcomes(task_ids, returns, assigned_revision=rev, completion_revision=rev)
+        _outcomes(
+            [t for t in task_ids for _ in range(reps)],
+            np.repeat(np.asarray(returns, dtype=np.float64), reps),
+            assigned_revision=rev,
+            completion_revision=rev,
+        )
     )
     snapshot = curriculum.advance(step)
     assert snapshot is not None
@@ -125,7 +138,13 @@ def test_missing_task_uses_neutral_lp_without_fabricating_a_return():
     curriculum = LPACRLEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10, beta=0.2, seed=5)
     _advance_with_return(curriculum, [0, 1, 2], [0.0, 0.0, 0.0], 10)
     rev = curriculum.sampler_revision
-    curriculum.observe(_outcomes([0, 1], [1.0, 0.0], assigned_revision=rev, completion_revision=rev))
+    reps = curriculum.min_stage_episodes_for_lp
+    curriculum.observe(_outcomes(
+        [t for t in (0, 1) for _ in range(reps)],
+        np.repeat([1.0, 0.0], reps),
+        assigned_revision=rev,
+        completion_revision=rev,
+    ))
     snapshot = curriculum.advance(20)
     assert snapshot is not None
     after = curriculum.probabilities()
@@ -136,7 +155,7 @@ def test_missing_task_uses_neutral_lp_without_fabricating_a_return():
     assert after[2] == pytest.approx(after[1])
     assert np.isnan(snapshot.current_returns[2])
     assert np.isnan(snapshot.learning_progress[2])
-    assert snapshot.transition_occupancy[f"{rev}:{rev}"] == 2
+    assert snapshot.transition_occupancy[f"{rev}:{rev}"] == 2 * reps
 
 
 def test_late_revision_outcomes_do_not_contaminate_open_stage_returns():
@@ -276,7 +295,9 @@ def _adaptive_stage(curriculum, means, *, spread=0.0, episodes=20, step):
     task_ids = np.repeat(np.arange(84, dtype=np.int64), episodes)
     offsets = np.tile(np.linspace(-spread, spread, episodes), 84)
     returns = np.repeat(np.asarray(means, dtype=np.float64), episodes) + offsets
-    return _advance_with_return(curriculum, task_ids, returns, step)
+    # ``episodes`` already sets the per-cell count, so opt out of the helper's
+    # gate-clearing repetition instead of multiplying the two.
+    return _advance_with_return(curriculum, task_ids, returns, step, reps=1)
 
 
 def test_adaptive_temperature_hits_target_ess_for_reliable_lp():
@@ -411,6 +432,52 @@ def test_v5_defaults_are_the_fixed_beta_freeze_and_the_softmax_bites():
     assert np.isfinite(diagnostics["sampled_lp_mass"])
 
 
+def test_fixed_mode_gates_lp_measured_from_too_few_episodes():
+    # The first beta=1.0 run collapsed because a cell sampled 1-2 times had
+    # |LP| ~ 6-9 (pure measurement noise against a ~0.5 steady-state signal)
+    # and e^{LP} handed it ~90% of the distribution.  The episode gate must
+    # apply in fixed mode, not only under the adaptive controller.
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(), stage_length_control_steps=10, beta=1.0,
+        temperature_mode="fixed", min_stage_episodes_for_lp=16,
+    )
+    stage = curriculum.stage_length_control_steps
+    _adaptive_stage(curriculum, np.zeros(84), spread=1.0, episodes=20, step=stage)
+    # Cell 0 reports a huge return off a single episode; everyone else keeps a
+    # well-measured flat return.
+    task_ids = np.concatenate([np.array([0]), np.repeat(np.arange(1, 84), 20)])
+    returns = np.concatenate([np.array([40.0]), np.zeros(83 * 20)])
+    snapshot = _advance_with_return(
+        curriculum, task_ids, returns, 2 * stage, reps=1
+    )
+    probabilities = curriculum.probabilities()
+    assert not snapshot.eligible_masks[0]
+    # Gated out -> neutral LP=0 -> the reference weight, not a takeover.
+    assert probabilities[0] == pytest.approx(probabilities[50], rel=1e-6)
+    assert snapshot.diagnostics["effective_sample_size"] > 50.0
+
+
+def test_fixed_mode_enforces_the_per_cell_cap():
+    # _cap_probabilities used to run only on the adaptive branch, so the cap
+    # was dead config under the shipped fixed-beta freeze and a single cell
+    # reached p=0.90 in training.
+    cap = 0.25
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(), stage_length_control_steps=10, beta=1.0,
+        temperature_mode="fixed", max_cell_probability=cap,
+    )
+    stage = curriculum.stage_length_control_steps
+    _adaptive_stage(curriculum, np.zeros(84), spread=1.0, episodes=20, step=stage)
+    spike = np.zeros(84)
+    spike[7] = 40.0
+    snapshot = _adaptive_stage(
+        curriculum, spike, spread=1.0, episodes=20, step=2 * stage
+    )
+    assert snapshot.diagnostics["max_cell_probability"] <= cap + 1e-9
+    # The cap is a bound, not a flattener: cell 7 still leads by a wide margin.
+    assert curriculum.probabilities()[7] == pytest.approx(cap, rel=1e-6)
+
+
 def test_adaptive_signal_quality_is_gated_by_task_space_coverage():
     curriculum = LPACRLEpisodeCurriculum(
         TaskSpace(),
@@ -441,9 +508,9 @@ def test_adaptive_requires_minimum_samples_in_both_stages():
         temperature_mode="adaptive_ess",
         min_stage_episodes_for_lp=16,
     )
-    _advance_with_return(curriculum, [0, 0], [0.0, 0.0], step=10)
+    _advance_with_return(curriculum, [0, 0], [0.0, 0.0], step=10, reps=1)
     snapshot = _advance_with_return(
-        curriculum, np.repeat(0, 20), np.full(20, 10.0), step=20
+        curriculum, np.repeat(0, 20), np.full(20, 10.0), step=20, reps=1
     )
     assert snapshot.diagnostics["eligible_cell_count"] == 0
     assert snapshot.diagnostics["signal_quality"] == 0.0

@@ -59,10 +59,21 @@ class _Driver:
         self.step = 0
 
     def stage(self, returns, *, skip=()):
-        """Observe every cell (except ``skip``) with ``returns`` then advance."""
+        """Observe every cell (except ``skip``) with ``returns`` then advance.
+
+        Each cell gets ``min_stage_episodes_for_lp`` copies of its return so the
+        episode gate admits the LP; a single episode per cell is exactly what
+        the gate is there to reject.
+        """
         returns = np.asarray(returns, dtype=np.float64)
         cells = [c for c in range(self.n) if c not in set(skip)]
-        _observe(self.cur, cells, returns[cells], revision=self.cur.sampler_revision)
+        reps = self.cur.min_stage_episodes_for_lp
+        _observe(
+            self.cur,
+            [c for c in cells for _ in range(reps)],
+            np.repeat(returns[cells], reps),
+            revision=self.cur.sampler_revision,
+        )
         self.step += self.cur.stage_length_control_steps
         return self.cur.advance(self.step)
 
@@ -168,7 +179,10 @@ class TestStatelessCurriculum(unittest.TestCase):
         self.assertLessEqual(p.max(), (1 - eps) + eps / self.n + 1e-9)
 
     def test_epsilon_zero_leaves_softmax_untouched(self):
-        floor = self._lpacrl(epsilon=0.0)
+        # max_cell_probability=1.0 isolates the epsilon floor: the shipped cap
+        # would redistribute the spike's mass and lift the coldest cell back
+        # above the threshold this test is asserting on.
+        floor = self._lpacrl(epsilon=0.0, max_cell_probability=1.0)
         d = _Driver(floor)
         d.stage(np.zeros(self.n))
         spike = np.zeros(self.n)

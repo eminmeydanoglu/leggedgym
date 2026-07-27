@@ -69,9 +69,15 @@ V5_BETA_MIN = 0.75
 V5_BETA_MAX = 8.0
 V5_BETA_EMA = 0.8
 V5_TARGET_ESS_RATIO_MIN = 0.5
-# Loose per-cell safety cap only: at 0.25 (vs the LP softmax's natural spread)
-# it never binds in normal operation and just bounds pathological collapse.
+# Per-cell ceiling, enforced in BOTH temperature modes.  It binds: the first
+# beta = 1.0 run collapsed to ESS ~1.3 with a single cell at p = 0.90 (see the
+# episode gate in _FiniteEpisodeCurriculum.advance), so 0.25 is what keeps at
+# least four cells sharing the top of the distribution.
 V5_MAX_CELL_PROBABILITY = 0.25
+# Minimum episodes in BOTH consecutive stages before a cell's LP is believed.
+# Below this the LP is a difference of one- or two-episode means: |LP| ~ 6-9
+# against a steady-state signal of ~0.5.  Ungated, e^{noise} at beta = 1 hands
+# the distribution to whichever cell is currently mismeasured worst.
 V5_MIN_STAGE_EPISODES_FOR_LP = 16
 V5_CONFIDENCE_SCALE = 1.0
 

@@ -389,13 +389,7 @@ class _FiniteEpisodeCurriculum:
 
         # lp_reliability_median: median over eligible cells of
         # |LP| / (|LP| + lp_sem), lp_sem = sqrt(cur_sem^2 + prev_sem^2).
-        eligible = (
-            progress_mask
-            & (self._stage_episode_counts >= self.min_stage_episodes_for_lp)
-            & (self._previous_stage_episode_counts >= self.min_stage_episodes_for_lp)
-            & np.isfinite(current_sems)
-            & np.isfinite(self._current_return_sems)
-        )
+        eligible = self._episode_gate(progress_mask, current_sems)
         if np.any(eligible):
             lp_sem = np.sqrt(
                 np.square(current_sems[eligible])
@@ -407,10 +401,11 @@ class _FiniteEpisodeCurriculum:
         else:
             self._lp_reliability_median = float("nan")
 
-        # sampled_lp_mass: fraction of positive LP the distribution targets.
-        # ``progress`` imputes 0 for unmeasured/negative-neutral cells, so only
-        # genuinely positive LP contributes to the denominator.
-        positive_lp = np.maximum(progress, 0.0)
+        # sampled_lp_mass: fraction of TRUSTED positive LP the distribution
+        # targets.  Restricted to gated cells so the metric answers "of the LP
+        # we believe, how much are we sampling"; scored against raw LP it would
+        # be dominated by one-episode noise and unreadable by construction.
+        positive_lp = np.where(eligible, np.maximum(progress, 0.0), 0.0)
         total_positive = float(positive_lp.sum(dtype=np.float64))
         if total_positive > 0.0:
             self._sampled_lp_mass = float(
@@ -459,19 +454,25 @@ class _FiniteEpisodeCurriculum:
                 hi = mid
         return float(np.sqrt(lo * hi))
 
-    def _adaptive_scores(
-        self,
-        progress: np.ndarray,
-        progress_mask: np.ndarray,
-        current_sems: np.ndarray,
+    def _episode_gate(
+        self, progress_mask: np.ndarray, current_sems: np.ndarray
     ) -> np.ndarray:
-        eligible = (
+        """Cells whose LP rests on enough episodes in BOTH stages to be real."""
+        return (
             progress_mask
             & (self._stage_episode_counts >= self.min_stage_episodes_for_lp)
             & (self._previous_stage_episode_counts >= self.min_stage_episodes_for_lp)
             & np.isfinite(current_sems)
             & np.isfinite(self._current_return_sems)
         )
+
+    def _adaptive_scores(
+        self,
+        progress: np.ndarray,
+        progress_mask: np.ndarray,
+        current_sems: np.ndarray,
+    ) -> np.ndarray:
+        eligible = self._episode_gate(progress_mask, current_sems)
         self._eligible_masks = eligible
         lp_sem = np.full(self._n, np.nan, dtype=np.float64)
         lp_sem[eligible] = np.sqrt(
@@ -551,15 +552,23 @@ class _FiniteEpisodeCurriculum:
                 # direction.
                 self._effective_beta = max(smoothed_beta, solved_beta)
             else:
-                scores = self._score(progress)
+                # The episode gate is not an adaptive-mode extra.  An LP built
+                # from a one-episode mean is noise whose magnitude (|LP| ~ 6-9
+                # here) dwarfs the steady-state signal (~0.5), and a bare
+                # softmax at beta=1 turns e^{noise} into a runaway: the cell
+                # with the loudest measurement error takes ~90% of the mass,
+                # floods, regresses, and hands the mass to the next 1-episode
+                # cell.  Gated-out cells fall back to the same neutral LP = 0
+                # imputation unobserved cells get, so they keep the reference
+                # weight e^0 rather than hijacking the distribution.
+                self._eligible_masks = self._episode_gate(progress_mask, current_sems)
+                scores = self._score(np.where(self._eligible_masks, progress, 0.0))
                 self._effective_beta = self.beta
                 self._target_ess = float(self._n)
                 self._signal_quality = 0.0
-            weights = (
-                self._distribution(scores, self._effective_beta)
-                if self.temperature_mode == "adaptive_ess"
-                else self._mix_epsilon(self._softmax(scores, self._effective_beta))
-            )
+            # The per-cell cap is a safety bound on the sampler, not on one
+            # temperature controller; both modes go through _distribution.
+            weights = self._distribution(scores, self._effective_beta)
             if self.temperature_mode == "adaptive_ess":
                 weights = self._ensure_minimum_ess(weights, self._target_ess)
             self._probabilities = weights
