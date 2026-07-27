@@ -48,6 +48,7 @@ from legged_gym.scripts.eval.provenance import verify_run_identity
 RAW_METRICS = ("tracking_lin", "tracking_yaw", "fall_rate", "return_per_step")
 SCORED_SUITES = ("s1", "s2", "t1", "t2")
 TERRAIN_SUITES = ("t0", "t1", "t2")
+V4_MATRIX_SUITE = "h4"
 
 # Canonical column->type map for the pinned eval grid.  With num_cols=5 and the
 # benchmark proportions [0.2, 0.1, 0.25, 0.25, 0.2] the deterministic
@@ -140,7 +141,174 @@ def _command_name(command: Mapping[str, Any]) -> str:
     return str(command["name"]).replace("/", "_").replace(" ", "_")
 
 
+def _is_v4_headroom_matrix(cfg: Mapping[str, Any]) -> bool:
+    interface = cfg.get("execution", {}).get("runner_interface", cfg.get("protocol_kind", ""))
+    return cfg.get("schema_version") == "v4_headroom_matrix_v1" or interface == "v4_headroom_matrix_v1"
+
+
+def _v4_value_name(value: float) -> str:
+    return f"{float(value):g}".replace("-", "neg").replace(".", "p")
+
+
+def _v4_followup_manifest(cfg: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Load an immutable discovery-selected world manifest, when configured."""
+    raw_path = cfg.get("execution", {}).get("followup_manifest")
+    if not raw_path:
+        return None
+    path = Path(str(raw_path))
+    if not path.is_absolute():
+        path = _root() / path
+    if not path.is_file():
+        raise FileNotFoundError(f"V4 follow-up manifest is missing: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != "v4_adaptive_followup_v1":
+        raise ValueError(f"unsupported V4 follow-up manifest: {path}")
+    return manifest
+
+
+def _validate_v4_headroom_matrix(cfg: Mapping[str, Any]) -> None:
+    if not _is_v4_headroom_matrix(cfg):
+        return
+    protocol = cfg["protocol"]
+    terrain = protocol["terrain"]
+    if cfg.get("simulator") != "genesis":
+        raise ValueError("v4_headroom_matrix_v1 supports Genesis only")
+    required_nominal = {"mass_kg", "com_x_m", "friction"}
+    if set(protocol["nominal_physics"]) != required_nominal:
+        raise ValueError("v4_headroom_matrix_v1 nominal_physics must contain exactly mass_kg, com_x_m, friction")
+    if set(protocol.get("training_support", {})) != required_nominal:
+        raise ValueError("v4_headroom_matrix_v1 training_support must contain exactly mass_kg, com_x_m, friction")
+    for axis_name, bounds in protocol["training_support"].items():
+        if len(bounds) != 2 or float(bounds[0]) >= float(bounds[1]):
+            raise ValueError(f"training_support.{axis_name} must be [lower, upper]")
+        nominal = float(protocol["nominal_physics"][axis_name])
+        if not float(bounds[0]) <= nominal <= float(bounds[1]):
+            raise ValueError(f"nominal_physics.{axis_name} must lie inside training_support")
+    if len(terrain["types"]) > int(terrain["num_cols"]):
+        raise ValueError("declared terrain.types exceeds terrain.num_cols")
+    if not terrain["types"] or not terrain["levels"] or not protocol["commands"]["vx"]:
+        raise ValueError("v4_headroom_matrix_v1 needs non-empty terrain types/levels and command vx")
+    known_types = {_terrain_type_name(index, int(terrain["num_cols"])) for index in range(int(terrain["num_cols"]))}
+    unknown_types = set(terrain["types"]) - known_types
+    if unknown_types:
+        raise ValueError(f"unknown terrain type(s) for configured terrain proportions: {sorted(unknown_types)}")
+    if int(protocol["replicas_per_cell"]) < 1:
+        raise ValueError("replicas_per_cell must be positive")
+    if int(protocol["warmup_steps"]) < 0 or int(protocol["measured_steps"]) < 1:
+        raise ValueError("warmup_steps must be >= 0 and measured_steps must be positive")
+    axes = protocol["primary_isolated_axes"]["axes"]
+    expected = {"mass_kg": "added_mass", "com_x_m": "com_x", "friction": "friction"}
+    names = [str(axis["name"]) for axis in axes]
+    if not names or len(names) != len(set(names)) or not set(names).issubset(expected):
+        raise ValueError("primary_isolated_axes must declare a non-empty unique subset of mass_kg, com_x_m, friction")
+    for axis in axes:
+        if axis["dr_axis"] != expected[axis["name"]]:
+            raise ValueError(f"{axis['name']} must use dr_axis={expected[axis['name']]}")
+        if not axis["id"] or not axis["ood"] or set(axis["id"]) & set(axis["ood"]):
+            raise ValueError(f"{axis['name']} must have non-empty, disjoint id/ood values")
+        lower, upper = map(float, protocol["training_support"][axis["name"]])
+        if not all(lower <= float(value) <= upper for value in axis["id"]):
+            raise ValueError(f"{axis['name']} ID values must lie inside training_support")
+        if not all(float(value) < lower or float(value) > upper for value in axis["ood"]):
+            raise ValueError(f"{axis['name']} OOD values must lie outside training_support")
+    if not bool(protocol["primary_isolated_axes"].get("pin_unswept_axes_to_nominal")):
+        raise ValueError("v4 primary cells require pin_unswept_axes_to_nominal=true")
+    manifest = _v4_followup_manifest(cfg)
+    if manifest is not None:
+        requested = {str(item) for item in cfg.get("execution", {}).get("followup_model_labels", [])}
+        known = {str(model["label"]) for model in cfg["models"]}
+        if not requested or not requested.issubset(known):
+            raise ValueError("V4 follow-up must declare non-empty execution.followup_model_labels from models")
+        if requested != set(manifest.get("method_labels", [])):
+            raise ValueError("V4 follow-up config method labels differ from frozen manifest")
+        if not manifest.get("worlds"):
+            raise ValueError("V4 follow-up manifest has no eligible worlds; do not run adaptation policies")
+
+
+def _v4_headroom_cells(cfg: Mapping[str, Any]) -> List[Cell]:
+    """Expand the V4 matrix without conflating primary and stress tiers."""
+    _validate_v4_headroom_matrix(cfg)
+    protocol = cfg["protocol"]
+    terrain = protocol["terrain"]
+    nominal = {key: float(value) for key, value in protocol["nominal_physics"].items()}
+    cells: List[Cell] = []
+    type_to_index = {_terrain_type_name(index, int(terrain["num_cols"])): index for index in range(int(terrain["num_cols"]))}
+    manifest = _v4_followup_manifest(cfg)
+    if manifest is not None:
+        labels = {str(item) for item in cfg["execution"]["followup_model_labels"]}
+        for model in cfg["models"]:
+            if str(model["label"]) not in labels:
+                continue
+            model_seeds = set(_seed_list(cfg, model))
+            for world in manifest["worlds"]:
+                identity = world["identity"]
+                terrain_type = str(identity["terrain_type"])
+                if terrain_type not in type_to_index:
+                    raise ValueError(f"follow-up terrain type is not present in config: {terrain_type}")
+                physics = {key: float(value) for key, value in json.loads(str(identity["physics_signature"])).items()}
+                for seed in world["training_seeds"]:
+                    if int(seed) not in model_seeds:
+                        continue
+                    name = str(identity["scenario"])
+                    cells.append(Cell(V4_MATRIX_SUITE, str(model["label"]), int(seed), name, {
+                        "kind": "v4_headroom", "tier": str(identity["physics_tier"]),
+                        "terrain_type": terrain_type, "terrain_type_index": int(type_to_index[terrain_type]),
+                        "terrain_level": int(identity["terrain_level"]), "command_vx": float(identity["command_vx"]),
+                        "physics_axis": str(identity["physics_axis"]),
+                        "physics_dr_axis": {"mass_kg": "added_mass", "com_x_m": "com_x", "friction": "friction"}.get(str(identity["physics_axis"]), "combined"),
+                        "physics_band": str(identity["physics_band"]), "physics": physics,
+                        "physics_scenario": "" if str(identity["physics_axis"]) != "combined" else name.split("__secondary__", 1)[-1],
+                    }))
+        return cells
+    primary = protocol["primary_isolated_axes"]
+    for model in cfg["models"]:
+        for seed in _seed_list(cfg, model):
+            for terrain_type in terrain["types"]:
+                for level in terrain["levels"]:
+                    for vx in protocol["commands"]["vx"]:
+                        for axis in primary["axes"]:
+                            for band in ("id", "ood"):
+                                for value in axis[band]:
+                                    physics = dict(nominal); physics[axis["name"]] = float(value)
+                                    name = (f"{terrain_type}__L{int(level)}__vx{_v4_value_name(vx)}__"
+                                            f"primary__{axis['name']}__{band}__{_v4_value_name(value)}")
+                                    cells.append(Cell(V4_MATRIX_SUITE, model["label"], seed, name, {
+                                        "kind": "v4_headroom", "tier": str(primary["tier"]), "terrain_type": str(terrain_type),
+                                        "terrain_type_index": int(type_to_index[str(terrain_type)]), "terrain_level": int(level),
+                                        "command_vx": float(vx), "physics_axis": str(axis["name"]),
+                                        "physics_dr_axis": str(axis["dr_axis"]), "physics_band": band,
+                                        "physics": physics,
+                                    }))
+            secondary = protocol["secondary_combined_stress_payload"]
+            for terrain_type in terrain["types"]:
+                for level in secondary["terrain_levels"]:
+                    for vx in secondary["vx"]:
+                        for stress in secondary["scenarios"]:
+                            physics = {key: float(stress[key]) for key in nominal}
+                            name = (f"{terrain_type}__L{int(level)}__vx{_v4_value_name(vx)}__secondary__"
+                                    f"{stress['name']}")
+                            cells.append(Cell(V4_MATRIX_SUITE, model["label"], seed, name, {
+                                "kind": "v4_headroom", "tier": str(secondary["tier"]), "terrain_type": str(terrain_type),
+                                "terrain_type_index": int(type_to_index[str(terrain_type)]), "terrain_level": int(level),
+                                "command_vx": float(vx), "physics_axis": "combined", "physics_dr_axis": "combined",
+                                "physics_band": str(stress["band"]), "physics": physics,
+                                "physics_scenario": str(stress["name"]),
+                            }))
+    budget = protocol.get("planned_cell_budget")
+    if budget:
+        primary_count = sum(cell.scenario["tier"] == primary["tier"] for cell in cells)
+        secondary_count = len(cells) - primary_count
+        actual = {"primary": primary_count, "secondary": secondary_count, "total": len(cells)}
+        if {key: int(budget[key]) for key in actual} != actual:
+            raise ValueError(f"v4 planned_cell_budget mismatch: declared={budget}, expanded={actual}")
+    return cells
+
+
 def _planned_cells(cfg: Mapping[str, Any], suite: str, *, include_diagnostics: bool = False) -> List[Cell]:
+    if _is_v4_headroom_matrix(cfg):
+        if suite != "all":
+            raise ValueError("v4_headroom_matrix_v1 accepts --suite all only; tiers are declared inside the protocol")
+        return _v4_headroom_cells(cfg)
     protocol = cfg["protocol"]
     terrain_cfg = protocol.get("terrain")
     if suite == "all":
@@ -230,8 +398,11 @@ def _discover_run(model: Mapping[str, Any], seed: int, *, require_final: bool) -
     root = Path(str(model["log_root"]))
     root = root if root.is_absolute() else _root() / root
     pattern = str(model["run_pattern"]).format(seed=seed)
+    pinned_paths = model.get("run_paths", {})
+    pinned = pinned_paths.get(seed, pinned_paths.get(str(seed))) if isinstance(pinned_paths, Mapping) else None
+    candidate_dirs = [root / str(pinned)] if pinned else list(root.glob(pattern))
     candidates = []
-    for run_dir in root.glob(pattern):
+    for run_dir in candidate_dirs:
         if not run_dir.is_dir():
             continue
         if require_final and not (run_dir / "model_3000.pt").is_file():
@@ -248,13 +419,17 @@ def _discover_run(model: Mapping[str, Any], seed: int, *, require_final: bool) -
         raise FileNotFoundError(
             f"{model['label']} seed {seed}: no verified V3 run matching {root / pattern}{suffix}"
         )
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    if len(candidates) > 1:
+        names = sorted(str(item[1].name) for item in candidates)
+        raise RuntimeError(f"{model['label']} seed {seed}: multiple verified runs match {pattern}: {names}; pin run_paths in config")
     return candidates[0][1]
 
 
 def cmd_resolve_runs(cfg: Mapping[str, Any], *, labels: Sequence[str] | None = None, strict: bool = False) -> int:
     root = artifact_root(cfg); root.mkdir(parents=True, exist_ok=True)
-    require_final = bool(cfg.get("require_final_checkpoint", True))
+    # V4 curriculum runs select the explicit best_spnte deploy checkpoint; they
+    # are not required to retain V3's historical model_3000.pt final-save.
+    require_final = bool(cfg.get("require_final_checkpoint", not _is_v4_headroom_matrix(cfg)))
     path = _selection_path(root)
     previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"selections": []}
     selection_by_key = {(str(row["label"]), int(row["training_seed"])): row
@@ -311,6 +486,7 @@ def _selected_models(cfg: Mapping[str, Any], root: Path, labels: Sequence[str] |
         expected = [seed for seed in _seed_list(cfg, model) if seed in by_seed]
         copied = dict(model)
         copied["run_folders"] = {seed: by_seed[seed]["run_folder"] for seed in expected}
+        copied["selected_checkpoints"] = {seed: by_seed[seed] for seed in expected}
         copied["training_seeds"] = expected
         selected[model["label"]] = copied
     if labels and not selected:
@@ -581,16 +757,158 @@ def _base_payload(session, suite: str, scenario: str, eval_seed: int, warmup: in
     return out
 
 
+def _v4_protocol_fingerprint(cfg: Mapping[str, Any]) -> str:
+    """Stable provenance fingerprint for all semantics that define a matrix world."""
+    payload = {
+        "schema_version": cfg.get("schema_version"), "protocol": cfg["protocol"],
+        "scorecard": {key: cfg["scorecard"].get(key) for key in ("baseline_label", "oracle_label", "headline_tier", "relative_headroom", "absolute_headroom", "fall_gate_pp", "achieved_speed_ratio")},
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _v4_campaign_fingerprint(cfg: Mapping[str, Any], root: Path | None = None) -> str:
+    """Fingerprint the policy population and selection policy around a V4 world."""
+    root = root or artifact_root(cfg)
+    selection = _selection_path(root)
+    selection_sha = hashlib.sha256(selection.read_bytes()).hexdigest() if selection.is_file() else ""
+    payload = {
+        "world_protocol_fingerprint": _v4_protocol_fingerprint(cfg),
+        "training_seeds": [int(seed) for seed in cfg["training_seeds"]],
+        "comparison_scope": cfg.get("comparison_scope", ""),
+        "models": [{key: model.get(key) for key in ("label", "task", "checkpoint", "run_pattern", "run_paths")}
+                   for model in cfg["models"]],
+        "run_selection_sha256": selection_sha,
+        "followup_manifest": cfg.get("execution", {}).get("followup_manifest", ""),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _v4_artifact_valid(path: Path, cfg: Mapping[str, Any], cell: Cell) -> bool:
+    """Resume only a finite artifact from the exact same V4 matrix world."""
+    if not _artifact_valid(path):
+        return False
+    scenario = cell.scenario
+    required = {
+        "protocol_kind": "v4_headroom_matrix_v1",
+        "protocol_fingerprint": _v4_protocol_fingerprint(cfg),
+        "campaign_fingerprint": _v4_campaign_fingerprint(cfg),
+        "training_seed": int(cell.seed), "model": str(cell.model), "tier": str(scenario["tier"]),
+        "terrain_type_name": str(scenario["terrain_type"]), "terrain_level": int(scenario["terrain_level"]),
+        "command_vx": float(scenario["command_vx"]), "physics_axis": str(scenario["physics_axis"]),
+        "physics_band": str(scenario["physics_band"]),
+    }
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            for key, expected in required.items():
+                actual = _scalar(z, key, object())
+                if isinstance(expected, float):
+                    if not np.isfinite(float(actual)) or not np.isclose(float(actual), expected, rtol=0.0, atol=1e-9):
+                        return False
+                elif actual != expected:
+                    return False
+            return str(_scalar(z, "physics_signature", "")) == json.dumps(scenario["physics"], sort_keys=True, separators=(",", ":"))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _apply_v4_physics(env, physics: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+    """Write and validate all three V4 P5 physics values, every cell."""
+    expected_keys = {"mass_kg", "com_x_m", "friction"}
+    if set(physics) != expected_keys:
+        raise ValueError(f"V4 physics must contain exactly {sorted(expected_keys)}, got {sorted(physics)}")
+    _set_nominal(env)
+    mapping = (("mass_kg", "added_mass"), ("com_x_m", "com_x"), ("friction", "friction"))
+    output: Dict[str, np.ndarray] = {}
+    for physical_name, axis_name in mapping:
+        requested = torch.full((env.num_envs,), float(physics[physical_name]), device=env.device)
+        axis = get_axis(axis_name)
+        axis.apply(env, requested)
+        actual = axis.validate(env, requested)
+        output[f"physics_{physical_name}_requested"] = requested.detach().cpu().numpy()
+        output[f"physics_{physical_name}_actual"] = actual.detach().cpu().numpy()
+    # ``com_x``'s setter must leave the unswept lateral/vertical components
+    # nominal too. Its readback covers x only, so make that invariant explicit.
+    com_bias = env.simulator._base_com_bias
+    if not torch.allclose(com_bias[:, 1:], torch.zeros_like(com_bias[:, 1:]), atol=1e-6, rtol=0.0):
+        raise RuntimeError("V4 physics pinning leaked non-zero com_y/com_z")
+    return output
+
+
+def _v4_terrain_hash(terrain_info: Mapping[str, Any], terrain_type: str, level: int, eval_seed: int) -> str:
+    # The base hash covers the actual generated full heightfield. Appending the
+    # selected tile identity prevents reports from labelling two tiles as one
+    # world while retaining a direct cross-model equality check.
+    text = f"{terrain_info['terrain_hash']}|{terrain_type}|{int(level)}|{int(eval_seed)}"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _run_v4_headroom_cell(root: Path, cfg: Mapping[str, Any], model: Mapping[str, Any], cell: Cell, *, resume: bool) -> None:
+    rel = _cell_rel(cell)
+    final = root / "raw" / f"{rel}.npz"
+    if resume and _v4_artifact_valid(final, cfg, cell):
+        return
+    scenario = dict(cell.scenario)
+    protocol = cfg["protocol"]
+    terrain = protocol["terrain"]
+    session, terrain_info = build_terrain_session(
+        model, cell.seed, int(protocol["replicas_per_cell"]), int(protocol["eval_seed"]),
+        fixed_level=int(scenario["terrain_level"]), fixed_type=int(scenario["terrain_type_index"]),
+        num_cols=int(terrain["num_cols"]), terrain_proportions=terrain["proportions"],
+        num_rows=int(terrain["num_rows"]), measure_heights=bool(terrain["measure_heights"]),
+        disable_v3_physics_switch=True,
+    )
+    selected_checkpoint = model.get("selected_checkpoints", {}).get(int(cell.seed))
+    if selected_checkpoint and sha256_file(str(session.checkpoint)) != str(selected_checkpoint["checkpoint_sha256"]):
+        raise RuntimeError(
+            f"V4 deploy checkpoint drift for {cell.model} seed {cell.seed}: selection recorded "
+            f"{selected_checkpoint['checkpoint_sha256']}, runner resolved {sha256_file(str(session.checkpoint))}"
+        )
+    actual_types = terrain_info["terrain_type"]
+    actual_levels = terrain_info["terrain_level"]
+    if not np.all(actual_types == int(scenario["terrain_type_index"])):
+        raise RuntimeError(f"V4 terrain type pin failed for {cell.name}: got {np.unique(actual_types).tolist()}")
+    if not np.all(actual_levels == int(scenario["terrain_level"])):
+        raise RuntimeError(f"V4 terrain level pin failed for {cell.name}: got {np.unique(actual_levels).tolist()}")
+    actual_type_name = _terrain_type_name(int(scenario["terrain_type_index"]), int(terrain["num_cols"]))
+    if actual_type_name != str(scenario["terrain_type"]):
+        raise RuntimeError(f"V4 terrain type mapping drift: config={scenario['terrain_type']}, runtime={actual_type_name}")
+    physics = _apply_v4_physics(session.env, scenario["physics"])
+    vx, vy, yaw = float(scenario["command_vx"]), float(protocol["commands"]["vy"]), float(protocol["commands"]["yaw_rate"])
+    commands = np.tile(np.asarray([[vx, vy, yaw]], dtype=np.float32), (session.env.num_envs, 1))
+    payload = _base_payload(session, V4_MATRIX_SUITE, cell.name, int(protocol["eval_seed"]),
+                            int(protocol["warmup_steps"]), int(protocol["measured_steps"]), cfg)
+    physics_signature = json.dumps(scenario["physics"], sort_keys=True, separators=(",", ":"))
+    payload.update(
+        protocol_kind="v4_headroom_matrix_v1", protocol_fingerprint=_v4_protocol_fingerprint(cfg),
+        campaign_fingerprint=_v4_campaign_fingerprint(cfg, root),
+        tier=str(scenario["tier"]), physics_tier=str(scenario["tier"]),
+        physics_axis=str(scenario["physics_axis"]), physics_dr_axis=str(scenario["physics_dr_axis"]),
+        physics_band=str(scenario["physics_band"]), physics_scenario=str(scenario.get("physics_scenario", "")),
+        physics_signature=physics_signature, terrain_type_name=actual_type_name,
+        terrain_type_index=int(scenario["terrain_type_index"]), terrain_level=int(scenario["terrain_level"]),
+        terrain_num_cols=int(terrain["num_cols"]), terrain_num_rows=int(terrain["num_rows"]),
+        terrain_hash=_v4_terrain_hash(terrain_info, actual_type_name, int(scenario["terrain_level"]), int(protocol["eval_seed"])),
+        terrain_full_hash=str(terrain_info["terrain_hash"]), terrain_type=actual_types, terrain_level_per_env=actual_levels,
+        command_vx=vx, command_vy=vy, command_yaw_rate=yaw, command_speed=float(np.hypot(vx, vy)),
+        headline_command=True, **physics,
+        **_rollout_fixed(session, commands, warmup=int(protocol["warmup_steps"]), steps=int(protocol["measured_steps"])),
+    )
+    _save_cell(root, rel, payload)
+
+
 def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[str, Any]], cell: Cell, *, resume: bool) -> None:
     rel = _cell_rel(cell)
     final = root / "raw" / f"{rel}.npz"
-    if resume and _artifact_valid(final):
-        return
     model = models[cell.model]
     protocol = cfg["protocol"]
-    num_envs, eval_seed = int(protocol["num_envs"]), int(protocol["eval_seed"])
     scenario = dict(cell.scenario)
     kind = scenario["kind"]
+    if kind == "v4_headroom":
+        _run_v4_headroom_cell(root, cfg, model, cell, resume=resume)
+        return
+    if resume and _artifact_valid(final):
+        return
+    num_envs, eval_seed = int(protocol["num_envs"]), int(protocol["eval_seed"])
     if kind == "static_id":
         p = protocol["s0"]
         session = build_session(model, cell.seed, num_envs, eval_seed, id_domain_rand=True, disable_v3_physics_switch=True)
@@ -686,7 +1004,9 @@ def _run_cell(root: Path, cfg: Mapping[str, Any], models: Mapping[str, Mapping[s
         payload.update(terrain_kind=kind, terrain_level=level, terrain_hash=terrain_info["terrain_hash"],
                        terrain_num_cols=terrain_info["num_cols"], terrain_num_rows=terrain_info["num_rows"],
                        terrain_type=terrain_info["terrain_type"], terrain_level_per_env=terrain_info["terrain_level"],
-                       command_mode="forward", command_speed=vx, headline_command=True, **extra,
+                       command_mode="forward", command_speed=vx, command_vx=vx,
+                       physics_tier=(str(extra.get("payload_tier", "")) or "nominal"),
+                       physics_signature=str(extra.get("payload_name", "")), headline_command=True, **extra,
                        **_rollout_fixed(session, commands, warmup=int(t["warmup"]), steps=int(t["steps"])))
     else:
         raise ValueError(f"unknown V3 eval cell kind {kind!r}")
@@ -722,9 +1042,10 @@ def cmd_plan(cfg: Mapping[str, Any], suite: str, *, labels: Sequence[str] | None
     by_suite: Dict[str, int] = defaultdict(int)
     for cell in cells:
         by_suite[cell.suite] += 1
+    num_envs_per_cell = cfg["protocol"].get("num_envs", cfg["protocol"].get("replicas_per_cell"))
     print(_json({"campaign": cfg["campaign"], "suite": suite, "process_cells": len(cells), "configured_cells": len(all_cells),
                  "selected_policy_seeds": {label: model["training_seeds"] for label, model in selected.items()}, "by_suite": dict(by_suite),
-                 "num_envs_per_cell": cfg["protocol"]["num_envs"], "artifact_root": str(artifact_root(cfg)),
+                 "num_envs_per_cell": num_envs_per_cell, "artifact_root": str(artifact_root(cfg)),
                  "preview": [f"{cell.suite}:{cell.model}:seed{cell.seed}:{cell.name}" for cell in cells[:12]]}))
     return 0
 
@@ -799,11 +1120,90 @@ def _raw_rows(root: Path) -> List[Dict[str, Any]]:
                 "payload_tier": str(_scalar(z, "payload_tier", _scalar(z, "switch_tier", ""))),
                 "payload_name": str(_scalar(z, "payload_name", _scalar(z, "switch_name", ""))),
                 "command_name": str(_scalar(z, "command_name", "")),
+                # Keep enough provenance to form a V4 world key even for the
+                # older flat artifacts.  New V4 writers persist command_vx and
+                # physics_tier explicitly; the fallbacks make the reader
+                # append-only for V3/V4 terrain artifacts written before that
+                # schema existed.
+                "command_vx": float(_scalar(z, "command_vx", _scalar(z, "command_speed", 0.0))),
+                "physics_tier": str(_scalar(z, "physics_tier", _scalar(z, "payload_tier", "nominal"))) or "nominal",
+                "physics_signature": str(_scalar(z, "physics_signature", _scalar(z, "payload_name", ""))),
+                "eval_seed": int(_scalar(z, "eval_seed", -1)),
+                "physics_axis": str(_scalar(z, "physics_axis", "")),
+                "physics_band": str(_scalar(z, "physics_band", "")),
+                "protocol_kind": str(_scalar(z, "protocol_kind", "")),
+                "protocol_fingerprint": str(_scalar(z, "protocol_fingerprint", "")),
+                "campaign_fingerprint": str(_scalar(z, "campaign_fingerprint", "")),
+                "terrain_type_name": str(_scalar(z, "terrain_type_name", "")),
+                "terrain_level": int(_scalar(z, "terrain_level", 0)),
+                "terrain_hash": str(_scalar(z, "terrain_hash", "")),
             }
             if suite == "s2":
                 row["post_switch_tracking_error"] = _mean(z, "post_switch_tracking_error")
                 row["post_switch_tracking_yaw"] = _mean(z, "post_switch_tracking_yaw")
             rows.append(row)
+    return rows
+
+
+def _followup_reference_rows(cfg: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Import only frozen MLP/Oracle references from the discovery artifact root.
+
+    Adaptation policies must never decide their own evaluation population.  The
+    manifest pins that population and hashes the two discovery summary inputs;
+    this loader verifies both before allowing the old reference artifacts into
+    the follow-up scorecard.
+    """
+    manifest = _v4_followup_manifest(cfg)
+    if manifest is None:
+        return []
+    source = manifest["source"]
+    root_value = str(source["artifact_root"])
+    source_root = Path(root_value) if Path(root_value).is_absolute() else _root() / root_value
+    headline = source_root / "tables" / "headline.json"
+    scorecard_worlds = source_root / "tables" / "scorecard_worlds.csv"
+    raw_table = source_root / "tables" / "raw_cells.csv"
+    run_selection = source_root / "run_selection.json"
+    for path, expected, name in ((headline, source["headline_sha256"], "headline"),
+                                 (scorecard_worlds, source["scorecard_worlds_sha256"], "scorecard worlds"),
+                                 (raw_table, source["raw_cells_sha256"], "raw-cell table"),
+                                 (run_selection, source["run_selection_sha256"], "checkpoint selection")):
+        actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        if actual != str(expected):
+            raise RuntimeError(f"frozen follow-up {name} hash changed; regenerate the manifest instead of mixing discovery results")
+    allowed = {
+        (json.dumps(world["identity"], sort_keys=True, separators=(",", ":")), int(seed))
+        for world in manifest["worlds"] for seed in world["training_seeds"]
+    }
+    score = cfg["scorecard"]
+    references = {str(score["baseline_label"]), str(score["oracle_label"])}
+    expected_fingerprint = str(source["protocol_fingerprint"])
+    expected_campaign = str(source["campaign_fingerprint"])
+    rows = []
+    for row in _raw_rows(source_root):
+        if (str(row["model"]) not in references or str(row.get("protocol_fingerprint", "")) != expected_fingerprint
+                or str(row.get("campaign_fingerprint", "")) != expected_campaign):
+            continue
+        key = (json.dumps(_v4_world_identity(row), sort_keys=True, separators=(",", ":")), int(row["training_seed"]))
+        if key in allowed:
+            world = next(item for item in manifest["worlds"]
+                         if json.dumps(item["identity"], sort_keys=True, separators=(",", ":")) == key[0])
+            reference = world["references"][str(row["training_seed"])]
+            if str(row.get("terrain_hash", "")) != str(reference["terrain_hash"]):
+                raise RuntimeError("frozen follow-up terrain hash drift; regenerate the manifest")
+            artifact = source_root / str(row["path"])
+            expected_artifact = reference["artifacts"][str(row["model"])]
+            actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest() if artifact.is_file() else ""
+            if actual_sha != str(expected_artifact["npz_sha256"]):
+                raise RuntimeError("frozen follow-up reference artifact drift; regenerate the manifest")
+            for field in ("tracking_error", "fall_rate", "achieved_speed_ratio"):
+                if not np.isclose(float(row[field]), float(expected_artifact[field]), rtol=0.0, atol=1e-12):
+                    raise RuntimeError(f"frozen follow-up reference {field} drift; regenerate the manifest")
+            copied = dict(row)
+            copied["frozen_discovery_reference"] = True
+            rows.append(copied)
+    expected_count = len(allowed) * len(references)
+    if len(rows) != expected_count:
+        raise RuntimeError(f"frozen follow-up references incomplete: expected {expected_count}, found {len(rows)}")
     return rows
 
 
@@ -832,6 +1232,9 @@ def _terrain_raw_rows(root: Path) -> List[Dict[str, Any]]:
             payload_tier = str(_scalar(z, "payload_tier", ""))
             payload_name = str(_scalar(z, "payload_name", ""))
             command_speed = float(_scalar(z, "command_speed", 0.0))
+            command_vx = float(_scalar(z, "command_vx", command_speed))
+            physics_tier = str(_scalar(z, "physics_tier", payload_tier)) or "nominal"
+            physics_signature = str(_scalar(z, "physics_signature", payload_name))
             terrain_type = np.asarray(z["terrain_type"]).astype(int)
             tracking = np.asarray(z["tracking_lin"], dtype=float)
             fall = np.asarray(z["fall_rate"], dtype=float)
@@ -861,10 +1264,13 @@ def _terrain_raw_rows(root: Path) -> List[Dict[str, Any]]:
                     "spnte_lin": float(np.mean(spnte_lin[mask])),
                     "spnte_yaw": float(np.mean(spnte_yaw[mask])),
                     "spnte_v_scale": spnte_v_scale,
-                    "command_speed": command_speed, "headline_command": True, "diagnostic_kind": "",
+                    "command_speed": command_speed, "command_vx": command_vx,
+                    "physics_tier": physics_tier, "physics_signature": physics_signature,
+                    "headline_command": True, "diagnostic_kind": "",
                     "payload_tier": payload_tier, "payload_name": payload_name, "command_name": "",
                     "terrain_type": int(type_index), "terrain_type_name": type_name, "terrain_level": level,
-                    "terrain_hash": terrain_hash, "num_replicas": int(mask.sum()),
+                    "terrain_hash": terrain_hash, "eval_seed": int(_scalar(z, "eval_seed", -1)),
+                    "num_replicas": int(mask.sum()),
                 })
     return rows
 
@@ -954,24 +1360,410 @@ def _scope(row: Mapping[str, Any]) -> str:
     raise ValueError(f"no gap-closed scope for {row['suite']}")
 
 
+def _uses_v4_world_headroom(cfg: Mapping[str, Any]) -> bool:
+    """Whether aggregation must use the V4 per-world contract.
+
+    V3's historical scorecard intentionally pools its reference seeds for
+    backwards compatibility.  That is not scientifically valid for the V4
+    terrain matrix: a training seed is a replicate, not an additional
+    parallel-env sample.  The explicit runner interface is the preferred
+    switch; the campaign-name fallback keeps the existing V4 terrain campaign
+    on the stricter path without requiring an artifact migration.
+    """
+    interface = cfg.get(
+        "runner_interface",
+        cfg.get("execution", {}).get("runner_interface", cfg.get("protocol", {}).get("runner_interface", "")),
+    )
+    return interface == "v4_headroom_matrix_v1" or str(cfg.get("campaign", "")).startswith("v4_")
+
+
+def _v4_world_identity(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Physical world identity, deliberately excluding ``training_seed``.
+
+    A training seed is retained alongside this key during scoring and only
+    aggregated after a per-seed, per-world comparison.  ``physics_signature``
+    prevents two distinct settings in the same broad tier from being merged.
+    """
+    return {
+        "suite": str(row.get("suite", "")),
+        "terrain_type": str(row.get("terrain_type_name", "")),
+        "terrain_level": int(row.get("terrain_level", 0)),
+        "command_vx": float(row.get("command_vx", row.get("command_speed", 0.0))),
+        "physics_tier": str(row.get("physics_tier", row.get("payload_tier", "nominal"))) or "nominal",
+        "physics_signature": str(row.get("physics_signature", row.get("payload_name", ""))),
+        "eval_seed": int(row.get("eval_seed", -1)),
+        "physics_axis": str(row.get("physics_axis", "")),
+        "physics_band": str(row.get("physics_band", "")),
+        # ``scenario`` remains part of the key for legacy artifacts that did
+        # not yet emit a complete physics signature.
+        "scenario": str(row.get("scenario", "")),
+    }
+
+
+def _v4_world_key(row: Mapping[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+    return tuple(sorted(_v4_world_identity(row).items()))
+
+
+def _v4_scope(row: Mapping[str, Any], score_cfg: Mapping[str, Any]) -> str:
+    """Keep secondary stress worlds out of the declared primary headline."""
+    tier = str(row.get("physics_tier", row.get("payload_tier", "nominal"))) or "nominal"
+    if row.get("suite") == V4_MATRIX_SUITE:
+        if tier == str(score_cfg.get("headline_tier", tier)):
+            return f"GapClosed_primary_{row.get('physics_axis', 'unknown')}_{row.get('physics_band', 'unknown')}"
+        return f"GapClosed_secondary_{tier}_{row.get('physics_band', 'unknown')}"
+    if tier == str(score_cfg.get("headline_tier", tier)):
+        return _scope(row)
+    return f"GapClosed_secondary_{tier}_{row.get('terrain_type_name', 'flat')}"
+
+
+def classify_v4_tracking_world(mlp: Mapping[str, Any], oracle: Mapping[str, Any], score_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Classify a V4 world using *only* the MLP and Oracle references.
+
+    A survival world is useful for survival reporting but has no tracking
+    GapClosed value. Gates are explicit scorecard contract fields and therefore
+    part of the V4 protocol fingerprint.
+    """
+    mlp_fall = float(mlp["fall_rate"])
+    oracle_fall = float(oracle["fall_rate"])
+    oracle_speed = float(oracle["achieved_speed_ratio"])
+    absolute_headroom = float(mlp["tracking_error"]) - float(oracle["tracking_error"])
+    reasons: List[str] = []
+    fall_gate = float(score_cfg["fall_gate_pp"])
+    speed_gate = float(score_cfg["achieved_speed_ratio"])
+    absolute_gate = float(score_cfg["absolute_headroom"])
+    relative_gate = float(score_cfg["relative_headroom"])
+    relative_headroom = absolute_headroom / float(mlp["tracking_error"]) if float(mlp["tracking_error"]) > 0 else float("nan")
+    if not np.isfinite(mlp_fall) or mlp_fall > fall_gate:
+        reasons.append(f"mlp_fall_rate_gt_{fall_gate:.2f}")
+    if not np.isfinite(oracle_fall) or oracle_fall > fall_gate:
+        reasons.append(f"oracle_fall_rate_gt_{fall_gate:.2f}")
+    if reasons:
+        return {
+            "world_classification": "survival",
+            "survival_status": "survival_world",
+            "tracking_status": "excluded_survival_world",
+            "tracking_include": False,
+            "tracking_exclusion_reasons": ";".join(reasons),
+            "absolute_tracking_headroom": absolute_headroom, "relative_tracking_headroom": relative_headroom,
+        }
+    if not np.isfinite(oracle_speed) or oracle_speed < speed_gate:
+        reasons.append(f"oracle_achieved_speed_ratio_lt_{speed_gate:.2f}")
+    if not np.isfinite(absolute_headroom) or absolute_headroom < absolute_gate:
+        reasons.append(f"absolute_tracking_headroom_lt_{absolute_gate:.2f}")
+    if not np.isfinite(relative_headroom) or relative_headroom < relative_gate:
+        reasons.append(f"relative_tracking_headroom_lt_{relative_gate:.2f}")
+    if reasons:
+        return {
+            "world_classification": "tracking_excluded",
+            "survival_status": "survival_eligible",
+            "tracking_status": "excluded_tracking_gate",
+            "tracking_include": False,
+            "tracking_exclusion_reasons": ";".join(reasons),
+            "absolute_tracking_headroom": absolute_headroom, "relative_tracking_headroom": relative_headroom,
+        }
+    return {
+        "world_classification": "tracking",
+        "survival_status": "survival_eligible",
+        "tracking_status": "eligible",
+        "tracking_include": True,
+        "tracking_exclusion_reasons": "",
+        "absolute_tracking_headroom": absolute_headroom, "relative_tracking_headroom": relative_headroom,
+    }
+
+
+def _v4_normalized_headroom_payload(cfg: Mapping[str, Any], world_rows: Sequence[Mapping[str, Any]], score_rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Adapt scorecard rows to ``headroom_report.py``'s deliberately small schema."""
+    score_cfg = cfg["scorecard"]
+    primary_tier = str(score_cfg.get("headline_tier", ""))
+    by_world: Dict[Tuple[Tuple[str, Any], ...], List[Mapping[str, Any]]] = defaultdict(list)
+    identity_fields = ("suite", "terrain_type", "terrain_level", "command_vx", "physics_tier", "physics_signature", "eval_seed", "physics_axis", "physics_band")
+    for row in world_rows:
+        by_world[tuple((field, row.get(field, "")) for field in identity_fields)].append(row)
+    scores_by_world: Dict[Tuple[Tuple[str, Any], ...], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in score_rows:
+        scores_by_world[tuple((field, row.get(field, "")) for field in identity_fields)].append(row)
+
+    worlds = []
+    for key, rows in sorted(by_world.items()):
+        identity = dict(key)
+        def median(field: str) -> float | None:
+            values = [float(row[field]) for row in rows if np.isfinite(float(row.get(field, float("nan"))))]
+            return float(np.median(values)) if values else None
+        mlp_error, oracle_error = median("mlp_tracking_error"), median("oracle_tracking_error")
+        # The renderer requires reference tracking values. An incomplete
+        # append-only campaign is still fully retained in scorecard_worlds.csv;
+        # omit it here rather than serialize NaN into a renderer contract.
+        if mlp_error is None or oracle_error is None:
+            continue
+        all_tracking = all(bool(row["tracking_include"]) for row in rows)
+        reasons = sorted({
+            reason
+            for row in rows
+            for reason in str(row.get("tracking_exclusion_reasons", "")).split(";")
+            if reason
+        })
+        if str(identity["physics_tier"]) != primary_tier:
+            all_tracking = False
+            if "secondary_tier_not_primary_headline" not in reasons:
+                reasons.append("secondary_tier_not_primary_headline")
+        band = str(identity["physics_band"]).lower()
+        id_ood = "ID" if band.startswith("id") or band in {"", "nominal", "in_band"} else "OOD"
+        terrain_label = {
+            "slope": "Eğim",
+            "random_uniform": "Rastgele pürüz",
+            "stairs_down": "İnen merdiven",
+            "stairs_up": "Çıkan merdiven",
+            "discrete": "Ayrık engeller",
+        }.get(str(identity["terrain_type"]), str(identity["terrain_type"]))
+        axis_label = {
+            "mass_kg": "kütle",
+            "com_x_m": "CoM-x",
+            "friction": "sürtünme",
+            "combined": "birleşik stress",
+        }.get(str(identity["physics_axis"]), str(identity["physics_axis"]))
+        try:
+            physics = json.loads(str(identity["physics_signature"]))
+        except json.JSONDecodeError:
+            physics = None
+        axis = str(identity["physics_axis"])
+        if not isinstance(physics, Mapping):
+            physical_label = f"{axis_label} = {identity['physics_signature']}"
+        elif axis == "mass_kg":
+            physical_label = f"kütle = {float(physics['mass_kg']):+g} kg"
+        elif axis == "com_x_m":
+            physical_label = f"CoM-x = {float(physics['com_x_m']):+g} m"
+        elif axis == "friction":
+            physical_label = f"sürtünme = {float(physics['friction']):g}"
+        else:
+            physical_label = (f"kütle = {float(physics['mass_kg']):+g} kg · "
+                              f"CoM-x = {float(physics['com_x_m']):+g} m · μ = {float(physics['friction']):g}")
+        name = (f"{terrain_label} · L{identity['terrain_level']} · {float(identity['command_vx']):g} m/s · "
+                f"{physical_label} · {str(identity['physics_band']).upper()}")
+        tracking = {"MLP": mlp_error, "Oracle": oracle_error}
+        fall = {"MLP": median("mlp_fall_rate"), "Oracle": median("oracle_fall_rate")}
+        speed = {"MLP": None, "Oracle": median("oracle_achieved_speed_ratio")}
+        consistency: Dict[str, Dict[str, int]] = {}
+        gap_closed: Dict[str, float | None] = {}
+        method_note: Dict[str, str] = {}
+        for label, report_label in (("DreamWaQ", "DreamWaQ"), ("HIM-fixed", "HIM"), ("HIM", "HIM")):
+            method_rows = [row for row in scores_by_world.get(key, []) if row.get("model") == label]
+            if not method_rows:
+                continue
+            values = [float(row["method_tracking_error"]) for row in method_rows]
+            tracking[report_label] = float(np.median(values))
+            fall[report_label] = float(np.median([float(row["method_fall_rate"]) for row in method_rows]))
+            speed[report_label] = float(np.median([float(row["method_achieved_speed_ratio"]) for row in method_rows]))
+            included = [row for row in method_rows if row.get("headline_include")]
+            consistency[report_label] = {"better_seeds": sum(float(row.get("raw_gap_closed", 0.0)) > 0.0 for row in included),
+                                         "total_seeds": len({int(row["training_seed"]) for row in method_rows})}
+            if any(str(row.get("headline_status")) == "method_fall_gated" for row in method_rows):
+                gap_closed[report_label] = None
+                method_note[report_label] = "survival-gated"
+            else:
+                values = [float(row["headline_gap_closed"]) for row in included if "headline_gap_closed" in row]
+                gap_closed[report_label] = float(np.median(values)) if values else None
+        worlds.append({"world": name, "id_ood": id_ood, "include": all_tracking,
+                       "exclusion_reason": ";".join(reasons), "tracking_error": tracking,
+                       "fall_rate": fall, "achieved_speed_ratio": speed, "seed_consistency": consistency,
+                       "gap_closed": gap_closed, "method_note": method_note})
+    seed_count = len({int(row["training_seed"]) for row in world_rows})
+    return {"experiment": {"name": str(cfg["campaign"]),
+                             "contract": "Eşlenmiş MLP–Oracle; sabit terrain, komut ve fizik kimliği.",
+                             "seed_count": max(seed_count, 1),
+                             "tracking_metric": "Ortalama doğrusal hız takip hatası (m/s)",
+                             "limitations": ["Birleşik stress dünyaları ana tracking sonucuna dahil edilmez.",
+                                             "Tracking uygunluğu yalnızca MLP ve Oracle ile belirlenir."]},
+            "worlds": worlds}
+
+
+def _aggregate_v4_world_headroom(cfg: Mapping[str, Any], raw: Sequence[Mapping[str, Any]], diagnostic_raw: Sequence[Mapping[str, Any]]) -> int:
+    """Aggregate V4 headroom without pooling worlds or training seeds.
+
+    The reference selection is intentionally made before any adaptation-method
+    row is read.  Therefore DreamWaQ/HIM (or any later method) cannot turn a
+    survival world into a tracking world, nor select a more favorable oracle.
+    """
+    root = artifact_root(cfg)
+    score_cfg = cfg["scorecard"]
+    baseline_label = str(score_cfg["baseline_label"])
+    oracle_label = str(score_cfg["oracle_label"])
+    scored = [row for row in raw if row["suite"] in (*SCORED_SUITES, V4_MATRIX_SUITE) and bool(row["headline_command"])]
+    if _is_v4_headroom_matrix(cfg):
+        expected_fingerprint = _v4_protocol_fingerprint(cfg)
+        expected_campaign = _v4_campaign_fingerprint(cfg, root)
+        for row in scored:
+            if row["suite"] != V4_MATRIX_SUITE:
+                continue
+            if row.get("protocol_kind") != "v4_headroom_matrix_v1" or row.get("protocol_fingerprint") != expected_fingerprint:
+                raise RuntimeError(
+                    "V4 aggregate found an artifact from a different protocol fingerprint; "
+                    "start a new artifact root instead of mixing smoke/full or changed matrix cells"
+                )
+            if not row.get("frozen_discovery_reference") and row.get("campaign_fingerprint") != expected_campaign:
+                raise RuntimeError("V4 aggregate found an artifact from a different campaign fingerprint; start a new artifact root")
+    by_world_seed: Dict[Tuple[Tuple[Tuple[str, Any], ...], int], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in scored:
+        by_world_seed[(_v4_world_key(row), int(row["training_seed"]))].append(row)
+
+    score_rows: List[Dict[str, Any]] = []
+    world_rows: List[Dict[str, Any]] = []
+    for (world_key, training_seed), rows in sorted(by_world_seed.items(), key=lambda item: (item[0][0], item[0][1])):
+        identity = dict(world_key)
+        terrain_hashes = {str(row.get("terrain_hash", "")) for row in rows}
+        terrain_hashes.discard("")
+        if len(terrain_hashes) > 1:
+            offenders = {str(row["model"]): str(row.get("terrain_hash", ""))[:12] for row in rows}
+            raise RuntimeError(
+                "terrain geometry mismatch in V4 world "
+                f"{identity['terrain_type']}:L{identity['terrain_level']}:eval{identity['eval_seed']}: "
+                f"{offenders}"
+            )
+        by_model: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+        for row in rows:
+            by_model[str(row["model"])].append(row)
+        mlps = by_model.get(baseline_label, [])
+        oracles = by_model.get(oracle_label, [])
+        if len(mlps) != 1 or len(oracles) != 1:
+            # We do not substitute a different training seed or median several
+            # rows.  Emit the missing-reference condition for methods so an
+            # incomplete append-only campaign is visible rather than silently
+            # changing the comparison population.
+            ref_reasons = []
+            if len(mlps) != 1:
+                ref_reasons.append("missing_or_duplicate_mlp_reference")
+            if len(oracles) != 1:
+                ref_reasons.append("missing_or_duplicate_oracle_reference")
+            classification: Dict[str, Any] = {
+                "world_classification": "unscorable",
+                "survival_status": "unclassified",
+                "tracking_status": "excluded_missing_reference",
+                "tracking_include": False,
+                "tracking_exclusion_reasons": ";".join(ref_reasons),
+                "absolute_tracking_headroom": float("nan"),
+            }
+            mlp = oracle = None
+        else:
+            mlp, oracle = mlps[0], oracles[0]
+            classification = classify_v4_tracking_world(mlp, oracle, score_cfg)
+            if str(identity["physics_tier"]) != str(score_cfg["headline_tier"]):
+                reasons = [item for item in str(classification["tracking_exclusion_reasons"]).split(";") if item]
+                if "secondary_tier_not_primary_headline" not in reasons:
+                    reasons.append("secondary_tier_not_primary_headline")
+                classification = {**classification, "tracking_include": False,
+                                  "tracking_status": "excluded_secondary_tier",
+                                  "tracking_exclusion_reasons": ";".join(reasons)}
+        world_rows.append({**identity, "training_seed": training_seed,
+                           "baseline_label": baseline_label, "oracle_label": oracle_label,
+                           "mlp_tracking_error": float(mlp["tracking_error"]) if mlp else float("nan"),
+                           "oracle_tracking_error": float(oracle["tracking_error"]) if oracle else float("nan"),
+                           "mlp_fall_rate": float(mlp["fall_rate"]) if mlp else float("nan"),
+                           "oracle_fall_rate": float(oracle["fall_rate"]) if oracle else float("nan"),
+                           "oracle_achieved_speed_ratio": float(oracle["achieved_speed_ratio"]) if oracle else float("nan"),
+                           **classification})
+        for label in score_cfg["method_labels"]:
+            for method in by_model.get(str(label), []):
+                row = {**identity, "training_seed": training_seed, "model": str(label),
+                       "scope": _v4_scope(method, score_cfg), "metric_kind": "tracking",
+                       "method_tracking_error": float(method["tracking_error"]),
+                       "method_fall_rate": float(method["fall_rate"]),
+                       "method_achieved_speed_ratio": float(method["achieved_speed_ratio"]),
+                       "method_survival_status": ("survived" if float(method["fall_rate"]) <= float(score_cfg["fall_gate_pp"])
+                                                  else f"fall_rate_gt_{float(score_cfg['fall_gate_pp']):.2f}"),
+                       **classification}
+                if mlp is not None:
+                    row["baseline_tracking_error"] = float(mlp["tracking_error"])
+                if oracle is not None:
+                    row["oracle_tracking_error"] = float(oracle["tracking_error"])
+                if classification["tracking_include"]:
+                    # Never clip the scientific value.  A value outside [0, 1]
+                    # is meaningful (regression or beating the oracle) and must
+                    # remain visible in the raw and headline seed summaries.
+                    raw_gap = (float(mlp["tracking_error"]) - float(method["tracking_error"])) / float(classification["absolute_tracking_headroom"])
+                    method_fall_gate = float(score_cfg["fall_gate_pp"])
+                    if float(method["fall_rate"]) > method_fall_gate:
+                        row.update({"headline_status": "method_fall_gated", "headline_include": True,
+                                    "raw_gap_closed": raw_gap, "headline_gap_closed": 0.0,
+                                    "reasons": "method_fall_gate"})
+                    else:
+                        row.update({"headline_status": "eligible", "headline_include": True,
+                                    "raw_gap_closed": raw_gap, "headline_gap_closed": raw_gap,
+                                    "reasons": ""})
+                else:
+                    row.update({"headline_status": str(classification["tracking_status"]), "headline_include": False,
+                                "reasons": str(classification["tracking_exclusion_reasons"])})
+                score_rows.append(row)
+
+    _write_csv(root / "tables" / "scorecard_worlds.csv", world_rows)
+    _write_csv(root / "tables" / "scorecard_cells.csv", score_rows)
+    seed_scores: List[Dict[str, Any]] = []
+    by_seed: Dict[Tuple[str, str, int], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in score_rows:
+        if row["headline_include"]:
+            by_seed[(str(row["model"]), str(row["scope"]), int(row["training_seed"]))].append(row)
+    for (model, scope, training_seed), rows in sorted(by_seed.items()):
+        values = [float(row["headline_gap_closed"]) for row in rows]
+        signs = {int(np.sign(value)) for value in values if value != 0.0}
+        seed_scores.append({"model": model, "scope": scope, "metric_kind": "tracking", "training_seed": training_seed,
+                            "n_cells": len(values), "gap_closed_median": float(np.median(values)),
+                            "gap_closed_min": float(np.min(values)), "gap_closed_max": float(np.max(values)),
+                            "all_cells_positive": all(value > 0.0 for value in values),
+                            "cell_sign_consistent": len(signs) <= 1})
+    _write_csv(root / "tables" / "scorecard_seed_scores.csv", seed_scores)
+    headlines: List[Dict[str, Any]] = []
+    by_headline: Dict[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in seed_scores:
+        by_headline[(str(row["model"]), str(row["scope"]))].append(row)
+    for (model, scope), rows in sorted(by_headline.items()):
+        values = [float(row["gap_closed_median"]) for row in rows]
+        signs = {int(np.sign(value)) for value in values if value != 0.0}
+        headlines.append({"model": model, "metric": scope, "metric_kind": "tracking", "n_training_seeds": len(rows),
+                          "value_median": float(np.median(values)), "value_min": float(np.min(values)),
+                          "value_max": float(np.max(values)), "all_seeds_positive": all(value > 0.0 for value in values),
+                          "seed_sign_consistent": len(signs) <= 1})
+    status_counts: Dict[str, int] = defaultdict(int)
+    for row in score_rows:
+        status_counts[str(row["headline_status"])] += 1
+    classification_counts: Dict[str, int] = defaultdict(int)
+    for row in world_rows:
+        classification_counts[str(row["world_classification"])] += 1
+    summary = {"campaign": cfg["campaign"], "headline": headlines, "status_counts": dict(status_counts),
+               "world_classification_counts": dict(classification_counts), "raw_cells": len(raw),
+               "scorecard_cells": len(score_rows), "scorecard_worlds": len(world_rows), "seed_scores": len(seed_scores),
+               "command_ood_diagnostic_raw_cells": len(diagnostic_raw),
+               "contract": "v4_headroom_matrix_v1"}
+    normalized_path = root / "tables" / "headroom_report_normalized.json"
+    normalized_path.write_text(_json(_v4_normalized_headroom_payload(cfg, world_rows, score_rows)), encoding="utf-8")
+    summary["normalized_headroom_json"] = str(normalized_path.relative_to(root))
+    (root / "tables" / "headline.json").write_text(_json(summary), encoding="utf-8")
+    print(f"[v3_eval] V4 aggregate raw={len(raw)} worlds={len(world_rows)} scorecard_cells={len(score_rows)} -> {root / 'tables'}")
+    return 0
+
+
 def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
     root = artifact_root(cfg)
     raw = _raw_rows(root) + _terrain_raw_rows(root)
+    frozen_references = _followup_reference_rows(cfg)
+    raw = raw + frozen_references
     if not raw:
         raise FileNotFoundError(f"no raw artifacts under {root / 'raw'}")
     _write_csv(root / "tables" / "raw_cells.csv", raw)
     score_cfg = cfg["scorecard"]
     baseline_label, oracle_label = score_cfg["baseline_label"], score_cfg["oracle_label"]
-    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    # A policy training seed is a replicate.  It must be held fixed while the
+    # MLP/oracle/method cell is formed; seed aggregation happens only below in
+    # ``scorecard_seed_scores.csv`` / ``headline.json``.
+    grouped: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
     diagnostic_raw = []
     for row in raw:
         if row["suite"] in SCORED_SUITES:
             if row["headline_command"]:
-                grouped[(row["suite"], row["scenario"])].append(row)
+                grouped[(row["suite"], row["scenario"], int(row["training_seed"]))].append(row)
             else:
                 diagnostic_raw.append(row)
+    if _uses_v4_world_headroom(cfg):
+        return _aggregate_v4_world_headroom(cfg, raw, diagnostic_raw)
     score_rows: List[Dict[str, Any]] = []
-    for (suite, scenario), rows in grouped.items():
+    for (suite, scenario, training_seed), rows in grouped.items():
         if suite in TERRAIN_SUITES:
             # The entire scorecard's validity rests on every method seeing a
             # byte-identical heightfield for this (type x level/payload) cell.
@@ -983,7 +1775,7 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
             if len(hashes) > 1:
                 offenders = {row["model"]: str(row.get("terrain_hash", ""))[:12] for row in rows}
                 raise RuntimeError(
-                    f"terrain geometry mismatch in {suite}:{scenario}; methods must share one "
+                    f"terrain geometry mismatch in {suite}:{scenario}:seed{training_seed}; methods must share one "
                     f"heightfield but saw {len(hashes)} distinct terrain_hash values: {offenders}"
                 )
         baseline_rows = [row for row in rows if row["model"] == baseline_label]
@@ -1057,39 +1849,53 @@ def cmd_aggregate(cfg: Mapping[str, Any]) -> int:
     # S0a is deliberately not transformed into gap_closed. It reports the
     # method-minus-MLP tracking and fall difference on static ID.
     s0_static = [row for row in raw if row["suite"] == "s0" and row["scenario"] == "static_id"]
-    mlp_static = [row for row in s0_static if row["model"] == baseline_label]
-    if mlp_static:
-        baseline_tracking = float(np.median([row["tracking_lin"] for row in mlp_static]))
-        baseline_fall = float(np.median([row["fall_rate"] for row in mlp_static]))
-        for label in score_cfg["method_labels"]:
-            values = [row for row in s0_static if row["model"] == label]
-            if values:
-                tracking_delta = [row["tracking_lin"] - baseline_tracking for row in values]
-                fall_delta = [row["fall_rate"] - baseline_fall for row in values]
-                headlines.append({"model": label, "metric": "ID_delta_tracking", "n_training_seeds": len(values),
-                                  "value_median": float(np.median(tracking_delta)), "value_min": float(np.min(tracking_delta)),
-                                  "value_max": float(np.max(tracking_delta)), "all_seeds_positive": None,
-                                  "fall_delta_median": float(np.median(fall_delta))})
+    mlp_static_by_seed: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
+    for row in s0_static:
+        if row["model"] == baseline_label:
+            mlp_static_by_seed[int(row["training_seed"])].append(row)
+    for label in score_cfg["method_labels"]:
+        tracking_delta, fall_delta = [], []
+        for row in s0_static:
+            if row["model"] != label:
+                continue
+            same_seed = mlp_static_by_seed.get(int(row["training_seed"]), [])
+            if len(same_seed) != 1:
+                # A seed is a replicate, not an interchangeable sample.  Do
+                # not borrow/median a different seed's MLP for an ID delta.
+                continue
+            baseline_row = same_seed[0]
+            tracking_delta.append(float(row["tracking_lin"]) - float(baseline_row["tracking_lin"]))
+            fall_delta.append(float(row["fall_rate"]) - float(baseline_row["fall_rate"]))
+        if tracking_delta:
+            headlines.append({"model": label, "metric": "ID_delta_tracking", "n_training_seeds": len(tracking_delta),
+                              "value_median": float(np.median(tracking_delta)), "value_min": float(np.min(tracking_delta)),
+                              "value_max": float(np.max(tracking_delta)), "all_seeds_positive": None,
+                              "fall_delta_median": float(np.median(fall_delta))})
     # t0 is descriptive, not a gap-closed suite: report each method's
     # tracking/fall delta versus MLP at the nominal terrain difficulty, per type.
     t0_rows = [row for row in raw if row["suite"] == "t0"]
     for type_name in sorted({str(row["terrain_type_name"]) for row in t0_rows}):
         type_rows = [row for row in t0_rows if str(row["terrain_type_name"]) == type_name]
-        mlp_rows = [row for row in type_rows if row["model"] == baseline_label]
-        if not mlp_rows:
-            continue
-        baseline_tracking = float(np.median([row["tracking_lin"] for row in mlp_rows]))
-        baseline_fall = float(np.median([row["fall_rate"] for row in mlp_rows]))
+        mlp_by_seed: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
+        for row in type_rows:
+            if row["model"] == baseline_label:
+                mlp_by_seed[int(row["training_seed"])].append(row)
         for label in score_cfg["method_labels"]:
-            values = [row for row in type_rows if row["model"] == label]
-            if not values:
-                continue
-            tracking_delta = [row["tracking_lin"] - baseline_tracking for row in values]
-            fall_delta = [row["fall_rate"] - baseline_fall for row in values]
-            headlines.append({"model": label, "metric": f"terrain_ID_delta_tracking_{type_name}",
-                              "n_training_seeds": len(values), "value_median": float(np.median(tracking_delta)),
-                              "value_min": float(np.min(tracking_delta)), "value_max": float(np.max(tracking_delta)),
-                              "all_seeds_positive": None, "fall_delta_median": float(np.median(fall_delta))})
+            tracking_delta, fall_delta = [], []
+            for row in type_rows:
+                if row["model"] != label:
+                    continue
+                same_seed = mlp_by_seed.get(int(row["training_seed"]), [])
+                if len(same_seed) != 1:
+                    continue
+                baseline_row = same_seed[0]
+                tracking_delta.append(float(row["tracking_lin"]) - float(baseline_row["tracking_lin"]))
+                fall_delta.append(float(row["fall_rate"]) - float(baseline_row["fall_rate"]))
+            if tracking_delta:
+                headlines.append({"model": label, "metric": f"terrain_ID_delta_tracking_{type_name}",
+                                  "n_training_seeds": len(tracking_delta), "value_median": float(np.median(tracking_delta)),
+                                  "value_min": float(np.min(tracking_delta)), "value_max": float(np.max(tracking_delta)),
+                                  "all_seeds_positive": None, "fall_delta_median": float(np.median(fall_delta))})
     # Split by metric_kind so the historical tracking status_counts stays
     # exactly what it was before SPNTE scoring existed; the parallel SPNTE
     # view gets its own counter rather than being silently mixed in.

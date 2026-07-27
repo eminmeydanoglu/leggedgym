@@ -318,6 +318,7 @@ def build_terrain_session(
     model: Dict[str, Any], seed: int, num_envs: int, eval_seed: int, *,
     fixed_level: int, num_cols: int, terrain_proportions: Iterable[float],
     num_rows: int | None = None, measure_heights: bool = True,
+    fixed_type: int | None = None,
     disable_v3_physics_switch: bool = True,
 ) -> Tuple[Session, Dict[str, Any]]:
     """Build one task/policy pair on a controlled ETH game-terrain grid.
@@ -381,7 +382,7 @@ def build_terrain_session(
     num_cols = int(num_cols)
     if num_cols < 1:
         raise ValueError(f"num_cols must be >= 1, got {num_cols}")
-    if int(num_envs) % num_cols != 0:
+    if fixed_type is None and int(num_envs) % num_cols != 0:
         raise ValueError(f"num_envs ({num_envs}) must be a multiple of num_cols ({num_cols}) for an even type split")
     terrain = env_cfg.terrain
     terrain.mesh_type = "heightfield"
@@ -395,6 +396,8 @@ def build_terrain_session(
     if not 0 <= int(fixed_level) < int(terrain.num_rows):
         raise ValueError(f"fixed_level must be in [0, {int(terrain.num_rows) - 1}], got {fixed_level}")
     terrain.fixed_terrain_level = int(fixed_level)
+    if fixed_type is not None and not 0 <= int(fixed_type) < num_cols:
+        raise ValueError(f"fixed_type must be in [0, {num_cols - 1}], got {fixed_type}")
     # No manual RNG seeding here: make_env's set_seed(eval_seed) below reseeds
     # numpy right before Terrain() is built, which is what actually pins the
     # random-uniform / discrete geometry deterministically across methods.
@@ -410,12 +413,20 @@ def build_terrain_session(
     adapter = runner.get_eval_adapter(device=env.device)
     session = Session(env, adapter, runner, checkpoint, run_dir, model, seed)
     sim = env.simulator
+    if fixed_type is not None:
+        # Matrix cells intentionally put every replica on one named terrain
+        # tile.  This occurs after Terrain() construction, preserving the full
+        # training geometry/proportion map, and before the first eval reset.
+        sim.terrain_types[:] = int(fixed_type)
+        sim.terrain_levels[:] = int(fixed_level)
+        sim.env_origins[:] = sim._terrain_origins[int(fixed_level), int(fixed_type)]
     height_field = np.ascontiguousarray(np.asarray(sim._terrain.height_field_raw))
     info = {
         "terrain_hash": _terrain_hash(height_field),
         "fixed_level": int(fixed_level),
         "num_cols": num_cols,
         "num_rows": int(terrain.num_rows),
+        "fixed_type": int(fixed_type) if fixed_type is not None else None,
         "terrain_type": sim.terrain_types.detach().cpu().numpy().astype(np.int64),
         "terrain_level": sim.terrain_levels.detach().cpu().numpy().astype(np.int64),
     }
