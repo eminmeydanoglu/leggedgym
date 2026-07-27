@@ -29,6 +29,165 @@ def _xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
     return np.array([q[3], q[0], q[1], q[2]])
 
 
+# ---------------------------------------------------------------------------
+# Heightfield → browser mesh helpers (pure; no Viser server required)
+# ---------------------------------------------------------------------------
+#
+# Uniform ``h[::stride]`` + smooth vertex normals turns discrete stairs into
+# soft hills: stride>=3 desyncs 0.4 m treads (4 samples at 0.1 m), and averaged
+# normals blur the risers.  Taxonomy play wants the opposite — keep plateaus
+# and shade hard at height discontinuities — without blowing the WebGL budget.
+
+
+def heightfield_render_stride(
+    nx: int,
+    ny: int,
+    max_verts: int = 120_000,
+    *,
+    hard_edges: bool = False,
+    min_stride: int = 1,
+) -> int:
+    """Smallest stride whose estimated mesh vertex count is <= ``max_verts``.
+
+    ``hard_edges`` expands each triangle to three unique vertices (flat
+    shading), so the budget is checked against ``3 * n_faces`` rather than
+    the shared grid size.  ``min_stride`` defaults to 1 — the old forced
+    ``max(3, ...)`` was what made taxonomy stairs look like mounds.
+    """
+    if nx < 2 or ny < 2:
+        return max(1, int(min_stride))
+    max_verts = max(1, int(max_verts))
+    min_stride = max(1, int(min_stride))
+    # Upper bound: even a huge field should terminate.
+    for stride in range(min_stride, max(nx, ny) + 1):
+        out_x = (nx + stride - 1) // stride  # matches len(range(0, nx, stride))
+        out_y = (ny + stride - 1) // stride
+        if hard_edges:
+            faces = 2 * max(0, out_x - 1) * max(0, out_y - 1)
+            verts = 3 * faces
+        else:
+            verts = out_x * out_y
+        if verts <= max_verts:
+            return stride
+    return max(nx, ny)
+
+
+def downsample_heightfield_edge_preserving(
+    height_samples: np.ndarray,
+    stride: int,
+) -> np.ndarray:
+    """Downsample a discrete heightfield while preferring flat stair treads.
+
+    Naive ``h[::stride]`` phases through step rings and smears plateaus.
+    For each ``stride x stride`` block we take the **mode** (most common
+    quantized height); ties break toward the block-center sample.  Flat
+    treads dominate thin riser pixels, so concentric stairs stay stepped.
+    """
+    h = np.asarray(height_samples)
+    if h.ndim != 2:
+        raise ValueError(f"height_samples must be 2-D, got shape {h.shape}")
+    stride = int(stride)
+    if stride <= 1:
+        return h
+    nx, ny = h.shape
+    out_x = (nx + stride - 1) // stride
+    out_y = (ny + stride - 1) // stride
+    out = np.empty((out_x, out_y), dtype=h.dtype)
+    for ix in range(out_x):
+        x0 = ix * stride
+        x1 = min(x0 + stride, nx)
+        cx = min(x0 + stride // 2, nx - 1)
+        for iy in range(out_y):
+            y0 = iy * stride
+            y1 = min(y0 + stride, ny)
+            block = h[x0:x1, y0:y1].ravel()
+            # Mode of heights (plateau wins over a thin riser).  Ties: prefer
+            # the block-center sample when it is among the modal values.
+            cy = min(y0 + stride // 2, ny - 1)
+            center = h[cx, cy]
+            if np.issubdtype(block.dtype, np.integer):
+                bmin = int(block.min())
+                counts = np.bincount((block.astype(np.int64) - bmin).ravel())
+                mode_count = int(counts.max())
+                modal = np.flatnonzero(counts == mode_count) + bmin
+                out[ix, iy] = center if int(center) in set(modal.tolist()) else int(modal[0])
+            else:
+                vals, counts = np.unique(block, return_counts=True)
+                mode_count = counts.max()
+                modal = vals[counts == mode_count]
+                out[ix, iy] = center if np.any(np.isclose(modal, center)) else modal[0]
+    return out
+
+
+def heightfield_mesh_arrays(
+    height_samples: np.ndarray,
+    horizontal_scale: float = 0.1,
+    vertical_scale: float = 0.005,
+    *,
+    hard_edges: bool = False,
+    edge_thresh_m: float = 0.02,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build (vertices, faces, vertex_rgba) from a heightfield in metres.
+
+    When ``hard_edges`` is True, each triangle gets unique vertices so glTF
+    vertex normals are face-flat — stair risers stop being smoothed into
+    slopes.  Vertex colours keep a muted height gradient and darken slightly
+    on steep cells so edges read even under soft lighting.
+    """
+    h = np.asarray(height_samples, dtype=np.float64) * float(vertical_scale)
+    if h.ndim != 2 or h.shape[0] < 2 or h.shape[1] < 2:
+        raise ValueError(f"heightfield too small for a mesh: shape={getattr(h, 'shape', None)}")
+    nx, ny = h.shape
+    hs = float(horizontal_scale)
+
+    x = np.arange(nx, dtype=np.float64) * hs
+    y = np.arange(ny, dtype=np.float64) * hs
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    grid_verts = np.column_stack((xx.ravel(), yy.ravel(), h.ravel()))
+
+    xi, yi = np.mgrid[: nx - 1, : ny - 1]
+    i0 = (xi * ny + yi).ravel()
+    faces = np.column_stack([
+        i0, i0 + 1, i0 + ny + 1,
+        i0, i0 + ny + 1, i0 + ny,
+    ]).reshape(-1, 3).astype(np.int64)
+
+    # Per-grid-vertex slope proxy (max |Δh| to 4-neighbors), for colour accent.
+    dhx = np.zeros_like(h)
+    dhy = np.zeros_like(h)
+    dhx[1:, :] = np.abs(h[1:, :] - h[:-1, :])
+    dhx[:-1, :] = np.maximum(dhx[:-1, :], np.abs(h[:-1, :] - h[1:, :]))
+    dhy[:, 1:] = np.abs(h[:, 1:] - h[:, :-1])
+    dhy[:, :-1] = np.maximum(dhy[:, :-1], np.abs(h[:, :-1] - h[:, 1:]))
+    slope = np.maximum(dhx, dhy).ravel()
+    edge_w = np.clip(slope / max(float(edge_thresh_m), 1e-6), 0.0, 1.0)
+
+    heights = grid_verts[:, 2]
+    h_min, h_max = float(heights.min()), float(heights.max())
+    if h_max - h_min > 1e-6:
+        normalized = (heights - h_min) / (h_max - h_min)
+    else:
+        normalized = np.zeros_like(heights)
+    # Dark forest green with a slight height gradient; steep cells darken so
+    # stair rings stay readable even when normals are smoothed.
+    colors = np.zeros((len(heights), 4), dtype=np.uint8)
+    colors[:, 0] = (9 + 12 * normalized - 4 * edge_w).clip(0, 255).astype(np.uint8)
+    colors[:, 1] = (28 + 22 * (1 - normalized) - 10 * edge_w).clip(0, 255).astype(np.uint8)
+    colors[:, 2] = (14 + 9 * normalized - 4 * edge_w).clip(0, 255).astype(np.uint8)
+    colors[:, 3] = 255
+
+    if hard_edges:
+        # Non-indexed: one unique vertex per corner per face → flat shading.
+        faces_flat = faces.reshape(-1)
+        vertices = grid_verts[faces_flat]
+        colors = colors[faces_flat]
+        faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
+    else:
+        vertices = grid_verts
+
+    return vertices, faces, colors
+
+
 @dataclass
 class Body:
     name: str
@@ -947,6 +1106,10 @@ class ViserViewer:
         vertical_scale: float = 0.005,
         return_mesh: bool = False,
         stride: int = 1,
+        *,
+        hard_edges: bool = False,
+        edge_preserving: bool = False,
+        edge_thresh_m: float = 0.02,
     ):
         # Full-resolution heightfields (e.g. 1200x1200 ~ 2.9M triangles) are too
         # heavy for the browser and get silently dropped, so the terrain looks
@@ -958,42 +1121,28 @@ class ViserViewer:
         # (terrain cols / width).  The old meshgrid default swapped X/Y, so the
         # visual mesh sat at the wrong place and robots looked buried in the mesh
         # even when physics feet were on the real heightfield.
+        #
+        # ``edge_preserving`` + ``hard_edges`` are for discrete stairs/slopes
+        # (taxonomy showcase): mode-downsample keeps tread plateaus, and
+        # non-indexed faces stop smooth normals from turning risers into ramps.
+        stride = max(1, int(stride))
+        samples = np.asarray(height_samples)
         if stride > 1:
-            height_samples = height_samples[::stride, ::stride]
-            horizontal_scale = horizontal_scale * stride
-        hfield = height_samples.astype(np.float64) * vertical_scale
-        nx, ny = hfield.shape
+            if edge_preserving:
+                samples = downsample_heightfield_edge_preserving(samples, stride)
+            else:
+                samples = samples[::stride, ::stride]
+            horizontal_scale = float(horizontal_scale) * stride
 
-        x = np.arange(nx) * horizontal_scale
-        y = np.arange(ny) * horizontal_scale
-        xx, yy = np.meshgrid(x, y, indexing="ij")
-        zz = hfield
-
-        vertices = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
-
-        xi, yi = np.mgrid[:nx - 1, :ny - 1]
-        i0 = (xi * ny + yi).ravel()
-        faces = np.column_stack([
-            i0, i0 + 1, i0 + ny + 1,
-            i0, i0 + ny + 1, i0 + ny,
-        ]).reshape(-1, 3)
+        vertices, faces, colors = heightfield_mesh_arrays(
+            samples,
+            horizontal_scale=horizontal_scale,
+            vertical_scale=vertical_scale,
+            hard_edges=hard_edges,
+            edge_thresh_m=edge_thresh_m,
+        )
 
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        heights = vertices[:, 2]
-        h_min, h_max = heights.min(), heights.max()
-        if h_max - h_min > 1e-6:
-            normalized = (heights - h_min) / (h_max - h_min)
-        else:
-            normalized = np.zeros_like(heights)
-        # Dark-green terrain: keep a subtle height gradient but stay in a deep,
-        # muted green range (roughly RGB (9,28,14) .. (21,50,23)) rather than the
-        # old bright pastel green.  Even lit from directly above by the sun this
-        # reads as a dark forest green.
-        colors = np.zeros((len(heights), 4), dtype=np.uint8)
-        colors[:, 0] = (9 + 12 * normalized).astype(np.uint8)
-        colors[:, 1] = (28 + 22 * (1 - normalized)).astype(np.uint8)
-        colors[:, 2] = (14 + 9 * normalized).astype(np.uint8)
-        colors[:, 3] = 255
 
         # A bare ColorVisuals mesh exports to glTF with NO material, so the
         # viewer falls back to glTF's default material - which is fully metallic
@@ -1180,23 +1329,45 @@ def create_viser_viewer(
             transform[0] = -env.cfg.terrain.border_size
             transform[1] = -env.cfg.terrain.border_size
             transform[2] = 0.0
-            # Pick a stride that keeps the mesh under a triangle budget the
-            # browser can actually render.  A fixed stride=3 is fine for a small
-            # play grid, but a full training grid (e.g. 1200x1200 samples) still
-            # yields ~300k+ triangles at stride=3, which Viser/three.js silently
-            # drops - the ground then vanishes and the robot looks like it is
-            # sinking into a void.  Scale the stride up with the sample count.
+            # Pick a stride that keeps the mesh under a vertex budget the
+            # browser can actually render.  Large training grids still need
+            # aggressive downsampling; taxonomy showcase (4x6, border=2) fits
+            # near full resolution and benefits from hard-edge stair shading.
+            # The old forced min-stride=3 desynced 0.4 m stair treads (4 samples
+            # at 0.1 m) and smoothed risers into soft hills.
             nx, ny = terrain.heightsamples.shape
-            max_verts = 90_000  # ~180k triangles, comfortably renderable
-            stride = max(3, int(np.ceil(np.sqrt((nx * ny) / max_verts))))
+            from legged_gym.utils.terrain import is_taxonomy_terrain_cfg
+            taxonomy = is_taxonomy_terrain_cfg(env.cfg.terrain)
+            if taxonomy:
+                # Flat-shaded faces (3 verts each).  ~500k verts is still fine
+                # for Viser on a laptop; taxonomy at stride 1 is ~1.1M and can
+                # be dropped by three.js, so the budget targets stride 2 with
+                # mode-preserving downsample + hard edges.
+                hard_edges = True
+                edge_preserving = True
+                max_verts = 500_000
+            else:
+                hard_edges = False
+                edge_preserving = False
+                max_verts = 90_000  # shared-grid verts; ~180k triangles
+            stride = heightfield_render_stride(
+                nx, ny, max_verts=max_verts, hard_edges=hard_edges, min_stride=1,
+            )
             mesh = viewer.set_terrain_from_heightfield(
                 terrain.heightsamples,
                 horizontal_scale=env.cfg.terrain.horizontal_scale,
                 vertical_scale=env.cfg.terrain.vertical_scale,
                 return_mesh=True,
                 stride=stride,
+                hard_edges=hard_edges,
+                edge_preserving=edge_preserving,
             )
             if mesh is not None:
+                print(
+                    f"[viser_viewer] heightfield mesh: {nx}x{ny} stride={stride} "
+                    f"hard_edges={hard_edges} edge_preserving={edge_preserving} "
+                    f"verts={len(mesh.vertices)} faces={len(mesh.faces)}"
+                )
                 translation = trimesh.transformations.translation_matrix(transform)
                 mesh.apply_transform(translation)
                 viewer.set_terrain_mesh(mesh)
