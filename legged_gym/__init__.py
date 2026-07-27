@@ -2,7 +2,10 @@ import os
 import sys
 
 LEGGED_GYM_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-print(f"LEGGED_GYM_ROOT_DIR: {LEGGED_GYM_ROOT_DIR}")
+# stderr, not stdout: several scripts capture this module's stdout via
+# subprocess $(...) (e.g. scripts/run_v5_fazB.sh's schedule/select_checkpoint
+# parsing) and this import-time line would otherwise corrupt that output.
+print(f"LEGGED_GYM_ROOT_DIR: {LEGGED_GYM_ROOT_DIR}", file=sys.stderr)
 LEGGED_GYM_ENVS_DIR = os.path.join(LEGGED_GYM_ROOT_DIR, 'legged_gym', 'envs')
 
 if sys.version_info[1] >= 10: # >=3.10 for genesis and isaacsim
