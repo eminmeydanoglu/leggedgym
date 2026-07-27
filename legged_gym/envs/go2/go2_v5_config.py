@@ -50,19 +50,28 @@ V5_STANDSTILL_RHO = 0.12
 # update fires -- enough for a per-cell mean-return estimate.
 V5_STAGE_LENGTH_CONTROL_STEPS = 2000
 
-# Initial/fixed LP temperature.  Adaptive mode treats this as the controller's
-# starting value, then solves a confidence-gated target ESS every stage.
-V5_BETA = 2.5
+# Fixed LP temperature.  Frozen after the LP-ACRL curriculum flattened to
+# ~uniform sampling under adaptive_ess: offline replay on the real logged LP
+# data measured a steady-state median |LP| ~= 0.5, so beta = 1.0 makes
+# LP/beta ~= 1 and the Eq. 7 softmax actually bites (beta = 5 gave LP/beta ~=
+# 0.1 => effectively uniform; the adaptive_ess confidence gate flattened
+# everything further).  Chosen so LP/beta ~= 1 at the measured steady-state
+# |LP|.  Adaptive mode treats this as its starting value, but is no longer the
+# selected mode.
+V5_BETA = 1.0
 
-# Fixed uniform exploration floor; adaptive behavior belongs to the ESS
-# controller so coverage protection and exploitation remain separate.
-V5_EPSILON = 0.03
-V5_TEMPERATURE_MODE = "adaptive_ess"
+# Small uniform exploration floor: a plain observability guarantee that every
+# cell keeps a little sampling mass, not an adaptive coverage controller (that
+# belongs to the ESS mode, which is no longer selected).
+V5_EPSILON = 0.02
+V5_TEMPERATURE_MODE = "fixed"
 V5_BETA_MIN = 0.75
 V5_BETA_MAX = 8.0
 V5_BETA_EMA = 0.8
 V5_TARGET_ESS_RATIO_MIN = 0.5
-V5_MAX_CELL_PROBABILITY = 0.08
+# Loose per-cell safety cap only: at 0.25 (vs the LP softmax's natural spread)
+# it never binds in normal operation and just bounds pathological collapse.
+V5_MAX_CELL_PROBABILITY = 0.25
 V5_MIN_STAGE_EPISODES_FOR_LP = 16
 V5_CONFIDENCE_SCALE = 1.0
 
@@ -321,7 +330,7 @@ def build_ued_teacher(env_cfg):
         beta_ema=float(getattr(env_cfg.curriculum, "beta_ema", 0.8)),
         target_ess_ratio_min=float(getattr(env_cfg.curriculum, "target_ess_ratio_min", 0.5)),
         max_cell_probability=float(getattr(env_cfg.curriculum, "max_cell_probability", 0.08)),
-        min_stage_episodes_for_lp=int(getattr(env_cfg.curriculum, "min_stage_episodes_for_lp", 16)),
+        min_stage_episodes_for_lp=getattr(env_cfg.curriculum, "min_stage_episodes_for_lp", 16),
         confidence_scale=float(getattr(env_cfg.curriculum, "confidence_scale", 1.0)),
         seed=seed,
     )

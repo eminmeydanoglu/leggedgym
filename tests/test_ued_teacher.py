@@ -378,6 +378,87 @@ def test_adaptive_guards_survive_abrupt_lp_scale_change():
     assert diagnostics["min_cell_probability"] >= 0.03 / 84
 
 
+def test_v5_defaults_are_the_fixed_beta_freeze_and_the_softmax_bites():
+    # The shipped V5 freeze is fixed beta=1.0 (see go2_v5_config.py): adaptive
+    # mode is still available but is no longer the default, because at the
+    # measured steady-state |LP|~=0.5 a fixed beta=1.0 makes LP/beta~=1 so the
+    # Eq. 7 softmax actually concentrates instead of flattening to uniform.
+    from legged_gym.envs.go2.go2_v5_config import (
+        Go2V5LPACRLCfg,
+        build_ued_teacher,
+    )
+
+    curriculum, _ = build_ued_teacher(Go2V5LPACRLCfg())
+    assert curriculum.temperature_mode == "fixed"
+    assert curriculum.beta == pytest.approx(1.0)
+    stage = curriculum.stage_length_control_steps
+    _adaptive_stage(curriculum, np.zeros(84), step=stage)
+    snapshot = _adaptive_stage(
+        curriculum, np.linspace(-2.0, 2.0, 84), step=2 * stage
+    )
+    diagnostics = snapshot.diagnostics
+    # Fixed mode: the adaptive controller is dormant (no signal/ESS solve)...
+    assert diagnostics["temperature_mode"] == "fixed"
+    assert diagnostics["effective_beta"] == pytest.approx(1.0)
+    assert diagnostics["signal_quality"] == 0.0
+    # ...but the distribution genuinely bites -- it is not the uniform its
+    # adaptive predecessor collapsed to -- while staying under the loose cap.
+    assert diagnostics["tv_distance_uniform"] > 0.1
+    assert diagnostics["max_cell_probability"] > 1.0 / 84
+    assert diagnostics["max_cell_probability"] <= 0.25 + 1e-9
+    # The new curriculum-quality diagnostics are emitted in fixed mode too.
+    assert np.isfinite(diagnostics["lp_reliability_median"])
+    assert np.isfinite(diagnostics["sampled_lp_mass"])
+
+
+def test_adaptive_signal_quality_is_gated_by_task_space_coverage():
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(),
+        stage_length_control_steps=10,
+        beta=2.5,
+        epsilon=0.03,
+        temperature_mode="adaptive_ess",
+        beta_ema=0.0,
+        min_stage_episodes_for_lp=16,
+    )
+    _adaptive_stage(curriculum, np.zeros(84), step=10)
+    task_ids = np.repeat(np.array([0], dtype=np.int64), 20)
+    snapshot = _advance_with_return(
+        curriculum, task_ids, np.full(20, 20.0), step=20
+    )
+    diagnostics = snapshot.diagnostics
+    assert diagnostics["eligible_cell_count"] == 1
+    assert diagnostics["eligible_fraction"] == pytest.approx(1.0 / 84.0)
+    assert diagnostics["signal_quality"] == pytest.approx(1.0 / 84.0)
+    assert diagnostics["target_ess"] == pytest.approx(83.5)
+    assert diagnostics["effective_sample_size"] >= 83.5 - 1e-6
+
+
+def test_adaptive_requires_minimum_samples_in_both_stages():
+    curriculum = LPACRLEpisodeCurriculum(
+        TaskSpace(),
+        stage_length_control_steps=10,
+        temperature_mode="adaptive_ess",
+        min_stage_episodes_for_lp=16,
+    )
+    _advance_with_return(curriculum, [0, 0], [0.0, 0.0], step=10)
+    snapshot = _advance_with_return(
+        curriculum, np.repeat(0, 20), np.full(20, 10.0), step=20
+    )
+    assert snapshot.diagnostics["eligible_cell_count"] == 0
+    assert snapshot.diagnostics["signal_quality"] == 0.0
+    assert snapshot.diagnostics["effective_sample_size"] == pytest.approx(84.0)
+
+
+def test_adaptive_rejects_fractional_minimum_stage_episode_count():
+    with pytest.raises(ValueError, match="integer"):
+        LPACRLEpisodeCurriculum(
+            TaskSpace(),
+            stage_length_control_steps=10,
+            min_stage_episodes_for_lp=16.9,
+        )
+
+
 def test_teacher_modules_have_no_forbidden_imports():
     # Only the TEACHER CORE (task_space/episode_curriculum/checkpoint, plus
     # the package __init__ that merely re-exports them) must stay free of

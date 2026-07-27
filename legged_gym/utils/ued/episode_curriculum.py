@@ -59,6 +59,8 @@ class StageSnapshot:
     learning_progress: np.ndarray
     effective_learning_progress: np.ndarray
     observed_masks: np.ndarray
+    eligible_masks: np.ndarray
+    previous_stage_episode_counts: np.ndarray
     stage_episode_counts: np.ndarray
     task_assignment_counts: np.ndarray
     task_completion_counts: np.ndarray
@@ -113,7 +115,11 @@ class _FiniteEpisodeCurriculum:
             raise ValueError("target_ess_ratio_min must be in (0, 1]")
         if not np.isfinite(max_cell_probability) or not (1.0 / task_space.size <= max_cell_probability <= 1.0):
             raise ValueError("max_cell_probability must be in [1/task_count, 1]")
-        if isinstance(min_stage_episodes_for_lp, bool) or min_stage_episodes_for_lp < 2:
+        if (
+            isinstance(min_stage_episodes_for_lp, bool)
+            or not isinstance(min_stage_episodes_for_lp, Integral)
+            or min_stage_episodes_for_lp < 2
+        ):
             raise ValueError("min_stage_episodes_for_lp must be an integer >= 2")
         if not np.isfinite(confidence_scale) or confidence_scale <= 0:
             raise ValueError("confidence_scale must be finite and positive")
@@ -138,6 +144,7 @@ class _FiniteEpisodeCurriculum:
         )
         self._target_ess = float(task_space.size)
         self._signal_quality = 0.0
+        self._has_adaptive_signal = False
         self._ess_guard_uniform_mix = 0.0
         self._rng = np.random.Generator(np.random.PCG64(seed))
         self._n = task_space.size
@@ -153,6 +160,8 @@ class _FiniteEpisodeCurriculum:
         self._learning_progress = np.full(self._n, np.nan, dtype=np.float64)
         self._effective_learning_progress = np.full(self._n, np.nan, dtype=np.float64)
         self._observed_masks = np.zeros(self._n, dtype=bool)
+        self._eligible_masks = np.zeros(self._n, dtype=bool)
+        self._previous_stage_episode_counts = np.zeros(self._n, dtype=np.int64)
         self._stage_return_sums = np.zeros(self._n, dtype=np.float64)
         self._stage_return_sq_sums = np.zeros(self._n, dtype=np.float64)
         self._stage_episode_counts = np.zeros(self._n, dtype=np.int64)
@@ -162,6 +171,15 @@ class _FiniteEpisodeCurriculum:
         # Completions assigned under a previous sampler_revision (stage already
         # closed).  Tracked for diagnostics only; never enter stage return sums.
         self._late_outcome_count = 0
+        # Curriculum-quality diagnostics (computed each advance, exposed via
+        # ``diagnostics``).  Previous-stage sampling distribution is held in
+        # memory only -- intentionally NOT persisted, so the first post-resume
+        # stage degrades ``top10_overlap_prev`` to NaN rather than comparing
+        # against a stale distribution.
+        self._prev_stage_probabilities: np.ndarray | None = None
+        self._top10_overlap_prev = float("nan")
+        self._lp_reliability_median = float("nan")
+        self._sampled_lp_mass = float("nan")
         self._snapshots: list[StageSnapshot] = []
 
     @property
@@ -335,6 +353,72 @@ class _FiniteEpisodeCurriculum:
     def _effective_sample_size(probabilities: np.ndarray) -> float:
         return float(1.0 / np.sum(np.square(probabilities), dtype=np.float64))
 
+    @staticmethod
+    def _top10_overlap(current: np.ndarray, previous: np.ndarray, k: int = 10) -> float:
+        """|top-k(current) ∩ top-k(previous)| / k over two distributions."""
+        k = min(k, current.shape[0])
+        current_top = set(np.argsort(current, kind="stable")[-k:].tolist())
+        previous_top = set(np.argsort(previous, kind="stable")[-k:].tolist())
+        return float(len(current_top & previous_top)) / float(k)
+
+    def _update_curriculum_diagnostics(
+        self,
+        progress: np.ndarray,
+        progress_mask: np.ndarray,
+        current_sems: np.ndarray,
+    ) -> None:
+        """Compute side-effect-free curriculum-quality diagnostics.
+
+        Runs in BOTH temperature modes and never mutates the sampling
+        distribution.  Called from ``advance`` after ``self._probabilities`` is
+        finalized but before the previous-stage returns/sems/counts are rolled
+        forward, so ``self._current_return_sems`` and
+        ``self._previous_stage_episode_counts`` still hold the previous stage's
+        values (matching the adaptive path's ``lp_sem`` inputs).
+        """
+        # top10_overlap_prev: NaN on the first real stage (no prior stage
+        # distribution to compare against), and NaN on the first post-resume
+        # stage because ``_prev_stage_probabilities`` is not checkpointed.
+        if self._prev_stage_probabilities is not None:
+            self._top10_overlap_prev = self._top10_overlap(
+                self._probabilities, self._prev_stage_probabilities
+            )
+        else:
+            self._top10_overlap_prev = float("nan")
+        self._prev_stage_probabilities = self._probabilities.copy()
+
+        # lp_reliability_median: median over eligible cells of
+        # |LP| / (|LP| + lp_sem), lp_sem = sqrt(cur_sem^2 + prev_sem^2).
+        eligible = (
+            progress_mask
+            & (self._stage_episode_counts >= self.min_stage_episodes_for_lp)
+            & (self._previous_stage_episode_counts >= self.min_stage_episodes_for_lp)
+            & np.isfinite(current_sems)
+            & np.isfinite(self._current_return_sems)
+        )
+        if np.any(eligible):
+            lp_sem = np.sqrt(
+                np.square(current_sems[eligible])
+                + np.square(self._current_return_sems[eligible])
+            )
+            magnitude = np.abs(progress[eligible])
+            reliability = magnitude / (magnitude + lp_sem + np.finfo(np.float64).eps)
+            self._lp_reliability_median = float(np.median(reliability))
+        else:
+            self._lp_reliability_median = float("nan")
+
+        # sampled_lp_mass: fraction of positive LP the distribution targets.
+        # ``progress`` imputes 0 for unmeasured/negative-neutral cells, so only
+        # genuinely positive LP contributes to the denominator.
+        positive_lp = np.maximum(progress, 0.0)
+        total_positive = float(positive_lp.sum(dtype=np.float64))
+        if total_positive > 0.0:
+            self._sampled_lp_mass = float(
+                np.sum(self._probabilities * positive_lp, dtype=np.float64) / total_positive
+            )
+        else:
+            self._sampled_lp_mass = float("nan")
+
     def _ensure_minimum_ess(
         self, probabilities: np.ndarray, target_ess: float
     ) -> np.ndarray:
@@ -384,9 +468,11 @@ class _FiniteEpisodeCurriculum:
         eligible = (
             progress_mask
             & (self._stage_episode_counts >= self.min_stage_episodes_for_lp)
+            & (self._previous_stage_episode_counts >= self.min_stage_episodes_for_lp)
             & np.isfinite(current_sems)
             & np.isfinite(self._current_return_sems)
         )
+        self._eligible_masks = eligible
         lp_sem = np.full(self._n, np.nan, dtype=np.float64)
         lp_sem[eligible] = np.sqrt(
             np.square(current_sems[eligible])
@@ -399,7 +485,13 @@ class _FiniteEpisodeCurriculum:
         )
         effective = np.zeros(self._n, dtype=np.float64)
         effective[eligible] = progress[eligible] * reliability[eligible]
-        self._signal_quality = float(np.median(reliability[eligible])) if np.any(eligible) else 0.0
+        eligible_fraction = float(np.count_nonzero(eligible) / self._n)
+        eligible_quality = (
+            float(np.median(reliability[eligible])) if np.any(eligible) else 0.0
+        )
+        # Confidence in a few well-measured hot cells is not confidence in the
+        # whole curriculum.  Coverage therefore gates the global controller.
+        self._signal_quality = eligible_quality * eligible_fraction
         self._target_ess = float(
             self._n
             - self._signal_quality
@@ -413,6 +505,7 @@ class _FiniteEpisodeCurriculum:
             raise ValueError("global_control_steps cannot move backwards")
         if global_control_steps - self.stage_start_global_steps < self.stage_length_control_steps:
             return None
+        previous_stage_episode_counts = self._previous_stage_episode_counts.copy()
         observed = self._stage_episode_counts > 0
         current = np.full(self._n, np.nan, dtype=np.float64)
         current[observed] = self._stage_return_sums[observed] / self._stage_episode_counts[observed]
@@ -441,11 +534,17 @@ class _FiniteEpisodeCurriculum:
             if self.temperature_mode == "adaptive_ess":
                 scores = self._adaptive_scores(progress, progress_mask, current_sems)
                 solved_beta = self._solve_beta_for_ess(scores, self._target_ess)
-                # Temperature is multiplicative, so smooth in log space.
-                smoothed_beta = float(np.exp(
-                    self.beta_ema * np.log(self._effective_beta)
-                    + (1.0 - self.beta_ema) * np.log(solved_beta)
-                ))
+                if self._signal_quality > 0.0 and not self._has_adaptive_signal:
+                    # Bootstrap/uniform stages contain no LP information and
+                    # must not seed the EMA at beta_max.
+                    smoothed_beta = solved_beta
+                    self._has_adaptive_signal = True
+                else:
+                    # Temperature is multiplicative, so smooth in log space.
+                    smoothed_beta = float(np.exp(
+                        self.beta_ema * np.log(self._effective_beta)
+                        + (1.0 - self.beta_ema) * np.log(solved_beta)
+                    ))
                 # EMA may lag dangerously when LP scale jumps.  Never use a
                 # temperature below the one that satisfies the current stage's
                 # ESS target; lag is allowed only in the safer, more-uniform
@@ -467,6 +566,9 @@ class _FiniteEpisodeCurriculum:
             self._source_label = "lp" if self.algorithm == "lp_acrl" else "alp"
         if not np.all(np.isfinite(self._probabilities)) or not np.isclose(self._probabilities.sum(), 1.0):
             raise ValueError("curriculum probabilities are not finite and normalized")
+        # Curriculum-quality diagnostics: computed against the previous stage's
+        # state, which is still intact here (rolled forward just below).
+        self._update_curriculum_diagnostics(progress, progress_mask, current_sems)
         # Report imputed cells as NaN LP so downstream analysis can tell an
         # imputed 0 from a genuinely measured zero learning progress.
         progress_report = np.full(self._n, np.nan, dtype=np.float64)
@@ -481,6 +583,8 @@ class _FiniteEpisodeCurriculum:
             effective_report[progress_mask] = scores[progress_mask]
         self._effective_learning_progress = effective_report
         self._observed_masks = observed
+        closed_stage_episode_counts = self._stage_episode_counts.copy()
+        self._previous_stage_episode_counts = closed_stage_episode_counts
         self.stage_index += 1
         self.sampler_revision += 1
         self.stage_start_global_steps = int(global_control_steps)
@@ -488,7 +592,9 @@ class _FiniteEpisodeCurriculum:
             int(global_control_steps), self.stage_index, self.sampler_revision, self._probabilities.copy(),
             self._previous_returns.copy(), self._current_returns.copy(), self._current_return_sems.copy(),
             self._learning_progress.copy(), self._effective_learning_progress.copy(),
-            self._observed_masks.copy(), self._stage_episode_counts.copy(), self._task_assignment_counts.copy(),
+            self._observed_masks.copy(), self._eligible_masks.copy(),
+            previous_stage_episode_counts, closed_stage_episode_counts,
+            self._task_assignment_counts.copy(),
             self._task_completion_counts.copy(), dict(self._transition_occupancy), self.diagnostics(),
         )
         self._snapshots.append(snapshot)
@@ -512,10 +618,17 @@ class _FiniteEpisodeCurriculum:
             "effective_beta": float(self._effective_beta),
             "target_ess": float(self._target_ess),
             "signal_quality": float(self._signal_quality),
+            "eligible_cell_count": int(np.count_nonzero(self._eligible_masks)),
+            "eligible_fraction": float(np.count_nonzero(self._eligible_masks) / self._n),
             "ess_guard_uniform_mix": float(self._ess_guard_uniform_mix),
             "task_assignment_coverage": float(np.count_nonzero(self._task_assignment_counts) / self._n),
             "completed_outcome_coverage": float(np.count_nonzero(self._task_completion_counts) / self._n),
             "late_outcome_count": int(self._late_outcome_count),
+            # Curriculum-quality diagnostics (see _update_curriculum_diagnostics).
+            "top10_overlap_prev": float(self._top10_overlap_prev),
+            "tv_distance_uniform": float(0.5 * np.sum(np.abs(p - 1.0 / self._n), dtype=np.float64)),
+            "lp_reliability_median": float(self._lp_reliability_median),
+            "sampled_lp_mass": float(self._sampled_lp_mass),
         }
 
     def state_dict(self) -> dict:
@@ -528,6 +641,8 @@ class _FiniteEpisodeCurriculum:
             "previous_return_sems": self._previous_return_sems.copy(), "current_return_sems": self._current_return_sems.copy(),
             "learning_progress": self._learning_progress.copy(), "observed_masks": self._observed_masks.copy(),
             "effective_learning_progress": self._effective_learning_progress.copy(),
+            "eligible_masks": self._eligible_masks.copy(),
+            "previous_stage_episode_counts": self._previous_stage_episode_counts.copy(),
             "stage_return_sums": self._stage_return_sums.copy(), "stage_return_sq_sums": self._stage_return_sq_sums.copy(),
             "stage_episode_counts": self._stage_episode_counts.copy(),
             "task_assignment_counts": self._task_assignment_counts.copy(), "task_completion_counts": self._task_completion_counts.copy(),
@@ -535,6 +650,7 @@ class _FiniteEpisodeCurriculum:
             "source_label": self._source_label,
             "effective_beta": self._effective_beta, "target_ess": self._target_ess,
             "signal_quality": self._signal_quality,
+            "has_adaptive_signal": self._has_adaptive_signal,
             "ess_guard_uniform_mix": self._ess_guard_uniform_mix,
             "rng_bit_generator_state": deepcopy(self._rng.bit_generator.state),
         }
@@ -545,16 +661,20 @@ class _FiniteEpisodeCurriculum:
             "probabilities", "previous_returns", "current_returns",
             "previous_return_sems", "current_return_sems", "learning_progress",
             "effective_learning_progress", "observed_masks", "stage_return_sums",
+            "eligible_masks", "previous_stage_episode_counts",
             "stage_return_sq_sums", "stage_episode_counts",
             "task_assignment_counts", "task_completion_counts",
         )
-        count_arrays = {"stage_episode_counts", "task_assignment_counts", "task_completion_counts"}
+        count_arrays = {
+            "previous_stage_episode_counts", "stage_episode_counts",
+            "task_assignment_counts", "task_completion_counts",
+        }
         loaded_arrays: dict[str, np.ndarray] = {}
         for name in arrays:
             value = np.asarray(state[name])
             if value.shape != (self._n,):
                 raise ValueError(f"checkpoint {name} has the wrong task-space shape")
-            if name == "observed_masks":
+            if name in {"observed_masks", "eligible_masks"}:
                 if value.dtype != np.bool_:
                     raise ValueError("checkpoint observed_masks must be boolean")
             elif name in count_arrays:
@@ -573,6 +693,7 @@ class _FiniteEpisodeCurriculum:
         effective_beta = float(state["effective_beta"])
         target_ess = float(state["target_ess"])
         signal_quality = float(state["signal_quality"])
+        has_adaptive_signal = state["has_adaptive_signal"]
         ess_guard_uniform_mix = float(state["ess_guard_uniform_mix"])
         valid_beta = (
             self.beta_min <= effective_beta <= self.beta_max
@@ -585,6 +706,8 @@ class _FiniteEpisodeCurriculum:
             raise ValueError("checkpoint target_ess is invalid")
         if not np.isfinite(signal_quality) or not (0.0 <= signal_quality <= 1.0):
             raise ValueError("checkpoint signal_quality is invalid")
+        if not isinstance(has_adaptive_signal, (bool, np.bool_)):
+            raise ValueError("checkpoint has_adaptive_signal must be boolean")
         if not np.isfinite(ess_guard_uniform_mix) or not (0.0 <= ess_guard_uniform_mix <= 1.0):
             raise ValueError("checkpoint ess_guard_uniform_mix is invalid")
         try:
@@ -615,6 +738,7 @@ class _FiniteEpisodeCurriculum:
         self._effective_beta = effective_beta
         self._target_ess = target_ess
         self._signal_quality = signal_quality
+        self._has_adaptive_signal = bool(has_adaptive_signal)
         self._ess_guard_uniform_mix = ess_guard_uniform_mix
         self._transition_occupancy = transition_occupancy
         self._source_label = source_label

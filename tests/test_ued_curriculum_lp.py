@@ -17,7 +17,23 @@ from legged_gym.utils.ued import (
     TaskSpace,
 )
 
-BETA = 5.0  # frozen V5_BETA
+BETA = 5.0  # test temperature (the shipped freeze is V5_BETA = 1.0)
+
+
+def _observe_multi(cur, per_cell_returns, *, revision, length=100):
+    """Feed several same-revision outcomes per cell.
+
+    ``per_cell_returns`` maps a cell id to an iterable of episodic returns; each
+    return becomes one completed episode, so cells can clear the
+    ``min_stage_episodes_for_lp`` eligibility gate and get a finite SEM.
+    """
+    cells = []
+    returns = []
+    for cell, cell_returns in per_cell_returns.items():
+        for r in cell_returns:
+            cells.append(cell)
+            returns.append(r)
+    _observe(cur, cells, returns, revision=revision, length=length)
 
 
 def _observe(cur, cells, returns, *, revision, length=100):
@@ -174,6 +190,97 @@ class TestStatelessCurriculum(unittest.TestCase):
         # ALP scores |LP|, so a regression raises sampling just like progress.
         self.assertGreater(p[2], p[50])     # cell 50 has LP=0
         self.assertGreater(p.min(), 1e-4)
+
+    # ------------------------------------------------ curriculum diagnostics
+    def _lpacrl_eligible(self, **kw):
+        # min_stage_episodes_for_lp=2 so a couple of episodes per cell clears
+        # the LP eligibility gate in these small synthetic sequences.
+        return LPACRLEpisodeCurriculum(
+            self.space, stage_length_control_steps=1, beta=BETA, seed=0,
+            min_stage_episodes_for_lp=2, **kw,
+        )
+
+    def test_top10_overlap_is_a_known_fraction(self):
+        cur = self._lpacrl()
+        current = np.zeros(self.n)
+        current[np.arange(10)] = np.arange(10, 0, -1)      # top-10 == {0..9}
+        previous = np.zeros(self.n)
+        previous[np.arange(5, 15)] = np.arange(10, 0, -1)  # top-10 == {5..14}
+        # {0..9} ∩ {5..14} == {5,6,7,8,9} -> 5/10.
+        self.assertAlmostEqual(cur._top10_overlap(current, previous), 0.5)
+        self.assertAlmostEqual(cur._top10_overlap(current, current), 1.0)
+
+    def test_tv_distance_uniform_unit(self):
+        cur = self._lpacrl()
+        # Uniform distribution -> zero total variation from uniform.
+        self.assertAlmostEqual(cur.diagnostics()["tv_distance_uniform"], 0.0, places=12)
+        skew = np.zeros(self.n)
+        skew[0] = 0.5
+        skew[1:] = 0.5 / (self.n - 1)
+        cur._probabilities = skew
+        expected = 0.5 * np.sum(np.abs(skew - 1.0 / self.n))
+        self.assertAlmostEqual(cur.diagnostics()["tv_distance_uniform"], float(expected), places=12)
+
+    def test_first_stage_diagnostics_are_null(self):
+        cur = self._lpacrl_eligible()
+        _observe_multi(cur, {c: (0.0, 0.0) for c in range(self.n)}, revision=0)
+        cur.advance(cur.stage_length_control_steps)
+        diag = cur.diagnostics()
+        # No prior stage / no cross-stage LP yet -> the three cross-stage
+        # metrics are NaN; TV is still defined (distribution is uniform -> 0).
+        self.assertTrue(np.isnan(diag["top10_overlap_prev"]))
+        self.assertTrue(np.isnan(diag["lp_reliability_median"]))
+        self.assertTrue(np.isnan(diag["sampled_lp_mass"]))
+        self.assertAlmostEqual(diag["tv_distance_uniform"], 0.0, places=12)
+
+    def test_reliability_and_mass_on_two_stage_sequence(self):
+        cur = self._lpacrl_eligible()
+        # Stage 1 baseline: every cell measured twice at return 0 (finite SEM=0).
+        _observe_multi(cur, {c: (0.0, 0.0) for c in range(self.n)}, revision=cur.sampler_revision)
+        cur.advance(cur.stage_length_control_steps)
+        # Stage 2: every cell jumps to a noiseless return 10 -> LP=10, SEM=0,
+        # so reliability |LP|/(|LP|+lp_sem) == 1 for every eligible cell.
+        _observe_multi(cur, {c: (10.0, 10.0) for c in range(self.n)}, revision=cur.sampler_revision)
+        cur.advance(2 * cur.stage_length_control_steps)
+        diag = cur.diagnostics()
+        self.assertAlmostEqual(diag["lp_reliability_median"], 1.0, places=9)
+        # Uniform LP over all cells -> uniform distribution -> the sampler
+        # targets exactly its fair share 1/n of the positive-LP mass.
+        self.assertAlmostEqual(diag["sampled_lp_mass"], 1.0 / self.n, places=9)
+        # A real prior stage now exists -> overlap is defined and in [0, 1].
+        self.assertFalse(np.isnan(diag["top10_overlap_prev"]))
+        self.assertGreaterEqual(diag["top10_overlap_prev"], 0.0)
+        self.assertLessEqual(diag["top10_overlap_prev"], 1.0)
+
+    def test_sampled_lp_mass_rises_when_distribution_targets_positive_lp(self):
+        cur = self._lpacrl_eligible()
+        _observe_multi(cur, {c: (0.0, 0.0) for c in range(self.n)}, revision=cur.sampler_revision)
+        cur.advance(cur.stage_length_control_steps)
+        # One cell shows large LP, the rest a tiny positive LP: the softmax
+        # concentrates on the hot cell, so the sampled positive-LP mass exceeds
+        # the uniform fair share 1/n.
+        nxt = {c: (0.5, 0.5) for c in range(self.n)}
+        nxt[0] = (40.0, 40.0)
+        _observe_multi(cur, nxt, revision=cur.sampler_revision)
+        cur.advance(2 * cur.stage_length_control_steps)
+        diag = cur.diagnostics()
+        self.assertGreater(diag["sampled_lp_mass"], 1.0 / self.n)
+
+    def test_curriculum_diagnostics_reset_to_null_after_resume(self):
+        cur = self._lpacrl_eligible()
+        _observe_multi(cur, {c: (0.0, 0.0) for c in range(self.n)}, revision=cur.sampler_revision)
+        cur.advance(cur.stage_length_control_steps)
+        _observe_multi(cur, {c: (10.0, 10.0) for c in range(self.n)}, revision=cur.sampler_revision)
+        cur.advance(2 * cur.stage_length_control_steps)
+        state = cur.state_dict()
+        # State does not carry the previous-stage distribution, so a resumed
+        # curriculum degrades top10_overlap_prev to NaN on its first stage.
+        resumed = self._lpacrl_eligible()
+        resumed.load_state_dict(state)
+        _observe_multi(resumed, {c: (20.0, 20.0) for c in range(self.n)}, revision=resumed.sampler_revision)
+        step = (resumed.stage_index + 1) * resumed.stage_length_control_steps
+        resumed.advance(step)
+        self.assertTrue(np.isnan(resumed.diagnostics()["top10_overlap_prev"]))
 
     # ------------------------------------------------------------------ checkpoint
     def test_checkpoint_roundtrip_with_epsilon(self):
