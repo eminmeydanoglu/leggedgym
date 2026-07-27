@@ -153,8 +153,11 @@ def get_args():
     parser.add_argument('--sync_wandb',     action='store_true', default=False, help="synchronize training log with wandb")
     parser.add_argument('--export_onnx',    action='store_true', default=False, help="export policy as onnx (besides jit)")
     parser.add_argument('--debug',          action='store_true', default=False, help="enable debug mode")
-    parser.add_argument('--dashboard',      action='store_true', default=False,
-                        help="publish completed V5 UED curriculum stages to the local Curriculum Atlas")
+    parser.add_argument('--dashboard',      action='store_true', default=True,
+                        help="publish completed V5 UED curriculum stages to the local Curriculum Atlas "
+                             "(default: on; harmless no-op for non-UED tasks and when no server is listening)")
+    parser.add_argument('--no_dashboard',   action='store_true', default=False,
+                        help="disable Curriculum Atlas publishing (overrides --dashboard / $LPACRL_DASHBOARD)")
     parser.add_argument('--dashboard_url',  type=str, default=None,
                         help="Curriculum Atlas base URL (default: $LPACRL_DASHBOARD_URL or http://127.0.0.1:8765)")
     parser.add_argument('--dashboard_run_id', type=str, default=None,

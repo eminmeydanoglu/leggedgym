@@ -29,7 +29,15 @@ class TaskSpaceTest(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers["content-length"])
-                received.append(json.loads(self.rfile.read(length)))
+                body = self.rfile.read(length)
+                # Mirror Node: reject non-standard NaN tokens.
+                text = body.decode("utf-8")
+                if "NaN" in text or "Infinity" in text:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"invalid JSON number"}')
+                    return
+                received.append(json.loads(body))
                 self.send_response(202)
                 self.end_headers()
 
@@ -45,7 +53,18 @@ class TaskSpaceTest(unittest.TestCase):
                 server_url=f"http://127.0.0.1:{server.server_port}",
                 metadata={"source": "v5"},
             )
-            plugger.log(10, {"performance": [float("nan"), 3.0]}, frame_metadata={"stage_index": 1})
+            plugger.log(
+                10,
+                {"performance": [float("nan"), 3.0]},
+                frame_metadata={
+                    "stage_index": 1,
+                    "diagnostics": {
+                        "top10_overlap_prev": float("nan"),
+                        "lp_reliability_median": float("nan"),
+                        "entropy": 1.5,
+                    },
+                },
+            )
             self.assertTrue(plugger.flush())
             plugger.close()
         finally:
@@ -55,6 +74,14 @@ class TaskSpaceTest(unittest.TestCase):
         self.assertEqual(received[0]["metrics"]["performance"], [None, 3.0])
         self.assertEqual(received[0]["metadata"]["run"]["source"], "v5")
         self.assertEqual(received[0]["metadata"]["frame"]["stage_index"], 1)
+        self.assertEqual(
+            received[0]["metadata"]["frame"]["diagnostics"],
+            {
+                "top10_overlap_prev": None,
+                "lp_reliability_median": None,
+                "entropy": 1.5,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -39,6 +39,43 @@ class TaskSpace:
         }
 
 
+def _json_safe(value: object) -> object:
+    """Convert values to strict-JSON forms Node can parse.
+
+    Python's ``json.dumps`` emits non-standard ``NaN``/``Infinity`` tokens by
+    default.  The Curriculum Atlas server uses ``JSON.parse``, which rejects
+    those tokens with HTTP 400 — and a plugger worker that retries 4xx forever
+    silently drops every subsequent stage frame.  Metrics already went through
+    this conversion; nested ``metadata`` (diagnostics with optional NaNs) must
+    too.
+    """
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    # bool is a subclass of int; keep it above any numeric coercion.
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value) if math.isfinite(value) else None
+    # NumPy scalars: prefer ``item()`` so np.float64(nan) → null, not [null].
+    numpy_item = getattr(value, "item", None)
+    if callable(numpy_item) and type(value).__module__.startswith("numpy"):
+        try:
+            return _json_safe(numpy_item())
+        except (ValueError, OverflowError, AttributeError):
+            pass
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist) and not isinstance(value, (list, tuple, dict)):
+        try:
+            return _json_safe(tolist())
+        except (TypeError, ValueError, AttributeError):
+            pass
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value]
+    return str(value)
+
+
 class CurriculumDashboardPlugger:
     """Queues metric snapshots and uploads them without blocking training.
 
@@ -111,10 +148,12 @@ class CurriculumDashboardPlugger:
             "metrics": flattened,
         }
         if self.metadata is not None or frame_metadata is not None:
-            frame["metadata"] = {
+            # Sanitize nested metadata the same way metrics are sanitized so
+            # optional diagnostic NaNs become JSON null, not illegal tokens.
+            frame["metadata"] = _json_safe({
                 **({"run": self.metadata} if self.metadata is not None else {}),
                 **({"frame": dict(frame_metadata)} if frame_metadata is not None else {}),
-            }
+            })
         dropped = False
         try:
             self._queue.put_nowait(frame)
@@ -148,7 +187,14 @@ class CurriculumDashboardPlugger:
             if frame is None:
                 self._queue.task_done()
                 return
-            payload = json.dumps(frame, separators=(",", ":")).encode()
+            try:
+                # allow_nan=False turns a missed sanitization into a hard error
+                # instead of a Node 400 that we used to retry forever.
+                payload = json.dumps(frame, separators=(",", ":"), allow_nan=False).encode()
+            except (TypeError, ValueError) as exc:
+                print(f"[ued-dashboard] drop non-JSON frame step={frame.get('step')}: {exc}")
+                self._queue.task_done()
+                continue
             request = urllib.request.Request(
                 self.endpoint,
                 data=payload,
@@ -160,6 +206,23 @@ class CurriculumDashboardPlugger:
                     with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                         if response.status < 300:
                             break
+                        # Unexpected 2xx-with-large-status shouldn't spin hot.
+                        time.sleep(self.retry_seconds)
+                except urllib.error.HTTPError as exc:
+                    # 4xx is a permanent payload/route problem; retrying only
+                    # wedges the queue (this is how NaN metadata went silent).
+                    if 400 <= int(exc.code) < 500:
+                        detail = ""
+                        try:
+                            detail = exc.read().decode("utf-8", errors="replace")[:300]
+                        except Exception:  # noqa: BLE001
+                            pass
+                        print(
+                            f"[ued-dashboard] drop HTTP {exc.code} for step="
+                            f"{frame.get('step')}: {detail}"
+                        )
+                        break
+                    time.sleep(self.retry_seconds)
                 except (urllib.error.URLError, TimeoutError):
                     time.sleep(self.retry_seconds)
             self._queue.task_done()

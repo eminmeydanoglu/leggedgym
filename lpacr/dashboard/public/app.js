@@ -1,6 +1,6 @@
 const $ = (selector) => document.querySelector(selector);
 const els = {
-  atlas: $("#atlas"), triptych: $("#triptych"), timelines: $("#timelines"),
+  atlas: $("#atlas"), triptych: $("#triptych"), timelines: $("#timelines"), health: $("#health"),
   run: $("#runSelect"), x: $("#xDimension"), y: $("#yDimension"),
   facet: $("#facetDimension"), filter: $("#filterValue"), filterWrap: $("#filterWrap"),
   metric: $("#metricSelect"), live: $("#liveButton"), history: $("#historyButton"),
@@ -673,50 +673,305 @@ function marginal(frame, dim, metric = "sampling_probability") {
   return values;
 }
 
-function drawTimeline(canvas, series, labels, active) {
-  // Timelines use container width; measure after layout.
+const TIMELINE_COLORS = [
+  "#5cb89a", "#c9a05a", "#6a96c4", "#a8b86a", "#a87cb8",
+  "#c97878", "#6aada0", "#c48a52", "#7a9ab8", "#a09088",
+  "#4a9fd4", "#d4a04a", "#8bc46a", "#c46a9a", "#6ac4b8",
+];
+
+/** Round up rawMax to a clean tick ceiling (1 / 2 / 5 × 10^n). */
+function niceCeil(rawMax) {
+  if (!Number.isFinite(rawMax) || rawMax <= 0) return 1;
+  const exp = Math.floor(Math.log10(rawMax));
+  const base = 10 ** exp;
+  const n = rawMax / base;
+  const nice = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return nice * base;
+}
+
+function formatTimelineValue(value, yKind = "auto") {
+  if (!Number.isFinite(value)) return "—";
+  if (yKind === "probability") {
+    const s = value.toFixed(3);
+    return s.startsWith("0") && value < 1 ? s.slice(1) : s;
+  }
+  if (yKind === "count") {
+    if (Math.abs(value) >= 100) return Math.round(value).toLocaleString();
+    if (Math.abs(value) >= 10) return value.toFixed(1);
+    return value.toFixed(2);
+  }
+  if (value >= 0 && value <= 1.001) {
+    const s = value.toFixed(3);
+    return s.startsWith("0") && value < 1 ? s.slice(1) : s;
+  }
+  if (Math.abs(value) >= 100) return Math.round(value).toLocaleString();
+  return value.toFixed(2);
+}
+
+function formatStepLabel(step) {
+  if (!Number.isFinite(step)) return "—";
+  if (Math.abs(step) >= 1e6) return `${(step / 1e6).toFixed(1)}M`;
+  if (Math.abs(step) >= 1e4) return `${Math.round(step / 1e3)}k`;
+  if (Math.abs(step) >= 1e3) return `${(step / 1e3).toFixed(1)}k`;
+  return String(Math.round(step));
+}
+
+/**
+ * Interactive multi-series line chart with axes, grid, and hover readout.
+ * @param {HTMLCanvasElement} canvas
+ * @param {number[][]} series  frame → values[line]
+ * @param {string[]} labels    one per series line
+ * @param {number} active      current playback index in the sampled series
+ * @param {{ steps?: number[], yKind?: "probability"|"count"|"auto" }} [options]
+ */
+function drawTimeline(canvas, series, labels, active, options = {}) {
+  const steps = options.steps || series.map((_, i) => i);
+  const yKind = options.yKind || "auto";
+  const n = series.length;
+  const nLines = labels.length;
   const rect = canvas.parentElement?.getBoundingClientRect();
-  const cssW = Math.max(240, rect?.width || canvas.clientWidth || 320);
-  const cssH = Math.max(110, Math.round(cssW * 0.42));
+  const cssW = Math.max(280, rect?.width || canvas.clientWidth || 320);
+  const cssH = Math.max(160, Math.round(cssW * 0.48));
   const { ctx, width, height } = setupCanvas(canvas, cssW, cssH);
-  const margin = { l: 4, r: 5, t: 7, b: 22 };
-  const chartW = width - margin.l - margin.r;
-  const chartH = height - margin.t - margin.b;
-  const max = Math.max(...series.flat(), 1e-9);
-  const colors = ["#5cb89a", "#c9a05a", "#6a96c4", "#a8b86a", "#a87cb8", "#c97878", "#6aada0", "#c48a52", "#7a9ab8", "#a09088"];
-  ctx.clearRect(0, 0, width, height);
-  ctx.strokeStyle = "#24302c";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(0, margin.t + chartH);
-  ctx.lineTo(width, margin.t + chartH);
-  ctx.stroke();
-  labels.forEach((label, line) => {
-    ctx.strokeStyle = colors[line % colors.length];
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    series.forEach((values, i) => {
-      const x = margin.l + (series.length === 1 ? 0 : i / (series.length - 1)) * chartW;
-      const y = margin.t + chartH - (values[line] / max) * chartH;
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+
+  // Room for Y ticks (left), X ticks + legend (bottom).
+  const legendRows = Math.ceil(Math.min(nLines, 12) / Math.max(1, Math.floor((width - 16) / 88)));
+  const margin = {
+    l: 52,
+    r: 14,
+    t: 12,
+    b: 28 + legendRows * 16,
+  };
+  const chartW = Math.max(1, width - margin.l - margin.r);
+  const chartH = Math.max(1, height - margin.t - margin.b);
+
+  const rawMax = Math.max(...series.flatMap((row) => row.slice(0, nLines)), 0);
+  let yMax;
+  if (yKind === "probability" && rawMax <= 1.05) yMax = Math.max(rawMax * 1.05, 0.1);
+  else yMax = niceCeil(rawMax * 1.08);
+  if (yMax <= 0) yMax = 1;
+
+  const xAt = (i) => margin.l + (n <= 1 ? chartW / 2 : (i / (n - 1)) * chartW);
+  const yAt = (v) => margin.t + chartH - (Math.max(0, v) / yMax) * chartH;
+
+  const yTicks = (() => {
+    const count = 4;
+    const ticks = [];
+    for (let i = 0; i <= count; i++) ticks.push((yMax * i) / count);
+    return ticks;
+  })();
+
+  const xTickIndices = (() => {
+    if (n <= 1) return [0];
+    const count = Math.min(5, n);
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      out.push(Math.round((i / (count - 1)) * (n - 1)));
+    }
+    return [...new Set(out)];
+  })();
+
+  let hoverIndex = null;
+
+  function paint() {
+    ctx.clearRect(0, 0, width, height);
+
+    // Plot background
+    ctx.fillStyle = "rgba(18, 24, 22, 0.55)";
+    ctx.fillRect(margin.l, margin.t, chartW, chartH);
+
+    // Horizontal grid + Y labels
+    ctx.font = '11px "Noto Sans", "Liberation Sans", system-ui, sans-serif';
+    yTicks.forEach((tick, i) => {
+      const y = yAt(tick);
+      ctx.strokeStyle = i === 0 ? "#2e3c37" : "#1e2925";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(margin.l, y);
+      ctx.lineTo(margin.l + chartW, y);
+      ctx.stroke();
+      ctx.fillStyle = "#8d9894";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ctx.fillText(formatTimelineValue(tick, yKind), margin.l - 8, y);
     });
+
+    // Left / bottom axis spines
+    ctx.strokeStyle = "#3a4a44";
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.moveTo(margin.l, margin.t);
+    ctx.lineTo(margin.l, margin.t + chartH);
+    ctx.lineTo(margin.l + chartW, margin.t + chartH);
     ctx.stroke();
-  });
-  const x = margin.l + (series.length === 1 ? 0 : active / (series.length - 1)) * chartW;
-  ctx.strokeStyle = "#c5cdc9";
-  ctx.lineWidth = 1;
-  ctx.setLineDash([2, 3]);
-  ctx.beginPath();
-  ctx.moveTo(x, margin.t);
-  ctx.lineTo(x, margin.t + chartH);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.font = '12px "Noto Sans", "Liberation Sans", system-ui, sans-serif';
-  ctx.textAlign = "left";
-  labels.slice(0, 6).forEach((label, i) => {
-    ctx.fillStyle = colors[i];
-    ctx.fillText(shortAxisLabel(label, 12), 4 + i * Math.max(60, width / 7), height - 6);
-  });
+
+    // X tick marks + labels (control step)
+    ctx.fillStyle = "#8d9894";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    xTickIndices.forEach((i) => {
+      const x = xAt(i);
+      ctx.strokeStyle = "#2e3c37";
+      ctx.beginPath();
+      ctx.moveTo(x, margin.t + chartH);
+      ctx.lineTo(x, margin.t + chartH + 4);
+      ctx.stroke();
+      ctx.fillStyle = "#8d9894";
+      ctx.fillText(formatStepLabel(steps[i]), x, margin.t + chartH + 6);
+    });
+
+    // Series lines
+    for (let line = 0; line < nLines; line++) {
+      const color = TIMELINE_COLORS[line % TIMELINE_COLORS.length];
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.75;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < n; i++) {
+        const v = series[i][line];
+        if (!Number.isFinite(v)) {
+          started = false;
+          continue;
+        }
+        const x = xAt(i);
+        const y = yAt(v);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    // Active playback cursor (solid)
+    if (n > 0 && Number.isFinite(active)) {
+      const ai = Math.max(0, Math.min(n - 1, active));
+      const ax = xAt(ai);
+      ctx.strokeStyle = "rgba(197, 205, 201, 0.85)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(ax, margin.t);
+      ctx.lineTo(ax, margin.t + chartH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Hover cursor + dots
+    if (hoverIndex != null && n > 0) {
+      const hi = Math.max(0, Math.min(n - 1, hoverIndex));
+      const hx = xAt(hi);
+      ctx.strokeStyle = "rgba(77, 176, 140, 0.95)";
+      ctx.lineWidth = 1.25;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(hx, margin.t);
+      ctx.lineTo(hx, margin.t + chartH);
+      ctx.stroke();
+
+      for (let line = 0; line < nLines; line++) {
+        const v = series[hi][line];
+        if (!Number.isFinite(v)) continue;
+        const color = TIMELINE_COLORS[line % TIMELINE_COLORS.length];
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(hx, yAt(v), 3.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#0c0f0e";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    // Legend under the plot
+    const legendY0 = margin.t + chartH + 22;
+    const colW = Math.max(72, Math.min(110, (width - 16) / Math.min(nLines, 6)));
+    ctx.font = '11px "Noto Sans", "Liberation Sans", system-ui, sans-serif';
+    ctx.textBaseline = "middle";
+    labels.slice(0, 12).forEach((label, i) => {
+      const col = i % Math.max(1, Math.floor((width - 16) / colW));
+      const row = Math.floor(i / Math.max(1, Math.floor((width - 16) / colW)));
+      const lx = 8 + col * colW;
+      const ly = legendY0 + row * 16;
+      const color = TIMELINE_COLORS[i % TIMELINE_COLORS.length];
+      ctx.fillStyle = color;
+      ctx.fillRect(lx, ly - 4, 10, 8);
+      ctx.fillStyle = "#c0cbc5";
+      ctx.textAlign = "left";
+      ctx.fillText(shortAxisLabel(label, 14), lx + 14, ly);
+    });
+    if (nLines > 12) {
+      ctx.fillStyle = "#8d9894";
+      ctx.fillText(`+${nLines - 12} more`, width - 60, legendY0);
+    }
+  }
+
+  function indexFromEvent(event) {
+    if (n <= 0) return null;
+    const bounds = canvas.getBoundingClientRect();
+    const scaleX = width / bounds.width;
+    const px = (event.clientX - bounds.left) * scaleX;
+    if (px < margin.l - 4 || px > margin.l + chartW + 4) return null;
+    if (n === 1) return 0;
+    const t = (px - margin.l) / chartW;
+    return Math.max(0, Math.min(n - 1, Math.round(t * (n - 1))));
+  }
+
+  function showTimelineDetail(event, index) {
+    const values = series[index] || [];
+    // Sort by magnitude so the dominant series is readable first.
+    const ranked = labels
+      .map((label, line) => ({
+        label,
+        value: values[line],
+        color: TIMELINE_COLORS[line % TIMELINE_COLORS.length],
+      }))
+      .filter((row) => Number.isFinite(row.value))
+      .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
+
+    const rows = [
+      `<dt>Step</dt><dd>${Number.isFinite(steps[index]) ? Math.round(steps[index]).toLocaleString() : "—"}</dd>`,
+      ...ranked.slice(0, 10).map((row) =>
+        `<dt><i class="swatch" style="background:${row.color}"></i>${pretty(row.label)}</dt>` +
+        `<dd>${formatTimelineValue(row.value, yKind)}</dd>`
+      ),
+    ];
+    if (ranked.length > 10) {
+      rows.push(`<dt></dt><dd>+${ranked.length - 10} more</dd>`);
+    }
+    els.detail.innerHTML = `<dl>${rows.join("")}</dl>`;
+    els.detail.classList.add("visible");
+    els.detail.style.left = `${Math.min(event.clientX + 15, innerWidth - 260)}px`;
+    els.detail.style.top = `${Math.min(event.clientY + 15, innerHeight - 280)}px`;
+  }
+
+  paint();
+  canvas.style.cursor = "crosshair";
+  canvas.onmousemove = (event) => {
+    const index = indexFromEvent(event);
+    if (index == null) {
+      if (hoverIndex != null) {
+        hoverIndex = null;
+        paint();
+      }
+      hideDetail();
+      return;
+    }
+    if (hoverIndex !== index) {
+      hoverIndex = index;
+      paint();
+    }
+    showTimelineDetail(event, index);
+  };
+  canvas.onmouseleave = () => {
+    hoverIndex = null;
+    paint();
+    hideDetail();
+  };
 }
 
 function renderTimelines(frame) {
@@ -725,15 +980,56 @@ function renderTimelines(frame) {
   const stride = Math.max(1, Math.ceil(state.frames.length / maxTimelineFrames));
   const sampledFrames = state.frames.filter((_, index) => index % stride === 0 || index === state.frames.length - 1);
   const sampledActive = Math.min(sampledFrames.length - 1, Math.round(state.index / stride));
+  const steps = sampledFrames.map((item) => item.step);
   els.timelines.replaceChildren(...dims.map((dim) => {
     const figure = document.createElement("article");
     figure.className = "timeline-figure";
     const labels = frame.task_space.coordinates[dim];
-    figure.innerHTML = `<header><strong>${pretty(dim)}</strong><span>probability mass</span></header><canvas></canvas>`;
+    figure.innerHTML = `<header><strong>${pretty(dim)}</strong><span>probability mass · hover for values</span></header><canvas></canvas>`;
     const series = sampledFrames.map((item) => marginal(item, dim));
-    requestAnimationFrame(() => drawTimeline(figure.querySelector("canvas"), series, labels, sampledActive));
+    requestAnimationFrame(() =>
+      drawTimeline(figure.querySelector("canvas"), series, labels, sampledActive, {
+        steps,
+        yKind: "probability",
+      })
+    );
     return figure;
   }));
+}
+
+/** Effective sample size is a scalar per stage (adaptive_ess sampler_diagnostics),
+ * not a per-cell metric -- it can't go through marginal()/drawHeatmap like the
+ * task-space signals above, but drawTimeline's (series, labels) contract is
+ * generic enough to reuse directly for a two-line "actual vs. target" chart. */
+function samplerHealthSeries(frames) {
+  return frames.map((item) => {
+    const diagnostics = item?.metadata?.frame?.diagnostics || {};
+    const ess = Number(diagnostics.effective_sample_size);
+    const target = Number(diagnostics.target_ess);
+    return [Number.isFinite(ess) ? ess : 0, Number.isFinite(target) ? target : 0];
+  });
+}
+
+function renderHealth() {
+  const maxTimelineFrames = 360;
+  const stride = Math.max(1, Math.ceil(state.frames.length / maxTimelineFrames));
+  const sampledFrames = state.frames.filter((_, index) => index % stride === 0 || index === state.frames.length - 1);
+  const sampledActive = Math.min(sampledFrames.length - 1, Math.round(state.index / stride));
+  const steps = sampledFrames.map((item) => item.step);
+  const figure = document.createElement("article");
+  figure.className = "timeline-figure";
+  figure.innerHTML = `<header><strong>Effective sample size</strong><span>uniform-equivalent cell count · hover for values</span></header><canvas></canvas>`;
+  const series = samplerHealthSeries(sampledFrames);
+  requestAnimationFrame(() =>
+    drawTimeline(
+      figure.querySelector("canvas"),
+      series,
+      ["Effective sample size", "Target ESS"],
+      sampledActive,
+      { steps, yKind: "count" },
+    )
+  );
+  els.health.replaceChildren(figure);
 }
 
 function render() {
@@ -753,6 +1049,7 @@ function render() {
   renderAtlas(frame);
   renderTriptych(frame);
   renderTimelines(frame);
+  renderHealth();
 }
 
 function setMode(mode) {

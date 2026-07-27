@@ -308,11 +308,17 @@ main {
   gap: 18px;
 }
 
+.timeline-figure {
+  min-width: 0;
+}
+
 .timeline-figure canvas {
   width: 100%;
   height: auto;
-  aspect-ratio: 2 / 1;
+  aspect-ratio: 2.1 / 1;
   display: block;
+  cursor: crosshair;
+  border-radius: 2px;
 }
 
 /* —— Playback —— */
@@ -375,8 +381,21 @@ main {
   gap: 5px 18px;
 }
 
-.detail dt { color: var(--muted); }
-.detail dd { margin: 0; text-align: right; }
+.detail dt {
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.detail dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.detail .swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 1px;
+  flex: 0 0 auto;
+}
 
 /* —— Empty —— */
 .empty {

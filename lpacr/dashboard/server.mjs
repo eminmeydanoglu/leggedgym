@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { extname, join, normalize, resolve, sep } from "node:path";
@@ -7,10 +8,17 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT, "public");
 const DATA_DIR = resolve(process.env.LPACRL_DATA_DIR || join(ROOT, "data"));
+const LOGS_DIR = resolve(
+  process.env.LPACRL_LOGS_DIR || join(ROOT, "../../logs/go2_v5_ued"),
+);
+const PYTHON = process.env.LPACRL_PYTHON || "python3";
+const BENCHMARK_SCRIPT = join(ROOT, "tb_benchmark.py");
+const BENCHMARK_TTL_MS = Number(process.env.LPACRL_BENCHMARK_TTL_MS || 20000);
 const HOST = process.env.LPACRL_HOST || "127.0.0.1";
 const PORT = Number(process.env.LPACRL_PORT || 8765);
 const clients = new Map();
 const writeQueues = new Map();
+let benchmarkCache = { key: "", at: 0, payload: null };
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -142,9 +150,82 @@ function broadcast(runId, frame) {
   }
 }
 
+function runBenchmark(query) {
+  const window = Math.max(1, Math.min(500, Number(query.get("window") || 50) || 50));
+  const seed = query.get("seed");
+  const leftPath = query.get("left_path") || process.env.LPACRL_BENCHMARK_LEFT_PATH || "";
+  const rightPath = query.get("right_path") || process.env.LPACRL_BENCHMARK_RIGHT_PATH || "";
+  const key = JSON.stringify({
+    logs: LOGS_DIR,
+    window,
+    seed,
+    leftPath,
+    rightPath,
+    python: PYTHON,
+  });
+  const now = Date.now();
+  if (benchmarkCache.payload && benchmarkCache.key === key && now - benchmarkCache.at < BENCHMARK_TTL_MS) {
+    return Promise.resolve(benchmarkCache.payload);
+  }
+  const args = [BENCHMARK_SCRIPT, "--logs-dir", LOGS_DIR, "--window", String(window)];
+  if (seed != null && seed !== "") args.push("--seed", String(seed));
+  if (leftPath) args.push("--left-path", leftPath);
+  if (rightPath) args.push("--right-path", rightPath);
+
+  return new Promise((resolvePromise) => {
+    const child = spawn(PYTHON, args, {
+      cwd: ROOT,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+    }, 30000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolvePromise({
+        ok: false,
+        error: `Failed to spawn benchmark helper: ${error.message}`,
+        logs_dir: LOGS_DIR,
+        rows: [],
+      });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      let payload;
+      try {
+        payload = JSON.parse(stdout.trim() || "{}");
+      } catch {
+        payload = {
+          ok: false,
+          error: `Benchmark helper returned non-JSON (exit ${code}): ${stderr || stdout}`.slice(0, 500),
+          logs_dir: LOGS_DIR,
+          rows: [],
+        };
+      }
+      if (!payload.ok && stderr && !payload.error) {
+        payload.error = stderr.slice(0, 500);
+      }
+      benchmarkCache = { key, at: Date.now(), payload };
+      resolvePromise(payload);
+    });
+  });
+}
+
 async function api(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/runs") {
     sendJson(res, 200, { runs: await listRuns() });
+    return true;
+  }
+  if (req.method === "GET" && url.pathname === "/api/benchmark") {
+    const payload = await runBenchmark(url.searchParams);
+    sendJson(res, 200, payload);
     return true;
   }
   const match = url.pathname.match(/^\/api\/runs\/([^/]+)\/(frames|stream)$/);
@@ -221,5 +302,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   createDashboardServer().listen(PORT, HOST, () => {
     console.log(`Curriculum Atlas: http://${HOST}:${PORT}`);
     console.log(`Data: ${DATA_DIR}`);
+    console.log(`Logs (benchmark): ${LOGS_DIR}`);
+    console.log(`Python (benchmark): ${PYTHON}`);
   });
 }

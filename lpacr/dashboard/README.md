@@ -79,11 +79,17 @@ dashboard.close()
 ### V5 UED gerçek eğitim entegrasyonu
 
 `go2_v5_uniform`, `go2_v5_lpacrl` ve `go2_v5_alp` için köprü artık gerçek
-`EpisodeCurriculum.advance()` sonucunu yayınlar; demo verisi üretmez. Varsayılan
-olarak kapalıdır: dashboard modülü import edilmez, thread oluşturulmaz ve
-eğitimin reset/sampling davranışı değişmez.
+`EpisodeCurriculum.advance()` sonucunu yayınlar; demo verisi üretmez.
+**Varsayılan olarak açıktır** (2026-07-27'den itibaren): `train.py` her UED
+arm'ı için otomatik olarak `create_v5_dashboard_bridge` çağırır ve
+`http://127.0.0.1:8765`'e publish etmeye çalışır. Sunucu ayakta değilse bu
+tamamen zararsızdır -- publish thread'i arka planda sessizce (saniyede bir)
+retry eder, eğitimi asla bloklamaz veya çökertmez (bkz.
+`lpacr/dashboard/plugger.py` `_worker`). `go2_v5_handcrafted` gibi UED
+olmayan arm'larda `create_v5_dashboard_bridge` zaten no-op döner.
 
-Önce dashboard sunucusunu açın, ardından training'i açıkça opt-in başlatın:
+Dashboard'u izlemek için önce sunucuyu açın, training'i olduğu gibi başlatın
+(hiçbir ek bayrağa gerek yok):
 
 ```bash
 cd /home/emin/code/online-estimation/genesis-wp/LeggedGym-Ex/lpacr/dashboard
@@ -91,12 +97,13 @@ npm start
 
 cd /home/emin/code/online-estimation/genesis-wp/LeggedGym-Ex
 env SIMULATOR=genesis WANDB_MODE=disabled .venv/bin/python -m legged_gym.scripts.train \
-  --task go2_v5_lpacrl --headless --dashboard
+  --task go2_v5_lpacrl --headless
 ```
 
 `--dashboard_url http://127.0.0.1:9000` ve `--dashboard_run_id benim-runim`
-isteğe bağlıdır. CLI yerine `LPACRL_DASHBOARD=1` ile,
-sunucu adresi için `LPACRL_DASHBOARD_URL` ile de açılabilir.
+isteğe bağlı override'lardır (yoksa sırasıyla `LPACRL_DASHBOARD_URL` ve
+otomatik `<task>-<run_dir>` kullanılır). Kapatmak için `--no_dashboard` CLI
+bayrağı veya `LPACRL_DASHBOARD=0` ortam değişkeni kullanılır.
 
 Her tamamlanmış stage için tek frame yazılır: `performance` (cell return),
 `learning_progress`, `sampling_probability`, stage episode sayısı, assignment

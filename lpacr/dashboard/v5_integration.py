@@ -12,6 +12,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 from .plugger import CurriculumDashboardPlugger, TaskSpace as DashboardTaskSpace
 
 
@@ -95,6 +97,8 @@ class V5DashboardBridge:
                 "performance_sem": snapshot.current_return_sems,
                 "learning_progress": snapshot.learning_progress,
                 "effective_learning_progress": snapshot.effective_learning_progress,
+                "eligible_for_lp": snapshot.eligible_masks.astype(np.float64),
+                "previous_stage_episode_count": snapshot.previous_stage_episode_counts,
                 "sampling_probability": snapshot.probabilities,
                 "stage_episode_count": snapshot.stage_episode_counts,
                 "task_assignment_count": snapshot.task_assignment_counts,

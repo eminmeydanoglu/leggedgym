@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import subprocess
 
@@ -47,9 +48,17 @@ def _simulator_versions():
 
 
 def _dashboard_requested(args) -> bool:
-    """Keep Curriculum Atlas strictly opt-in (CLI or explicit environment)."""
+    """Curriculum Atlas publishing is on by default for UED arms (non-UED
+    tasks already no-op in create_v5_dashboard_bridge, and publishing to an
+    absent server just retries quietly in a daemon thread -- see
+    lpacr/dashboard/plugger.py), so this only has to honour explicit opt-outs.
+    """
+    if getattr(args, "no_dashboard", False):
+        return False
     env_value = os.getenv("LPACRL_DASHBOARD", "").strip().lower()
-    return bool(getattr(args, "dashboard", False)) or env_value in {"1", "true", "yes", "on"}
+    if env_value in {"0", "false", "no", "off"}:
+        return False
+    return bool(getattr(args, "dashboard", True)) or env_value in {"1", "true", "yes", "on"}
 
 
 def write_run_manifest(log_dir, args, env_cfg, train_cfg):
@@ -172,29 +181,38 @@ def train(args):
     # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
     write_run_manifest(log_dir, args, env_cfg, train_cfg)
 
-    # Curriculum Atlas is deliberately attached only after the UED teacher and
-    # runner exist.  Disabled runs import no dashboard module, create no worker
-    # thread, and do not touch their reset/training semantics.
+    # Curriculum Atlas is on by default (see _dashboard_requested); it is
+    # attached only after the UED teacher and runner exist.  A missing server
+    # is harmless (the plugger retries quietly in a daemon thread), but the
+    # bridge is built from a caller-provided launcher script whose PYTHONPATH
+    # may not include the repo root, so both the import and construction are
+    # best-effort: any failure here must never cost hours of GPU training.
     dashboard_bridge = None
     if _dashboard_requested(args):
-        from lpacr.dashboard.v5_integration import create_v5_dashboard_bridge
+        try:
+            if LEGGED_GYM_ROOT_DIR not in sys.path:
+                sys.path.insert(0, LEGGED_GYM_ROOT_DIR)
+            from lpacr.dashboard.v5_integration import create_v5_dashboard_bridge
 
-        dashboard_url = (
-            getattr(args, "dashboard_url", None)
-            or os.getenv("LPACRL_DASHBOARD_URL")
-            or "http://127.0.0.1:8765"
-        )
-        default_run_id = f"{args.task}-{os.path.basename(os.path.normpath(log_dir))}"
-        dashboard_bridge = create_v5_dashboard_bridge(
-            env,
-            task=args.task,
-            training_seed=train_cfg.seed,
-            server_url=dashboard_url,
-            run_id=getattr(args, "dashboard_run_id", None) or default_run_id,
-        )
-        if dashboard_bridge is None:
-            print("[ued-dashboard] requested, but this non-UED arm has no stage frames to publish")
-        else:
+            dashboard_url = (
+                getattr(args, "dashboard_url", None)
+                or os.getenv("LPACRL_DASHBOARD_URL")
+                or "http://127.0.0.1:8765"
+            )
+            default_run_id = f"{args.task}-{os.path.basename(os.path.normpath(log_dir))}"
+            dashboard_bridge = create_v5_dashboard_bridge(
+                env,
+                task=args.task,
+                training_seed=train_cfg.seed,
+                server_url=dashboard_url,
+                run_id=getattr(args, "dashboard_run_id", None) or default_run_id,
+            )
+            if dashboard_bridge is None:
+                print("[ued-dashboard] requested, but this non-UED arm has no stage frames to publish")
+        except Exception as error:
+            print(f"[ued-dashboard] disabled: could not attach ({error!r})")
+            dashboard_bridge = None
+        if dashboard_bridge is not None:
             env.set_ued_snapshot_listener(dashboard_bridge.publish)
             print(
                 f"[ued-dashboard] enabled: run={dashboard_bridge.run_id} "
