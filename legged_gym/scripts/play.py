@@ -57,6 +57,9 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
         env_cfg.terrain.curriculum = False
         env_cfg.terrain.selected = False
         env_cfg.terrain.terrain_kwargs = None
+        # V5 UED tasks bake ued_training_grid=True; clear it for play overrides
+        # so Terrain.__init__ does not keep building the 84-cell training map.
+        env_cfg.terrain.ued_training_grid = False
         return
 
     if terrain_mode == "rough":
@@ -70,6 +73,7 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
         env_cfg.terrain.terrain_proportions = [0.2, 0.1, 0.25, 0.25, 0.2]
         env_cfg.terrain.num_cols = 5
         env_cfg.terrain.border_size = 2.0
+        env_cfg.terrain.ued_training_grid = False
         _pin_terrain_difficulty(env_cfg, terrain_level, default_level=3, max_level=9)
         return
 
@@ -78,6 +82,8 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
         # (whatever the checkpoint used - flat for V3, rough curriculum for V4),
         # just shrink the grid to something renderable.  Difficulty still honours
         # --terrain_level when the underlying terrain is a curriculum.
+        # Leave ued_training_grid alone so V5 train-mode still rebuilds the
+        # checkpoint's 84-cell UED map when that flag is set on the task cfg.
         env_cfg.terrain.num_cols = 5
         env_cfg.terrain.border_size = 2.0
         if getattr(env_cfg.terrain, "curriculum", False):
@@ -93,6 +99,9 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
         env_cfg.terrain.terrain_kwargs = None
         env_cfg.terrain.mode = "taxonomy"
         env_cfg.terrain.taxonomy_showcase = True
+        # UED training grid has higher priority in Terrain.__init__; must clear
+        # it or V5 play still builds the 21-config / 84-task training map.
+        env_cfg.terrain.ued_training_grid = False
         env_cfg.terrain.num_rows = TAXONOMY_NUM_LEVELS
         env_cfg.terrain.num_cols = TAXONOMY_NUM_TYPES
         env_cfg.terrain.border_size = 2.0
@@ -177,6 +186,11 @@ def override_configs(env_cfg, args, task_type):
         env_cfg.domain_rand.push_robots = False
 
     env_cfg.env.debug = True
+    # Play drives commands/terrain from the viewer (or fixed ranges), not from the
+    # training UED teacher.  Same contract as ued_rollout: leave ued_enabled False
+    # so reset_idx does not require an installed episode curriculum.
+    if getattr(env_cfg.env, "ued_enabled", False):
+        env_cfg.env.ued_enabled = False
     # disable automatic reset on failure/timeout for interactive viewing - respawn is
     # triggered manually instead (e.g. via the viser "Respawn" button)
     env_cfg.env.auto_reset = False

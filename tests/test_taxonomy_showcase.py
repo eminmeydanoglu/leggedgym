@@ -254,6 +254,7 @@ class TestTaxonomyPlayConfig(unittest.TestCase):
         from legged_gym.scripts import play as play_mod
 
         env_cfg = self._make_env_cfg()
+        env_cfg.terrain.ued_training_grid = True  # V5 tasks bake this on
         play_mod.configure_play_terrain(env_cfg, "taxonomy")
         self.assertFalse(env_cfg.terrain.curriculum)
         self.assertFalse(env_cfg.terrain.selected)
@@ -261,6 +262,7 @@ class TestTaxonomyPlayConfig(unittest.TestCase):
         self.assertEqual(env_cfg.terrain.num_cols, 6)
         self.assertEqual(env_cfg.terrain.mode, "taxonomy")
         self.assertTrue(env_cfg.terrain.taxonomy_showcase)
+        self.assertFalse(env_cfg.terrain.ued_training_grid)
         self.assertEqual(env_cfg.terrain.border_size, 2.0)
         self.assertIn(env_cfg.terrain.mesh_type, ("heightfield", "trimesh"))
 
