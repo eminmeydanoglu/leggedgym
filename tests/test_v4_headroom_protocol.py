@@ -16,6 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 FULL_PATH = ROOT / "configs/eval/v4_headroom.yaml"
 SMOKE_PATH = ROOT / "configs/eval/v4_headroom_smoke.yaml"
+INVENTORY_PATH = ROOT / "configs/eval/v4_spnte_checkpoint_inventory.yaml"
 
 
 def load(path: Path):
@@ -28,16 +29,38 @@ class TestV4HeadroomProtocol(unittest.TestCase):
     def setUpClass(cls):
         cls.full = load(FULL_PATH)
         cls.smoke = load(SMOKE_PATH)
+        cls.inventory = load(INVENTORY_PATH)
 
-    def test_full_primary_grid_is_fixed_and_bounded(self):
+    def test_eight_spnte_deployments_are_hash_locked_and_match_config_pins(self):
+        self.assertEqual(self.inventory["schema_version"], "v4_spnte_checkpoint_inventory_v1")
+        self.assertEqual(self.inventory["checkpoint"], "best_spnte")
+        entries = {item["label"]: item for item in self.inventory["models"]}
+        self.assertEqual(set(entries), {"MLP", "Superset-Oracle", "DreamWaQ", "HIM-fixed"})
+        self.assertTrue(all(set(item["seeds"]) == {1, 2} for item in entries.values()))
+        for item in entries.values():
+            for seed, deployment in item["seeds"].items():
+                self.assertEqual(len(deployment["checkpoint_sha256"]), 64)
+                self.assertIsInstance(deployment["selected_iteration"], int)
+                self.assertIn(deployment["selection_metric"], {"spnte_v1", "spnte_v1_offline"})
+        for cfg in (self.full, self.smoke):
+            self.assertEqual(cfg["checkpoint_inventory"], "configs/eval/v4_spnte_checkpoint_inventory.yaml")
+            for model in cfg["models"]:
+                expected = entries[model["label"]]
+                self.assertEqual(model["task"], expected["task"])
+                self.assertEqual(model["checkpoint"], self.inventory["checkpoint"])
+                self.assertEqual(model["run_paths"],
+                                 {seed: item["run_folder"] for seed, item in expected["seeds"].items()})
+
+    def test_full_primary_grid_is_small_but_discriminative(self):
         protocol = self.full["protocol"]
         self.assertEqual(self.full["schema_version"], "v4_headroom_matrix_v1")
         self.assertEqual(protocol["eval_seed"], 1)
-        self.assertEqual(protocol["terrain"]["types"],
-                         ["slope", "random_uniform", "stairs_down", "stairs_up", "discrete"])
-        self.assertEqual(protocol["terrain"]["levels"], [1, 3, 5, 7, 9])
-        self.assertEqual(protocol["commands"], {"vx": [0.4, 0.6, 0.8, 1.0], "vy": 0.0, "yaw_rate": 0.0})
-        self.assertEqual(protocol["replicas_per_cell"], 76)
+        self.assertEqual(protocol["terrain"]["types"], ["random_uniform", "stairs_up"])
+        self.assertEqual(protocol["terrain"]["levels"], [3])
+        self.assertEqual(protocol["commands"], {"vx": [0.6, 1.0], "vy": 0.0, "yaw_rate": 0.0})
+        self.assertEqual(protocol["warmup_steps"], 50)
+        self.assertEqual(protocol["measured_steps"], 500)
+        self.assertEqual(protocol["replicas_per_cell"], 16)
         self.assertEqual([model["label"] for model in self.full["models"]], ["MLP", "Superset-Oracle"])
         self.assertEqual(self.full["comparison_scope"], "matched_mlp_vs_superset_oracle_headroom")
         self.assertTrue(all(model.get("run_paths") for model in self.full["models"]))
@@ -61,15 +84,20 @@ class TestV4HeadroomProtocol(unittest.TestCase):
             lower, upper = protocol["training_support"][axis["name"]]
             self.assertTrue(all(lower <= value <= upper for value in axis["id"]))
             self.assertTrue(all(value < lower or value > upper for value in axis["ood"]))
+        self.assertEqual(axes["mass_kg"]["id"], [0.0])
+        self.assertEqual(axes["mass_kg"]["ood"], [6.0])
+        self.assertEqual(axes["com_x_m"]["id"], [0.08])
+        self.assertEqual(axes["com_x_m"]["ood"], [0.10])
+        self.assertEqual(axes["friction"]["id"], [0.50])
+        self.assertEqual(axes["friction"]["ood"], [0.35])
 
-    def test_secondary_stress_is_explicit_and_not_a_headline_input(self):
+    def test_discovery_explicitly_excludes_secondary_stress_fishing(self):
         protocol = self.full["protocol"]
         secondary = protocol["secondary_combined_stress_payload"]
         self.assertEqual(secondary["tier"], "secondary_combined_stress_payload")
-        self.assertEqual(secondary["terrain_levels"], [5, 9])
-        self.assertEqual(secondary["vx"], [0.6, 1.0])
-        self.assertEqual([item["name"] for item in secondary["scenarios"]],
-                         ["id_edge_forward_payload", "ood_mass_forward_payload", "payload_plus4", "payload_plus6"])
+        self.assertEqual(secondary["terrain_levels"], [])
+        self.assertEqual(secondary["vx"], [])
+        self.assertEqual(secondary["scenarios"], [])
         self.assertEqual(self.full["scorecard"]["headline_tier"], "primary_nominal_headroom")
 
     def test_declared_full_cell_budget_matches_the_matrix(self):
@@ -88,8 +116,10 @@ class TestV4HeadroomProtocol(unittest.TestCase):
         self.assertEqual(protocol["planned_cell_budget"],
                          {"primary": expected_primary, "secondary": expected_secondary,
                           "total": expected_primary + expected_secondary})
+        self.assertEqual(expected_primary, 96)
+        self.assertEqual(expected_secondary, 0)
 
-    def test_smoke_is_a_true_subset_of_full_contract(self):
+    def test_smoke_uses_discovery_terrain_and_checkpoint_contract(self):
         full, smoke = self.full, self.smoke
         self.assertEqual(smoke["schema_version"], full["schema_version"])
         self.assertEqual(smoke["protocol"]["eval_seed"], full["protocol"]["eval_seed"])
@@ -103,6 +133,8 @@ class TestV4HeadroomProtocol(unittest.TestCase):
         self.assertEqual(set(smoke_labels[2:]), {"DreamWaQ", "HIM-fixed"})
         self.assertEqual(smoke["training_seeds"], [1, 2])
         self.assertTrue(all(model.get("run_paths") for model in smoke["models"]))
+        self.assertEqual(smoke["protocol"]["terrain"]["levels"], [3])
+        self.assertEqual(smoke["protocol"]["commands"]["vx"], [0.6])
 
     def test_configs_target_the_dedicated_matrix_runner(self):
         for cfg in (self.full, self.smoke):

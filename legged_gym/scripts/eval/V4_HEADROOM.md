@@ -4,29 +4,36 @@
 the next V4 headroom measurement.  It holds `eval_seed=1` fixed and compares
 the matched blind MLP and privileged Superset-Oracle on the same selected terrain
 geometry.  It is a headroom precondition, not an adaptation-method leaderboard:
-SysID/RMA/DreamWaQ/HIM follow only if this pair has usable headroom.  The primary
-matrix is deliberately bounded:
+SysID/RMA/DreamWaQ/HIM follow only if this pair has usable headroom. The primary
+matrix is deliberately small and decision-oriented: it is a discovery bank,
+not a terrain leaderboard.
 
-- terrain type: `slope`, `random_uniform`, `stairs_down`, `stairs_up`,
-  `discrete`;
-- pinned terrain level: `1, 3, 5, 7, 9`;
-- forward command: `vx=0.4, 0.6, 0.8, 1.0` (`vy=yaw_rate=0`);
+- terrain type: `random_uniform` and `stairs_up`;
+- pinned terrain level: `3` (moderate);
+- forward command: `vx=0.6, 1.0` (`vy=yaw_rate=0`);
 - exactly one physical axis per primary cell: `mass_kg`, `com_x_m`, or
-  `friction`, each at declared disjoint ID/OOD points; every unswept named axis
-  is pinned to nominal (`0 kg`, `0 m`, `1.0`).
+  `friction`, each at a declared ID point and nearest OOD extension; the mass
+  axis carries the sole nominal anchor (`0 kg`). Every unswept
+  named axis is pinned to nominal (`0 kg`, `0 m`, `1.0`).
 
 ID/OOD labels are checked against the V4 training support stored in the config:
 mass `[-2,+5] kg`, CoM-x `[-0.08,+0.08] m`, and friction `[0.5,1.25]`.
 Every ID point must lie inside its interval and every OOD point outside it.
 
-The secondary tier contains only declared correlated stress/payload cells.  It
-may be reported beside the primary curves, but must never be pooled into a
-primary gap-closed/headroom value.
+There is deliberately no secondary correlated-stress/payload tier in this
+discovery. Testing such combinations before knowing that the matched MLP/Oracle
+pair has usable headroom is budget-expensive and does not answer the adaptation
+decision. The schema records the secondary tier as empty, so any later addition
+changes the campaign fingerprint and budget explicitly.
 
-The two-training-seed discovery plan has 6,000 primary and 320 secondary cells.
-The runner calculates and enforces this explicit budget; it prevents accidental
-duplication when a command or terrain loop is changed. The full plan is
-declarative only until the user explicitly authorizes it.
+There are 24 unique primary worlds: `2 terrain families × 1 level × 2 commands
+× 6 isolated-physics points`. MLP and Oracle are each evaluated for both
+training seeds, yielding **96 planned discovery cells** and zero secondary
+cells. A cell has 16 replicas, 50 warmup steps, and 500 measured steps (1 s +
+10 s at the V4 50 Hz control rate), for 844,800 total simulated
+environment-control steps including warmup. The runner calculates and enforces
+this explicit budget; it prevents accidental duplication when a loop is
+changed.
 
 The tracking inclusion gates are the explicit `scorecard` values in the config:
 MLP and Oracle fall rate at most `fall_gate_pp`, Oracle achieved-speed ratio at
@@ -75,10 +82,11 @@ cannot reuse old artifacts merely because the terrain matrix is unchanged.
 
 `v4_headroom_smoke.yaml` is intentionally tiny (four methods × two training
 seeds, one terrain type/level/velocity, two primary mass points, and one
-secondary payload cell). It validates matrix expansion, paired-seed scoring,
+secondary payload cell). It is an operational adapter smoke, not a subset claim
+or scientific result: it validates matrix expansion, paired-seed scoring,
 method adapters, pinning, height-map/terrain-hash identity, strict loading,
-report generation, and resume before any full campaign. Its numbers are never
-scientific results.
+report generation, and resume before discovery. Its primary terrain is the
+moderate `stairs_up/L3` world at `vx=0.6`, inside discovery support.
 
 ## Discovery to adaptation follow-up
 

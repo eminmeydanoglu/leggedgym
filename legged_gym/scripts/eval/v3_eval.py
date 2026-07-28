@@ -110,6 +110,75 @@ def artifact_root(cfg: Mapping[str, Any]) -> Path:
     return path if path.is_absolute() else _root() / path
 
 
+def _v4_checkpoint_inventory(cfg: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Load the optional immutable V4 deployment-checkpoint inventory.
+
+    V4's evaluation configs name runs for readability, while the inventory is
+    the authoritative, hash-pinned identity of the eight deployment policies.
+    Keeping it separate means a config edit cannot quietly retarget a run.
+    Non-V4 configs intentionally remain backwards compatible.
+    """
+    raw_path = cfg.get("checkpoint_inventory")
+    if not raw_path:
+        return None
+    path = Path(str(raw_path))
+    if not path.is_absolute():
+        path = _root() / path
+    if not path.is_file():
+        raise FileNotFoundError(f"V4 checkpoint inventory is missing: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, Mapping) or data.get("schema_version") != "v4_spnte_checkpoint_inventory_v1":
+        raise ValueError(f"unsupported V4 checkpoint inventory: {path}")
+    if data.get("checkpoint") != "best_spnte":
+        raise ValueError(f"V4 checkpoint inventory must lock best_spnte: {path}")
+    if not isinstance(data.get("models"), list):
+        raise ValueError(f"V4 checkpoint inventory models must be a list: {path}")
+    return data
+
+
+def _v4_inventory_entry(cfg: Mapping[str, Any], model: Mapping[str, Any], seed: int) -> Mapping[str, Any] | None:
+    """Return one locked policy-seed entry and reject config/inventory drift."""
+    inventory = _v4_checkpoint_inventory(cfg)
+    if inventory is None:
+        return None
+    matches = [item for item in inventory["models"] if isinstance(item, Mapping) and item.get("label") == model.get("label")]
+    if len(matches) != 1:
+        raise ValueError(f"V4 checkpoint inventory needs exactly one entry for {model.get('label')!r}")
+    item = matches[0]
+    if item.get("task") != model.get("task"):
+        raise ValueError(f"V4 checkpoint inventory task mismatch for {model.get('label')}: {item.get('task')} != {model.get('task')}")
+    if model.get("checkpoint") != inventory.get("checkpoint"):
+        raise ValueError(f"V4 config checkpoint mismatch for {model.get('label')}: expected {inventory.get('checkpoint')}")
+    seeds = item.get("seeds")
+    entry = seeds.get(seed, seeds.get(str(seed))) if isinstance(seeds, Mapping) else None
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"V4 checkpoint inventory is missing {model.get('label')} seed {seed}")
+    required = ("run_folder", "checkpoint_sha256", "selected_iteration", "selection_metric", "spnte_lin")
+    missing = [key for key in required if key not in entry]
+    if missing:
+        raise ValueError(f"V4 checkpoint inventory {model.get('label')} seed {seed} missing {missing}")
+    return entry
+
+
+def _verify_v4_inventory_entry(cfg: Mapping[str, Any], model: Mapping[str, Any], seed: int,
+                               run_dir: Path, checkpoint: Path) -> None:
+    """Fail closed when the resolved V4 deploy artifact differs from the lock."""
+    entry = _v4_inventory_entry(cfg, model, seed)
+    if entry is None:
+        return
+    if run_dir.name != str(entry["run_folder"]):
+        raise RuntimeError(
+            f"V4 checkpoint inventory run mismatch for {model['label']} seed {seed}: "
+            f"expected {entry['run_folder']}, resolved {run_dir.name}"
+        )
+    actual = sha256_file(str(checkpoint))
+    if actual != str(entry["checkpoint_sha256"]):
+        raise RuntimeError(
+            f"V4 checkpoint inventory SHA mismatch for {model['label']} seed {seed}: "
+            f"expected {entry['checkpoint_sha256']}, resolved {actual}"
+        )
+
+
 def _cell_rel(cell: Cell) -> str:
     return f"{cell.suite}/{cell.model}/seed_{cell.seed}/{cell.name}"
 
@@ -445,6 +514,7 @@ def cmd_resolve_runs(cfg: Mapping[str, Any], *, labels: Sequence[str] | None = N
                 skipped.append({"label": model["label"], "training_seed": seed, "reason": str(exc)})
                 continue
             checkpoint = Path(resolve_checkpoint_path(str(run_dir), model.get("checkpoint", "best_tracking")))
+            _verify_v4_inventory_entry(cfg, model, seed, run_dir, checkpoint)
             row = {
                 "label": model["label"], "task": model["task"], "training_seed": seed,
                 "run_folder": run_dir.name, "run_path": str(run_dir),
@@ -771,6 +841,11 @@ def _v4_campaign_fingerprint(cfg: Mapping[str, Any], root: Path | None = None) -
     root = root or artifact_root(cfg)
     selection = _selection_path(root)
     selection_sha = hashlib.sha256(selection.read_bytes()).hexdigest() if selection.is_file() else ""
+    raw_inventory = cfg.get("checkpoint_inventory", "")
+    inventory_path = Path(str(raw_inventory)) if raw_inventory else None
+    if inventory_path is not None and not inventory_path.is_absolute():
+        inventory_path = _root() / inventory_path
+    inventory_sha = hashlib.sha256(inventory_path.read_bytes()).hexdigest() if inventory_path and inventory_path.is_file() else ""
     payload = {
         "world_protocol_fingerprint": _v4_protocol_fingerprint(cfg),
         "training_seeds": [int(seed) for seed in cfg["training_seeds"]],
@@ -778,6 +853,7 @@ def _v4_campaign_fingerprint(cfg: Mapping[str, Any], root: Path | None = None) -
         "models": [{key: model.get(key) for key in ("label", "task", "checkpoint", "run_pattern", "run_paths")}
                    for model in cfg["models"]],
         "run_selection_sha256": selection_sha,
+        "checkpoint_inventory_sha256": inventory_sha,
         "followup_manifest": cfg.get("execution", {}).get("followup_manifest", ""),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

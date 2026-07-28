@@ -67,8 +67,8 @@ class TestV3EvalPlan(unittest.TestCase):
         self.assertEqual({cell.seed for cell in cells}, {1, 2})
         self.assertEqual({cell.model for cell in cells}, {"MLP", "Superset-Oracle", "DreamWaQ", "HIM-fixed"})
         self.assertTrue(all(cell.scenario["terrain_type"] == "stairs_up" for cell in cells))
-        self.assertTrue(all(cell.scenario["terrain_level"] == 5 for cell in cells))
-        self.assertTrue(all(cell.scenario["command_vx"] == 0.8 for cell in cells))
+        self.assertTrue(all(cell.scenario["terrain_level"] == cfg["protocol"]["terrain"]["levels"][0] for cell in cells))
+        self.assertTrue(all(cell.scenario["command_vx"] == cfg["protocol"]["commands"]["vx"][0] for cell in cells))
         self.assertTrue(all(cell.scenario["physics"]["com_x_m"] == 0.0 and cell.scenario["physics"]["friction"] == 1.0
                             for cell in primary))
         self.assertEqual({cell.scenario["physics"]["mass_kg"] for cell in primary}, {0.0, 6.0})

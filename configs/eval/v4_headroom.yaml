@@ -3,12 +3,17 @@
 # This is declarative input for the required ``v4_headroom_matrix_v1`` runner
 # interface described in ``legged_gym/scripts/eval/V4_HEADROOM.md``.  The
 # current runner validates and preserves the explicit terrain-type, velocity,
-# isolated-axis, policy-seed, and protocol-fingerprint dimensions.
+# isolated-axis, policy-seed, and protocol-fingerprint dimensions. This is a
+# deliberately small discovery bank: it decides whether adaptation-method
+# budget is justified, rather than mapping the whole terrain curriculum.
 schema_version: v4_headroom_matrix_v1
 campaign: v4_headroom
 artifact_root: logs/eval/v4_headroom
 simulator: genesis
 training_seeds: [1, 2]
+# Eight explicitly verified deployment artifacts (four architectures × two
+# policy seeds).  `resolve-runs` fails closed if a run folder or SHA drifts.
+checkpoint_inventory: configs/eval/v4_spnte_checkpoint_inventory.yaml
 execution:
   runner_interface: v4_headroom_matrix_v1
   status: ready_for_discovery
@@ -27,14 +32,17 @@ models:
 
 protocol:
   eval_seed: 1
-  warmup_steps: 100
-  measured_steps: 2000
+  # 1 s settling plus a 10 s measured steady-command window at V4's 50 Hz
+  # control rate. Sixteen replicas and two trained-policy seeds retain useful
+  # fall/tracking checks without turning discovery into a multi-day campaign.
+  warmup_steps: 50
+  measured_steps: 500
   # Every cell holds a single selected terrain type, so replicas are not mixed
   # across terrain families.  This is deliberately distinct from v3_eval's
   # current all-types-in-one-env-batch layout.
-  replicas_per_cell: 76
+  replicas_per_cell: 16
   commands:
-    vx: [0.4, 0.6, 0.8, 1.0]
+    vx: [0.6, 1.0]
     vy: 0.0
     yaw_rate: 0.0
   terrain:
@@ -42,8 +50,10 @@ protocol:
     num_rows: 10
     num_cols: 5
     proportions: [0.2, 0.1, 0.25, 0.25, 0.2]
-    types: [slope, random_uniform, stairs_down, stairs_up, discrete]
-    levels: [1, 3, 5, 7, 9]
+    # One irregular surface and one discontinuous-obstacle family at the same
+    # moderate level keep the comparison small and directly matched.
+    types: [random_uniform, stairs_up]
+    levels: [3]
     measure_heights: true
   nominal_physics:
     mass_kg: 0.0
@@ -64,33 +74,32 @@ protocol:
     axes:
       - name: mass_kg
         dr_axis: added_mass
-        id: [-2.0, 0.0, 5.0]
-        ood: [-3.0, 6.0]
+        # Keep the nominal point exactly once as the common anchor, then test
+        # the nearest OOD payload extension.
+        id: [0.0]
+        ood: [6.0]
       - name: com_x_m
         dr_axis: com_x
-        id: [-0.08, 0.0, 0.08]
-        ood: [-0.10, 0.10]
+        id: [0.08]
+        ood: [0.10]
       - name: friction
         dr_axis: friction
-        id: [0.50, 0.875, 1.25]
-        ood: [0.35, 1.50]
+        id: [0.50]
+        ood: [0.35]
 
-  # Secondary result only: correlated physics and payload.  It is never
-  # pooled with primary single-axis cells for the headline gap-closed claim.
+  # Discovery deliberately has no correlated-payload fishing tier. The empty
+  # schema section makes the zero secondary budget explicit; only eligible
+  # primary worlds may trigger the later DreamWaQ/HIM phase.
   secondary_combined_stress_payload:
     tier: secondary_combined_stress_payload
-    terrain_levels: [5, 9]
-    vx: [0.6, 1.0]
-    scenarios:
-      - {name: id_edge_forward_payload, mass_kg: 1.0, com_x_m: 0.03, friction: 0.50, band: id_composite}
-      - {name: ood_mass_forward_payload, mass_kg: 2.0, com_x_m: 0.06, friction: 0.50, band: ood_composite}
-      - {name: payload_plus4, mass_kg: 4.0, com_x_m: 0.04, friction: 0.75, band: payload_stress}
-      - {name: payload_plus6, mass_kg: 6.0, com_x_m: 0.06, friction: 0.50, band: payload_stress}
+    terrain_levels: []
+    vx: []
+    scenarios: []
 
-  # 2 models x 2 seeds x 5 types x 5 levels x 4 vx x (3 axes x 5 points) =
-  # 6,000 primary cells; the secondary tier adds 320. A matrix runner rejects a
-  # plan that expands beyond this declared budget rather than duplicating work.
-  planned_cell_budget: {primary: 6000, secondary: 320, total: 6320}
+  # 2 models x 2 seeds x 2 terrain families x 1 level x 2 commands x
+  # (2 mass + 2 CoM-x + 2 friction points) = 96 discovery cells. There is no
+  # secondary tier; the runner rejects any accidental expansion.
+  planned_cell_budget: {primary: 96, secondary: 0, total: 96}
 
 scorecard:
   baseline_label: MLP

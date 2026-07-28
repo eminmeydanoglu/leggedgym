@@ -8,6 +8,9 @@ campaign: v4_headroom_smoke
 artifact_root: logs/eval/v4_headroom_smoke
 simulator: genesis
 training_seeds: [1, 2]
+# Use the same locked eight-artifact population as discovery; a smoke may not
+# accidentally validate a different checkpoint than the full eval.
+checkpoint_inventory: configs/eval/v4_spnte_checkpoint_inventory.yaml
 execution:
   runner_interface: v4_headroom_matrix_v1
   status: ready_for_smoke
@@ -23,15 +26,15 @@ protocol:
   eval_seed: 1
   warmup_steps: 8
   measured_steps: 32
-  replicas_per_cell: 10
-  commands: {vx: [0.8], vy: 0.0, yaw_rate: 0.0}
+  replicas_per_cell: 8
+  commands: {vx: [0.6], vy: 0.0, yaw_rate: 0.0}
   terrain:
     generator: v4_curriculum_heightfield
     num_rows: 10
     num_cols: 5
     proportions: [0.2, 0.1, 0.25, 0.25, 0.2]
     types: [stairs_up]
-    levels: [5]
+    levels: [3]
     measure_heights: true
   nominal_physics: {mass_kg: 0.0, com_x_m: 0.0, friction: 1.0}
   training_support:
@@ -45,8 +48,8 @@ protocol:
       - {name: mass_kg, dr_axis: added_mass, id: [0.0], ood: [6.0]}
   secondary_combined_stress_payload:
     tier: secondary_combined_stress_payload
-    terrain_levels: [5]
-    vx: [0.8]
+    terrain_levels: [3]
+    vx: [0.6]
     scenarios:
       - {name: payload_plus4, mass_kg: 4.0, com_x_m: 0.04, friction: 0.75, band: payload_stress}
 

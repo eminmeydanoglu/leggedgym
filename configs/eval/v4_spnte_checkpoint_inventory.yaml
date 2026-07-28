@@ -1,0 +1,85 @@
+# Canonical V4 deployment checkpoint lock.  The eight entries were read on the
+# UHeM `starling` A100 allocation on 2026-07-28 from
+# /ari/users/btutak/auv/sim/genesis-wp/LeggedGym-Ex.  Eval resolution must
+# match every run folder, artifact name, and SHA-256 below before it rolls out.
+#
+# This is intentionally an inventory, not a checkpoint selector: it records
+# the already materialised best_spnte.pt for the four matched V4 architectures
+# and both policy-training seeds.  `selection_metric` is retained verbatim so
+# that the seed-2 historical provenance difference is visible rather than
+# silently relabelled as the V4 offline selector.
+schema_version: v4_spnte_checkpoint_inventory_v1
+campaign_family: v4_terrain_curriculum
+log_root: logs/go2_v4_terrain_curriculum
+checkpoint: best_spnte
+verified_at: '2026-07-28T00:00:00+03:00'
+verified_on: starling
+models:
+  - label: MLP
+    task: go2_v4_mlp
+    seeds:
+      1:
+        run_folder: Jul20_12-02-36_v4_mlp_genesis_seed1
+        checkpoint_sha256: da656cc9f87bfa28a7d83a781caf7b5a183a9e06f10eeff2a1c5deb562909c22
+        selected_iteration: 2600
+        selection_metric: spnte_v1_offline
+        source_checkpoint: model_2600.pt
+        spnte_lin: 0.17436425387859344
+      2:
+        run_folder: Jul24_15-28-10_v4_mlp_genesis_seed2
+        checkpoint_sha256: ac81149a6672dd1356fc1a75977dc558b389e1711c45a00880c10d37a8c7352d
+        selected_iteration: 2000
+        selection_metric: spnte_v1
+        source_checkpoint: null
+        spnte_lin: 0.19630412757396698
+  - label: Superset-Oracle
+    task: go2_v4_superset_oracle
+    seeds:
+      1:
+        run_folder: Jul20_11-49-05_v4_superset_oracle_genesis_seed1
+        checkpoint_sha256: bf96b3e1b464e0e4f508ec4c6eca8f4e46741f01786c56350610e42ec332dc0a
+        selected_iteration: 1200
+        selection_metric: spnte_v1_offline
+        source_checkpoint: model_1200.pt
+        spnte_lin: 0.14965230226516724
+      2:
+        run_folder: Jul24_15-28-33_v4_superset_oracle_genesis_seed2
+        checkpoint_sha256: b81aeafc267b54af16f9cf7821f01b73390d2bff8371652c4d427136c5fac523
+        selected_iteration: 3000
+        selection_metric: spnte_v1
+        source_checkpoint: null
+        spnte_lin: 0.1564052700996399
+  - label: DreamWaQ
+    task: go2_v4_dreamwaq
+    seeds:
+      1:
+        run_folder: Jul20_14-38-45_v4_dreamwaq_genesis_seed1
+        checkpoint_sha256: d4e9019b025eef9feb650c01032908c5691c43eb848157762e576e544422f238
+        selected_iteration: 2200
+        selection_metric: spnte_v1_offline
+        source_checkpoint: model_2200.pt
+        spnte_lin: 0.11362514644861221
+      2:
+        run_folder: Jul24_15-28-51_v4_dreamwaq_genesis_seed2
+        checkpoint_sha256: 4b4d8616a1649a47420d9ab4f3b98ab8e7716220f497f73fbaee6754fa4358d9
+        selected_iteration: 3000
+        selection_metric: spnte_v1
+        source_checkpoint: null
+        spnte_lin: 0.15033794939517975
+  - label: HIM-fixed
+    task: go2_v4_him_fixed
+    seeds:
+      1:
+        run_folder: Jul20_15-00-57_v4_him_fixed_genesis_seed1
+        checkpoint_sha256: ba58354a5d7f4f0652ca47af3926cace0ae1855e234fbd460748b45f754694a0
+        selected_iteration: 2400
+        selection_metric: spnte_v1_offline
+        source_checkpoint: model_2400.pt
+        spnte_lin: 0.18394486606121063
+      2:
+        run_folder: Jul24_15-29-13_v4_him_fixed_genesis_seed2
+        checkpoint_sha256: 3b864f7169a12feafde633a1af8205aff2c57e20ce4f5c44bca19055c3bdec61
+        selected_iteration: 2400
+        selection_metric: spnte_v1
+        source_checkpoint: null
+        spnte_lin: 0.20974206924438477
