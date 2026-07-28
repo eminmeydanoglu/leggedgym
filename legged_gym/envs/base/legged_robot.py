@@ -133,12 +133,14 @@ class LeggedRobot(BaseTask):
         from legged_gym.utils.ued.genesis_adapter import GenesisUEDAdapter
 
         self.episode_curriculum = episode_curriculum
-        self.ued_adapter = GenesisUEDAdapter(
+        adapter_class = getattr(episode_curriculum, "adapter_class", GenesisUEDAdapter)
+        self.ued_adapter = adapter_class(
             task_space=task_space,
             simulator=self.simulator,
             commands=self.commands,
             command_ranges=self.command_ranges,
             device=self.device,
+            **getattr(episode_curriculum, "adapter_kwargs", {}),
         )
         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
         self._assign_ued_batch(env_ids)
@@ -229,6 +231,10 @@ class LeggedRobot(BaseTask):
             outcomes = adapter.collect_outcomes(
                 mover_done,
                 completion_revision=self.episode_curriculum.sampler_revision,
+                # Completion-time control step for the rolling-completion LP
+                # ring.  Captured here, before replacement assignments clear
+                # episode provenance.
+                completion_global_control_steps=int(getattr(self, "common_step_counter", 0)),
                 timed_out=self.time_out_buf,
             )
             self.episode_curriculum.observe(outcomes)

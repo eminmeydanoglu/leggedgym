@@ -14,6 +14,9 @@ from .checkpoint import SCHEMA_VERSION, validate_checkpoint_state
 from .task_space import TaskSpace
 
 
+COMPLETION_RING_CAPACITY = 2_048
+
+
 @dataclass(frozen=True)
 class TaskAssignmentBatch:
     task_ids: np.ndarray
@@ -32,11 +35,11 @@ class EpisodeOutcomeBatch:
     ``legged_robot._assign_ued_batch``), so every outcome in this batch is a
     real LP cell with a finite return.  There is no per-episode validity flag.
 
-    Learning-progress admission (see :meth:`_FiniteEpisodeCurriculum.observe`):
-    only outcomes with ``assigned_revision`` equal to the currently open
-    ``sampler_revision`` and ``episode_lengths > 0`` update stage return
-    averages.  Late completions (assigned under a previous revision) stay in
-    provenance counters but do not contaminate the open stage.
+    The legacy stage estimator admits only outcomes with
+    ``assigned_revision == sampler_revision`` to its stage return averages;
+    late completions remain provenance-only there.  The rolling-completion
+    estimator instead records every real moving completion in its own per-task
+    ring, with no write to any stage accumulator.
     """
 
     task_ids: np.ndarray
@@ -45,6 +48,10 @@ class EpisodeOutcomeBatch:
     episodic_returns: np.ndarray
     episode_lengths: np.ndarray
     terminal_reasons: np.ndarray
+    # All outcomes in one lifecycle batch complete at the same control step.
+    # The default keeps direct core callers written before rolling completion
+    # provenance compatible; the environment supplies the real value.
+    completion_global_control_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,8 @@ class _FiniteEpisodeCurriculum:
         max_cell_probability: float = 0.08,
         min_stage_episodes_for_lp: int = 16,
         confidence_scale: float = 1.0,
+        lp_estimator: str = "stage",
+        rolling_completion_window: int = 64,
         seed: int | None = None,
     ) -> None:
         if stage_length_control_steps <= 0:
@@ -123,6 +132,18 @@ class _FiniteEpisodeCurriculum:
             raise ValueError("min_stage_episodes_for_lp must be an integer >= 2")
         if not np.isfinite(confidence_scale) or confidence_scale <= 0:
             raise ValueError("confidence_scale must be finite and positive")
+        if not isinstance(lp_estimator, str) or lp_estimator not in {"stage", "rolling_completion"}:
+            raise ValueError("lp_estimator must be 'stage' or 'rolling_completion'")
+        if (
+            isinstance(rolling_completion_window, bool)
+            or not isinstance(rolling_completion_window, Integral)
+            or rolling_completion_window < 1
+            or 2 * rolling_completion_window > COMPLETION_RING_CAPACITY
+        ):
+            raise ValueError(
+                "rolling_completion_window must be an integer >= 1 with "
+                f"2 * K <= {COMPLETION_RING_CAPACITY}"
+            )
         self.task_space = task_space
         self.stage_length_control_steps = int(stage_length_control_steps)
         self.beta = float(beta)
@@ -137,6 +158,8 @@ class _FiniteEpisodeCurriculum:
         self.max_cell_probability = float(max_cell_probability)
         self.min_stage_episodes_for_lp = int(min_stage_episodes_for_lp)
         self.confidence_scale = float(confidence_scale)
+        self._lp_estimator = lp_estimator
+        self._rolling_window_size = int(rolling_completion_window)
         self._effective_beta = (
             float(np.clip(beta, beta_min, beta_max))
             if temperature_mode == "adaptive_ess"
@@ -165,6 +188,21 @@ class _FiniteEpisodeCurriculum:
         self._stage_return_sums = np.zeros(self._n, dtype=np.float64)
         self._stage_return_sq_sums = np.zeros(self._n, dtype=np.float64)
         self._stage_episode_counts = np.zeros(self._n, dtype=np.int64)
+        self._completion_return_ring = np.zeros(
+            (self._n, COMPLETION_RING_CAPACITY), dtype=np.float64
+        )
+        self._completion_length_ring = np.zeros(
+            (self._n, COMPLETION_RING_CAPACITY), dtype=np.int64
+        )
+        self._completion_step_ring = np.zeros(
+            (self._n, COMPLETION_RING_CAPACITY), dtype=np.int64
+        )
+        self._completion_ring_pos = np.zeros(self._n, dtype=np.int64)
+        self._completion_ring_count = np.zeros(self._n, dtype=np.int64)
+        self._rolling_ready_masks = np.zeros(self._n, dtype=bool)
+        self._rolling_previous_return_sems = np.full(self._n, np.nan, dtype=np.float64)
+        self._rolling_current_return_sems = np.full(self._n, np.nan, dtype=np.float64)
+        self._rolling_reward_per_step_shadow = float("nan")
         self._task_assignment_counts = np.zeros(self._n, dtype=np.int64)
         self._task_completion_counts = np.zeros(self._n, dtype=np.int64)
         self._transition_occupancy: dict[str, int] = {}
@@ -197,6 +235,8 @@ class _FiniteEpisodeCurriculum:
             "max_cell_probability": self.max_cell_probability,
             "min_stage_episodes_for_lp": self.min_stage_episodes_for_lp,
             "confidence_scale": self.confidence_scale,
+            "lp_estimator": self._lp_estimator,
+            "rolling_completion_window": self._rolling_window_size,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -244,15 +284,16 @@ class _FiniteEpisodeCurriculum:
         """Ingest completed moving-task episodes.
 
         Provenance (completion counts, transition occupancy) records every
-        outcome.  Stage return / LP accumulators only accept outcomes assigned
-        under the currently open ``sampler_revision``: late completions
-        (previous revision) are censored from LP rather than written into the
-        open stage, and assigned revisions ahead of the open sampler are
-        rejected fail-closed.
+        outcome.  The legacy ``stage`` estimator only admits outcomes assigned
+        under the currently open ``sampler_revision``.  In
+        ``rolling_completion`` mode every real moving completion is appended to
+        its task's ring, independent of assignment/completion revision; it
+        never enters either an old or the open stage accumulator.
 
         Callers pass only genuinely-run episodes; never-stepped startup ghosts
         are filtered upstream at the episode-lifecycle boundary (see
         ``LeggedRobot._observe_ued_outcomes``), not re-checked here.
+
         """
         arrays = (
             outcomes.task_ids, outcomes.assigned_revision, outcomes.episodic_returns,
@@ -274,6 +315,10 @@ class _FiniteEpisodeCurriculum:
         completion_revision = self._non_negative_integer(
             outcomes.completion_revision, name="outcome completion_revision"
         )
+        completion_global_control_steps = self._non_negative_integer(
+            outcomes.completion_global_control_steps,
+            name="outcome completion_global_control_steps",
+        )
         returns = np.asarray(outcomes.episodic_returns, dtype=np.float64)
         episode_lengths = np.asarray(outcomes.episode_lengths)
         if not np.issubdtype(episode_lengths.dtype, np.integer) or np.any(episode_lengths < 0):
@@ -291,6 +336,13 @@ class _FiniteEpisodeCurriculum:
         same_stage = assigned_revisions == self.sampler_revision
         late = ~same_stage
         self._late_outcome_count += int(late.sum())
+
+        if self._lp_estimator == "rolling_completion":
+            self._append_rolling_completions(
+                ids, returns, episode_lengths.astype(np.int64, copy=False),
+                completion_global_control_steps,
+            )
+            return
         admitted = same_stage
         if not np.any(admitted):
             return
@@ -303,6 +355,70 @@ class _FiniteEpisodeCurriculum:
             admitted_ids, weights=np.square(admitted_returns), minlength=self._n
         )
         self._stage_episode_counts += np.bincount(admitted_ids, minlength=self._n)
+
+    def _append_rolling_completions(
+        self,
+        task_ids: np.ndarray,
+        returns: np.ndarray,
+        lengths: np.ndarray,
+        completion_global_control_steps: int,
+    ) -> None:
+        """Append completions in lifecycle order without consuming RNG state."""
+        for task_id, episodic_return, episode_length in zip(task_ids, returns, lengths):
+            index = int(self._completion_ring_pos[task_id])
+            self._completion_return_ring[task_id, index] = episodic_return
+            self._completion_length_ring[task_id, index] = episode_length
+            self._completion_step_ring[task_id, index] = completion_global_control_steps
+            self._completion_ring_pos[task_id] = (index + 1) % COMPLETION_RING_CAPACITY
+            self._completion_ring_count[task_id] = min(
+                int(self._completion_ring_count[task_id]) + 1,
+                COMPLETION_RING_CAPACITY,
+            )
+        self._rolling_ready_masks = (
+            self._completion_ring_count >= 2 * self._rolling_window_size
+        )
+
+    @staticmethod
+    def _window_sem(values: np.ndarray) -> float:
+        if values.size < 2:
+            return float("nan")
+        return float(np.std(values, ddof=1) / np.sqrt(values.size))
+
+    def _rolling_window_stats(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return two chronological completion-window means/SEMs and shadow RPS.
+
+        The physical ring layout is not chronological after wrap-around.  For a
+        task with a full ring, ``ring_pos`` is exactly its oldest item, so the
+        last ``2K`` indices can be built modulo capacity without copying or
+        touching the sampler RNG.
+        """
+        previous = np.full(self._n, np.nan, dtype=np.float64)
+        current = np.full(self._n, np.nan, dtype=np.float64)
+        previous_sems = np.full(self._n, np.nan, dtype=np.float64)
+        current_sems = np.full(self._n, np.nan, dtype=np.float64)
+        previous_rps = np.full(self._n, np.nan, dtype=np.float64)
+        current_rps = np.full(self._n, np.nan, dtype=np.float64)
+        window = self._rolling_window_size
+        ready_ids = np.flatnonzero(
+            self._completion_ring_count >= 2 * window
+        )
+        for task_id in ready_ids:
+            end = int(self._completion_ring_pos[task_id])
+            indices = (np.arange(-2 * window, 0, dtype=np.int64) + end) % COMPLETION_RING_CAPACITY
+            returns = self._completion_return_ring[task_id, indices]
+            lengths = self._completion_length_ring[task_id, indices]
+            previous_values = returns[:window]
+            current_values = returns[window:]
+            previous[task_id] = float(np.mean(previous_values))
+            current[task_id] = float(np.mean(current_values))
+            previous_sems[task_id] = self._window_sem(previous_values)
+            current_sems[task_id] = self._window_sem(current_values)
+            reward_per_step = returns / np.maximum(lengths, 1)
+            previous_rps[task_id] = float(np.mean(reward_per_step[:window]))
+            current_rps[task_id] = float(np.mean(reward_per_step[window:]))
+        return previous, current, previous_sems, current_sems, previous_rps, current_rps
 
     def _score(self, progress: np.ndarray) -> np.ndarray:
         return progress if self.algorithm == "lp_acrl" else np.abs(progress)
@@ -366,6 +482,9 @@ class _FiniteEpisodeCurriculum:
         progress: np.ndarray,
         progress_mask: np.ndarray,
         current_sems: np.ndarray,
+        *,
+        eligible_masks: np.ndarray | None = None,
+        previous_sems: np.ndarray | None = None,
     ) -> None:
         """Compute side-effect-free curriculum-quality diagnostics.
 
@@ -389,11 +508,18 @@ class _FiniteEpisodeCurriculum:
 
         # lp_reliability_median: median over eligible cells of
         # |LP| / (|LP| + lp_sem), lp_sem = sqrt(cur_sem^2 + prev_sem^2).
-        eligible = self._episode_gate(progress_mask, current_sems)
+        eligible = (
+            self._episode_gate(progress_mask, current_sems)
+            if eligible_masks is None
+            else eligible_masks
+        )
+        previous_sems = (
+            self._current_return_sems if previous_sems is None else previous_sems
+        )
         if np.any(eligible):
             lp_sem = np.sqrt(
                 np.square(current_sems[eligible])
-                + np.square(self._current_return_sems[eligible])
+                + np.square(previous_sems[eligible])
             )
             magnitude = np.abs(progress[eligible])
             reliability = magnitude / (magnitude + lp_sem + np.finfo(np.float64).eps)
@@ -471,13 +597,23 @@ class _FiniteEpisodeCurriculum:
         progress: np.ndarray,
         progress_mask: np.ndarray,
         current_sems: np.ndarray,
+        *,
+        eligible_masks: np.ndarray | None = None,
+        previous_sems: np.ndarray | None = None,
     ) -> np.ndarray:
-        eligible = self._episode_gate(progress_mask, current_sems)
+        eligible = (
+            self._episode_gate(progress_mask, current_sems)
+            if eligible_masks is None
+            else eligible_masks
+        )
         self._eligible_masks = eligible
+        previous_sems = (
+            self._current_return_sems if previous_sems is None else previous_sems
+        )
         lp_sem = np.full(self._n, np.nan, dtype=np.float64)
         lp_sem[eligible] = np.sqrt(
             np.square(current_sems[eligible])
-            + np.square(self._current_return_sems[eligible])
+            + np.square(previous_sems[eligible])
         )
         reliability = np.zeros(self._n, dtype=np.float64)
         magnitude = np.abs(progress[eligible])
@@ -507,33 +643,63 @@ class _FiniteEpisodeCurriculum:
         if global_control_steps - self.stage_start_global_steps < self.stage_length_control_steps:
             return None
         previous_stage_episode_counts = self._previous_stage_episode_counts.copy()
-        observed = self._stage_episode_counts > 0
-        current = np.full(self._n, np.nan, dtype=np.float64)
-        current[observed] = self._stage_return_sums[observed] / self._stage_episode_counts[observed]
-        current_sems = np.full(self._n, np.nan, dtype=np.float64)
-        variance_mask = self._stage_episode_counts >= 2
-        counts = self._stage_episode_counts[variance_mask].astype(np.float64)
-        centered_ss = (
-            self._stage_return_sq_sums[variance_mask]
-            - np.square(self._stage_return_sums[variance_mask]) / counts
-        )
-        sample_variances = np.maximum(centered_ss / (counts - 1.0), 0.0)
-        current_sems[variance_mask] = np.sqrt(sample_variances / counts)
-        # Eq. 6: learning progress is only defined for a cell with a real return
-        # in TWO consecutive stages.  A cell without that delta is imputed LP = 0
-        # -- the neutral value, not a fabricated reward: it writes nothing to the
-        # return accumulators and yields the reference softmax weight e^{0/beta},
-        # so an unobserved cell is neither boosted nor starved.
-        progress_mask = observed & self._observed_masks
-        progress = np.zeros(self._n, dtype=np.float64)
-        progress[progress_mask] = current[progress_mask] - self._current_returns[progress_mask]
+        if self._lp_estimator == "rolling_completion":
+            (
+                previous,
+                current,
+                previous_sems,
+                current_sems,
+                previous_rps,
+                current_rps,
+            ) = self._rolling_window_stats()
+            observed = self._completion_ring_count > 0
+            progress_mask = self._completion_ring_count >= 2 * self._rolling_window_size
+            progress = np.zeros(self._n, dtype=np.float64)
+            progress[progress_mask] = current[progress_mask] - previous[progress_mask]
+            rolling_adaptive_eligible = (
+                progress_mask
+                & np.isfinite(current_sems)
+                & np.isfinite(previous_sems)
+            )
+        else:
+            observed = self._stage_episode_counts > 0
+            current = np.full(self._n, np.nan, dtype=np.float64)
+            current[observed] = self._stage_return_sums[observed] / self._stage_episode_counts[observed]
+            current_sems = np.full(self._n, np.nan, dtype=np.float64)
+            variance_mask = self._stage_episode_counts >= 2
+            counts = self._stage_episode_counts[variance_mask].astype(np.float64)
+            centered_ss = (
+                self._stage_return_sq_sums[variance_mask]
+                - np.square(self._stage_return_sums[variance_mask]) / counts
+            )
+            sample_variances = np.maximum(centered_ss / (counts - 1.0), 0.0)
+            current_sems[variance_mask] = np.sqrt(sample_variances / counts)
+            # Eq. 6: LP is defined only for a cell with a real return in two
+            # consecutive *stages*.  This branch deliberately preserves the
+            # legacy estimator's exact admission and missing-data semantics.
+            progress_mask = observed & self._observed_masks
+            progress = np.zeros(self._n, dtype=np.float64)
+            progress[progress_mask] = current[progress_mask] - self._current_returns[progress_mask]
+            previous = self._current_returns
+            previous_sems = self._current_return_sems
+            previous_rps = np.full(self._n, np.nan, dtype=np.float64)
+            current_rps = np.full(self._n, np.nan, dtype=np.float64)
+            rolling_adaptive_eligible = None
+        if self._lp_estimator == "rolling_completion" and self.algorithm == "uniform":
+            self._eligible_masks = progress_mask.copy()
         if self.algorithm != "uniform":
             # Eq. 7: rebuild the WHOLE distribution as a softmax of LP over all of
             # T.  No probability is carried across stages -- the previous c_j is
             # not an input -- so a cell can never be permanently starved (an
             # absorbing state the old freeze-retained-mass update could reach).
             if self.temperature_mode == "adaptive_ess":
-                scores = self._adaptive_scores(progress, progress_mask, current_sems)
+                scores = self._adaptive_scores(
+                    progress,
+                    progress_mask,
+                    current_sems,
+                    eligible_masks=rolling_adaptive_eligible,
+                    previous_sems=previous_sems,
+                )
                 solved_beta = self._solve_beta_for_ess(scores, self._target_ess)
                 if self._signal_quality > 0.0 and not self._has_adaptive_signal:
                     # Bootstrap/uniform stages contain no LP information and
@@ -552,7 +718,7 @@ class _FiniteEpisodeCurriculum:
                 # direction.
                 self._effective_beta = max(smoothed_beta, solved_beta)
             else:
-                # The episode gate is not an adaptive-mode extra.  An LP built
+                # The stage estimator's episode gate is not an adaptive-mode extra.  An LP built
                 # from a one-episode mean is noise whose magnitude (|LP| ~ 6-9
                 # here) dwarfs the steady-state signal (~0.5), and a bare
                 # softmax at beta=1 turns e^{noise} into a runaway: the cell
@@ -561,9 +727,17 @@ class _FiniteEpisodeCurriculum:
                 # cell.  Gated-out cells fall back to the same neutral LP = 0
                 # imputation unobserved cells get, so they keep the reference
                 # weight e^0 rather than hijacking the distribution.
-                self._eligible_masks = self._episode_gate(progress_mask, current_sems)
+                self._eligible_masks = (
+                    progress_mask
+                    if self._lp_estimator == "rolling_completion"
+                    else self._episode_gate(progress_mask, current_sems)
+                )
                 scores = self._score(np.where(self._eligible_masks, progress, 0.0))
                 self._effective_beta = self.beta
+                # Inert sentinels: nothing in this branch reads them, but the
+                # checkpoint contract requires finite values, so they stay in
+                # state and are suppressed at the reporting boundary instead
+                # (see diagnostics()).
                 self._target_ess = float(self._n)
                 self._signal_quality = 0.0
             # The per-cell cap is a safety bound on the sampler, not on one
@@ -577,20 +751,47 @@ class _FiniteEpisodeCurriculum:
             raise ValueError("curriculum probabilities are not finite and normalized")
         # Curriculum-quality diagnostics: computed against the previous stage's
         # state, which is still intact here (rolled forward just below).
-        self._update_curriculum_diagnostics(progress, progress_mask, current_sems)
-        # Report imputed cells as NaN LP so downstream analysis can tell an
-        # imputed 0 from a genuinely measured zero learning progress.
-        progress_report = np.full(self._n, np.nan, dtype=np.float64)
-        progress_report[progress_mask] = progress[progress_mask]
-        self._previous_returns = self._current_returns.copy()
-        self._current_returns = current
-        self._previous_return_sems = self._current_return_sems.copy()
-        self._current_return_sems = current_sems
-        self._learning_progress = progress_report
-        effective_report = np.full(self._n, np.nan, dtype=np.float64)
-        if self.algorithm != "uniform":
-            effective_report[progress_mask] = scores[progress_mask]
-        self._effective_learning_progress = effective_report
+        self._update_curriculum_diagnostics(
+            progress,
+            progress_mask,
+            current_sems,
+            eligible_masks=(
+                self._eligible_masks if self._lp_estimator == "rolling_completion" else None
+            ),
+            previous_sems=previous_sems,
+        )
+        if self._lp_estimator == "rolling_completion":
+            # Unlike the legacy stage path, incomplete rolling windows have an
+            # explicit neutral LP score of 0 (not an unobserved-stage NaN).
+            progress_report = progress.copy()
+            self._previous_returns = previous.copy()
+            self._current_returns = current.copy()
+            self._previous_return_sems = previous_sems.copy()
+            self._current_return_sems = current_sems.copy()
+            self._rolling_previous_return_sems = previous_sems.copy()
+            self._rolling_current_return_sems = current_sems.copy()
+            ready_rps = current_rps[progress_mask] - previous_rps[progress_mask]
+            self._rolling_reward_per_step_shadow = (
+                float(np.mean(ready_rps)) if ready_rps.size else float("nan")
+            )
+            self._learning_progress = progress_report
+            self._effective_learning_progress = (
+                scores.copy() if self.algorithm != "uniform" else progress_report.copy()
+            )
+        else:
+            # Report imputed cells as NaN LP so downstream analysis can tell an
+            # imputed 0 from a genuinely measured zero learning progress.
+            progress_report = np.full(self._n, np.nan, dtype=np.float64)
+            progress_report[progress_mask] = progress[progress_mask]
+            self._previous_returns = self._current_returns.copy()
+            self._current_returns = current
+            self._previous_return_sems = self._current_return_sems.copy()
+            self._current_return_sems = current_sems
+            self._learning_progress = progress_report
+            effective_report = np.full(self._n, np.nan, dtype=np.float64)
+            if self.algorithm != "uniform":
+                effective_report[progress_mask] = scores[progress_mask]
+            self._effective_learning_progress = effective_report
         self._observed_masks = observed
         closed_stage_episode_counts = self._stage_episode_counts.copy()
         self._previous_stage_episode_counts = closed_stage_episode_counts
@@ -617,6 +818,7 @@ class _FiniteEpisodeCurriculum:
 
     def diagnostics(self) -> Mapping[str, object]:
         p = self._probabilities
+        adaptive = self.temperature_mode == "adaptive_ess"
         return {
             "finite_probabilities": bool(np.all(np.isfinite(p))),
             "entropy": float(-np.sum(np.where(p > 0, p * np.log(p), 0.0))),
@@ -624,9 +826,23 @@ class _FiniteEpisodeCurriculum:
             "max_cell_probability": float(np.max(p)),
             "min_cell_probability": float(np.min(p)),
             "temperature_mode": self.temperature_mode,
+            "lp_estimator": self._lp_estimator,
+            "rolling_completion_window": int(self._rolling_window_size),
+            "rolling_completion_total": int(self._completion_ring_count.sum()),
+            "rolling_ready_task_count": int(np.count_nonzero(self._rolling_ready_masks)),
+            "rolling_lp_nonzero_task_count": int(
+                np.count_nonzero(self._rolling_ready_masks & (self._learning_progress != 0.0))
+            ),
+            "rolling_reward_per_step_shadow": float(self._rolling_reward_per_step_shadow),
             "effective_beta": float(self._effective_beta),
-            "target_ess": float(self._target_ess),
-            "signal_quality": float(self._signal_quality),
+            # Both belong to the adaptive controller, which is dormant in fixed
+            # mode (_ensure_minimum_ess runs only there).  Their inert sentinels
+            # read as live values on a dashboard -- "target ESS 84" says we are
+            # aiming for the uniform this mode exists to escape, and "signal
+            # quality 0" contradicts a measured LP reliability of ~0.9 -- so
+            # report them as NaN, which renders as n/a.
+            "target_ess": float(self._target_ess) if adaptive else float("nan"),
+            "signal_quality": float(self._signal_quality) if adaptive else float("nan"),
             "eligible_cell_count": int(np.count_nonzero(self._eligible_masks)),
             "eligible_fraction": float(np.count_nonzero(self._eligible_masks) / self._n),
             "ess_guard_uniform_mix": float(self._ess_guard_uniform_mix),
@@ -638,6 +854,7 @@ class _FiniteEpisodeCurriculum:
             "tv_distance_uniform": float(0.5 * np.sum(np.abs(p - 1.0 / self._n), dtype=np.float64)),
             "lp_reliability_median": float(self._lp_reliability_median),
             "sampled_lp_mass": float(self._sampled_lp_mass),
+
         }
 
     def state_dict(self) -> dict:
@@ -651,9 +868,19 @@ class _FiniteEpisodeCurriculum:
             "learning_progress": self._learning_progress.copy(), "observed_masks": self._observed_masks.copy(),
             "effective_learning_progress": self._effective_learning_progress.copy(),
             "eligible_masks": self._eligible_masks.copy(),
+            "lp_estimator": self._lp_estimator,
+            "rolling_completion_window": self._rolling_window_size,
             "previous_stage_episode_counts": self._previous_stage_episode_counts.copy(),
             "stage_return_sums": self._stage_return_sums.copy(), "stage_return_sq_sums": self._stage_return_sq_sums.copy(),
             "stage_episode_counts": self._stage_episode_counts.copy(),
+            "completion_return_ring": self._completion_return_ring.copy(),
+            "completion_length_ring": self._completion_length_ring.copy(),
+            "completion_step_ring": self._completion_step_ring.copy(),
+            "completion_ring_pos": self._completion_ring_pos.copy(),
+            "completion_ring_count": self._completion_ring_count.copy(),
+            "rolling_ready_masks": self._rolling_ready_masks.copy(),
+            "rolling_previous_return_sems": self._rolling_previous_return_sems.copy(),
+            "rolling_current_return_sems": self._rolling_current_return_sems.copy(),
             "task_assignment_counts": self._task_assignment_counts.copy(), "task_completion_counts": self._task_completion_counts.copy(),
             "transition_occupancy": dict(self._transition_occupancy),
             "source_label": self._source_label,
@@ -666,6 +893,16 @@ class _FiniteEpisodeCurriculum:
 
     def load_state_dict(self, state: Mapping[str, object]) -> None:
         validate_checkpoint_state(state, algorithm=self.algorithm, task_space_fingerprint=self.task_space.fingerprint(), config_fingerprint=self.config_fingerprint)
+        if state["lp_estimator"] != self._lp_estimator:
+            raise ValueError("checkpoint lp_estimator does not match curriculum configuration")
+        checkpoint_window = self._non_negative_integer(
+            state["rolling_completion_window"],
+            name="checkpoint rolling_completion_window",
+        )
+        if checkpoint_window != self._rolling_window_size:
+            raise ValueError(
+                "checkpoint rolling_completion_window does not match curriculum configuration"
+            )
         arrays = (
             "probabilities", "previous_returns", "current_returns",
             "previous_return_sems", "current_return_sems", "learning_progress",
@@ -696,6 +933,50 @@ class _FiniteEpisodeCurriculum:
         probabilities = np.asarray(loaded_arrays["probabilities"], dtype=np.float64)
         if not np.all(np.isfinite(probabilities)) or np.any(probabilities < 0) or not np.isclose(probabilities.sum(), 1.0):
             raise ValueError("checkpoint probabilities are invalid")
+        ring_arrays = (
+            "completion_return_ring", "completion_length_ring", "completion_step_ring",
+        )
+        loaded_rings: dict[str, np.ndarray] = {}
+        expected_ring_shape = (self._n, COMPLETION_RING_CAPACITY)
+        for name in ring_arrays:
+            value = np.asarray(state[name])
+            if value.shape != expected_ring_shape:
+                raise ValueError(f"checkpoint {name} has the wrong ring shape")
+            if name == "completion_return_ring":
+                if not np.issubdtype(value.dtype, np.number) or not np.all(np.isfinite(value)):
+                    raise ValueError("checkpoint completion_return_ring must be finite numeric values")
+                loaded_rings[name] = value.astype(np.float64, copy=True)
+            else:
+                if not np.issubdtype(value.dtype, np.integer) or np.any(value < 0):
+                    raise ValueError(f"checkpoint {name} must be non-negative integers")
+                loaded_rings[name] = value.astype(np.int64, copy=True)
+        ring_vectors = (
+            "completion_ring_pos", "completion_ring_count", "rolling_ready_masks",
+            "rolling_previous_return_sems", "rolling_current_return_sems",
+        )
+        loaded_ring_vectors: dict[str, np.ndarray] = {}
+        for name in ring_vectors:
+            value = np.asarray(state[name])
+            if value.shape != (self._n,):
+                raise ValueError(f"checkpoint {name} has the wrong task-space shape")
+            if name == "rolling_ready_masks":
+                if value.dtype != np.bool_:
+                    raise ValueError("checkpoint rolling_ready_masks must be boolean")
+            elif name in {"completion_ring_pos", "completion_ring_count"}:
+                if not np.issubdtype(value.dtype, np.integer) or np.any(value < 0):
+                    raise ValueError(f"checkpoint {name} must be non-negative integers")
+            elif not np.issubdtype(value.dtype, np.number) or np.any(np.isinf(value)):
+                raise ValueError(f"checkpoint {name} must be numeric without infinities")
+            loaded_ring_vectors[name] = value.copy()
+        ring_pos = loaded_ring_vectors["completion_ring_pos"]
+        ring_count = loaded_ring_vectors["completion_ring_count"]
+        if np.any(ring_pos >= COMPLETION_RING_CAPACITY):
+            raise ValueError("checkpoint completion_ring_pos is outside the ring")
+        if np.any(ring_count > COMPLETION_RING_CAPACITY):
+            raise ValueError("checkpoint completion_ring_count exceeds ring capacity")
+        expected_ready = ring_count >= 2 * self._rolling_window_size
+        if not np.array_equal(loaded_ring_vectors["rolling_ready_masks"], expected_ready):
+            raise ValueError("checkpoint rolling_ready_masks do not match ring counts")
         stage_index = self._non_negative_integer(state["stage_index"], name="checkpoint stage_index")
         sampler_revision = self._non_negative_integer(state["sampler_revision"], name="checkpoint sampler_revision")
         stage_start_global_steps = self._non_negative_integer(state["stage_start_global_steps"], name="checkpoint stage_start_global_steps")
@@ -741,6 +1022,10 @@ class _FiniteEpisodeCurriculum:
         for name, value in loaded_arrays.items():
             if name != "probabilities":
                 setattr(self, "_" + name, value)
+        for name, value in loaded_rings.items():
+            setattr(self, "_" + name, value)
+        for name, value in loaded_ring_vectors.items():
+            setattr(self, "_" + name, value)
         self.stage_index = stage_index
         self.sampler_revision = sampler_revision
         self.stage_start_global_steps = stage_start_global_steps

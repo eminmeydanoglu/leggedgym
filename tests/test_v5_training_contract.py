@@ -34,6 +34,9 @@ ALLOWED_ENV_DIFF_KEYS = {
     # mechanism it replaces for the UED arms.
     "env.ued_enabled",
     "curriculum.algorithm",
+    # LP-ACRL alone opts into the rolling-completion estimator; legacy stage
+    # remains selectable for the other arms without changing task support.
+    "curriculum.lp_estimator",
     "terrain.curriculum",
     "terrain.num_rows",
     "terrain.num_cols",

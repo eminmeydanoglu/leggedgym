@@ -412,16 +412,38 @@ def test_v5_defaults_are_the_fixed_beta_freeze_and_the_softmax_bites():
     curriculum, _ = build_ued_teacher(Go2V5LPACRLCfg())
     assert curriculum.temperature_mode == "fixed"
     assert curriculum.beta == pytest.approx(1.0)
+    assert curriculum._lp_estimator == "rolling_completion"
     stage = curriculum.stage_length_control_steps
-    _adaptive_stage(curriculum, np.zeros(84), step=stage)
-    snapshot = _adaptive_stage(
-        curriculum, np.linspace(-2.0, 2.0, 84), step=2 * stage
-    )
+    window = curriculum._rolling_window_size
+    targets = np.linspace(-2.0, 2.0, 84)
+    # V5's default estimator reads two completion windows, not the old stage
+    # accumulators.  Give each cell K zero-return completions followed by K
+    # target-return completions, so raw rolling LP is exactly ``targets``.
+    task_ids = np.repeat(np.arange(84, dtype=np.int64), 2 * window)
+    returns = np.concatenate([
+        np.concatenate((np.zeros(window), np.full(window, target)))
+        for target in targets
+    ])
+    curriculum.observe(EpisodeOutcomeBatch(
+        task_ids=task_ids,
+        assigned_revision=np.zeros(task_ids.shape, dtype=np.int64),
+        completion_revision=0,
+        episodic_returns=returns,
+        episode_lengths=np.full(task_ids.shape, 20, dtype=np.int64),
+        terminal_reasons=np.full(task_ids.shape, "timeout", dtype="U16"),
+        completion_global_control_steps=stage,
+    ))
+    snapshot = curriculum.advance(stage)
+    assert snapshot is not None
+    np.testing.assert_allclose(snapshot.learning_progress, targets, atol=1e-12)
     diagnostics = snapshot.diagnostics
-    # Fixed mode: the adaptive controller is dormant (no signal/ESS solve)...
+    # Fixed mode: the adaptive controller is dormant, and its fields report NaN
+    # rather than sentinels a dashboard would read as live targets.
     assert diagnostics["temperature_mode"] == "fixed"
     assert diagnostics["effective_beta"] == pytest.approx(1.0)
-    assert diagnostics["signal_quality"] == 0.0
+    assert np.isnan(diagnostics["signal_quality"])
+    assert np.isnan(diagnostics["target_ess"])
+    assert diagnostics["ess_guard_uniform_mix"] == 0.0
     # ...but the distribution genuinely bites -- it is not the uniform its
     # adaptive predecessor collapsed to -- while staying under the loose cap.
     assert diagnostics["tv_distance_uniform"] > 0.1

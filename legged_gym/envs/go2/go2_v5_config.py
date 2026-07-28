@@ -80,6 +80,11 @@ V5_MAX_CELL_PROBABILITY = 0.25
 # the distribution to whichever cell is currently mismeasured worst.
 V5_MIN_STAGE_EPISODES_FOR_LP = 16
 V5_CONFIDENCE_SCALE = 1.0
+# LP measurement is selectable independently of the 2,000-control-step
+# sampling-update clock.  ``stage`` preserves the frozen legacy estimator;
+# ``rolling_completion`` compares the latest two completion windows.
+V5_LP_ESTIMATOR = "stage"
+V5_ROLLING_COMPLETION_WINDOW = 64
 
 # Deterministic UED training-grid geometry seed (terrain.ued_training_seed).
 # Shared by all three UED-teacher arms so their static 4x6 taxonomy grid is
@@ -167,6 +172,11 @@ class Go2V5CommonCfg(Go2BenchmarkV4TerrainCfg):
         max_cell_probability: float = V5_MAX_CELL_PROBABILITY
         min_stage_episodes_for_lp: int = V5_MIN_STAGE_EPISODES_FOR_LP
         confidence_scale: float = V5_CONFIDENCE_SCALE
+        # ``stage`` remains the compatibility default.  The rolling mode keeps
+        # its own completion history and uses this many completed episodes in
+        # each of its two LP windows; it does not change the stage clock.
+        lp_estimator: str = V5_LP_ESTIMATOR
+        rolling_completion_window: int = V5_ROLLING_COMPLETION_WINDOW
         seed: int | None = None
 
 
@@ -222,10 +232,15 @@ class Go2V5UniformCfg(_Go2V5UedArmCfg):
 
 
 class Go2V5LPACRLCfg(_Go2V5UedArmCfg):
-    """``lp_acrl``: signed learning-progress softmax (the main method)."""
+    """``lp_acrl``: signed rolling-completion LP softmax (the main method)."""
 
     class curriculum(_Go2V5UedArmCfg.curriculum):
         algorithm = "lp_acrl"
+        # The V5 main arm measures every completed moving episode, including
+        # late completions, while the inherited 2,000-step stage clock only
+        # decides when the sampling distribution is refreshed.
+        lp_estimator = "rolling_completion"
+        rolling_completion_window = V5_ROLLING_COMPLETION_WINDOW
 
 
 class Go2V5ALPCfg(_Go2V5UedArmCfg):
@@ -338,6 +353,8 @@ def build_ued_teacher(env_cfg):
         max_cell_probability=float(getattr(env_cfg.curriculum, "max_cell_probability", 0.08)),
         min_stage_episodes_for_lp=getattr(env_cfg.curriculum, "min_stage_episodes_for_lp", 16),
         confidence_scale=float(getattr(env_cfg.curriculum, "confidence_scale", 1.0)),
+        lp_estimator=getattr(env_cfg.curriculum, "lp_estimator", "stage"),
+        rolling_completion_window=getattr(env_cfg.curriculum, "rolling_completion_window", 64),
         seed=seed,
     )
     return curriculum, task_space

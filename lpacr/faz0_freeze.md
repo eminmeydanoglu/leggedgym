@@ -61,10 +61,13 @@ print(curriculum.config_fingerprint)
   (`ce331c8b10c2f8b642b6c4795492adb3913e90293ff040cbebbb963ae9a8ef7c`) since it
   carries no geometry description at all.
 - **Curriculum config fingerprint** (`{algorithm, stage_length_control_steps,
-  beta, epsilon, adaptive-temperature controller parameters}`,
+  lp_estimator, rolling_completion_window, beta, epsilon,
+  adaptive-temperature controller parameters}`,
   `legged_gym/utils/ued/episode_curriculum.py`) for `lp_acrl` at the frozen
-  stage length/controller settings below:
-  `d4125e462b3e8b6f06df77251d37ab2dc686e3c21fbaa407c5c8439ca461d321`.
+  stage/rolling/controller settings below must be regenerated from the command
+  at the top of this document after this migration. The pre-rolling
+  `d4125e462b3e8b6f06df77251d37ab2dc686e3c21fbaa407c5c8439ca461d321`
+  fingerprint is not resume-compatible with schema v5.
 
 ## 2. Standstill rho (solun_plani.md §4 "Standstill kontratı", §14.4)
 
@@ -104,19 +107,34 @@ print(curriculum.config_fingerprint)
 
 ## 4. Missing-task / minimum-count rule (solun_plani.md §5)
 
-- A task cell counts as "observed" in a stage iff it received **at least one**
-  completed moving-task episode that stage (standstill never reaches the
-  curriculum): `observed = self._stage_episode_counts > 0`
-  (`legged_gym/utils/ued/episode_curriculum.py:186`).
-- Cells that were *not* observed in two consecutive stages do **not** get a
-  fabricated return or reported LP value. Eq. 7 rebuilds the whole
-  distribution over the complete task set; cells without a measurable delta
-  receive the neutral softmax input `LP=0`, while `current_returns` and the
-  reported `learning_progress` remain `NaN`. Thus missing data stays explicit
-  in artifacts and cannot become a permanently starved retained-mass state.
-- The very first stage builds only `R_0` and produces no LP (`_observed_masks`
-  starts all-`False`, so `progress_mask` is empty until the second valid
-  measurement — §5 "İlk stage yalnız `R_0`yı kurar").
+- `Go2V5CommonCfg.curriculum.lp_estimator="stage"` compatibility default'u
+  olarak kalır. `uniform` ve `alp` bu legacy estimator'da kalır; yalnız açık
+  revision ile eşleşen moving completion'lar stage accumulator'ına girer.
+  Dolayısıyla eski per-stage observed/minimum-count açıklaması bu kollar için
+  geçerlidir.
+- `Go2V5LPACRLCfg` açıkça `lp_estimator="rolling_completion"` ve
+  `rolling_completion_window=64` (`K=64`) ayarlar. Bu LP-ACRL modunda her task
+  için assignment ya da completion revision'ına bakılmaksızın her **gerçek
+  moving completion** completion ring'ine eklenir. Standstill ve startup'ta
+  hiç step almadan reset olan ghost outcome'lar ring'e girmez.
+- Ring kapasitesi task başına son `2_048` completion'dır. LP, fiziksel dizi
+  sırasıyla değil `ring_position` üzerinden çıkarılan kronolojik iki pencereyle
+  hesaplanır: `previous = önceki 64`, `current = son 64`,
+  `LP = mean(current episodic return) - mean(previous episodic return)`.
+  Bir task'te `128` completion yoksa LP skoru tam `0.0`'dır. Ham episodic
+  return sampler girdisidir; aynı ring'den `return / max(length, 1)` yalnız
+  shadow diagnostic olarak raporlanabilir ve sampling skoruna giremez.
+- Stage uzunluğu değişmez: `2_000 global control step`. Rolling modda stage
+  artık LP ölçüm penceresi değil, yalnız yeni sampling dağılımının commit/update
+  saatidir. Stage sınırı late completion'ı kapatılmış eski stage'e geriye yazmaz
+  ve açık stage accumulator'ına da karıştırmaz; late completion yalnız
+  provenance sayaçları ve rolling completion ring'i günceller.
+- Bu modda `current_returns`, `previous_returns` ve
+  `learning_progress` snapshot'ta sırasıyla güncel pencere ortalaması, önceki
+  pencere ortalaması ve ham rolling LP'yi ifade eder. İki pencere hazır
+  değilken üçü de sampler açısından nötr kalır; `learning_progress=0.0`dır.
+  Dashboard/artifact yorumlayan her araç `lp_estimator` ve K bilgisini birlikte
+  göstermelidir; bunlar artık "bu stage'in return'ü" değildir.
 
 ## 5. Beta procedure + chosen value (solun_plani.md §5, §11 Faz B)
 
@@ -126,7 +144,7 @@ print(curriculum.config_fingerprint)
   confidence-gated per-stage signal to choose a target effective sample size,
   solves within `beta_min = 0.75` and `beta_max = 8.0`, then smooths with
   `beta_ema = 0.8`. The frozen guardrails are
-  `target_ess_ratio_min = 0.5`, `max_cell_probability = 0.08`,
+  `target_ess_ratio_min = 0.5`, `max_cell_probability = 0.25`,
   `min_stage_episodes_for_lp = 16`, and `confidence_scale = 1.0`. Any future
   revision requires a new validation sweep and re-freeze here and in config;
   these parameters are never tuned in-flight.
@@ -135,6 +153,13 @@ print(curriculum.config_fingerprint)
   non-finite input or non-finite/non-positive normalizer
   (`episode_curriculum.py:166-178`), matching §5's "Softmax `float64` ve
   max-shift/logsumexp ile hesaplanır; NaN/Inf fail-fast hatadır."
+- Rolling estimator, mevcut güvenlik zincirini değiştirmez: ham rolling LP
+  (ve ALP için mutlak değeri) → mevcut reliability/adaptive-ESS ya da fixed
+  temperature skoru → epsilon mixing → probability cap. `epsilon=0.03`,
+  `max_cell_probability=0.25`, finite/normalize ve RNG güvenlik kontrolleri
+  aynen geçerli kalır. `min_stage_episodes_for_lp=16` rolling pencere
+  hazır-olma koşulunun yerine geçmez; rolling için tek ölçüm eşiği `2K=128`
+  completion'dır.
 - Procedure: `scripts/run_v5_fazB.sh --beta-pilot` runs a single-seed
   `go2_v5_lpacrl` short training (default 400 iterations, full 4096 envs) with
   no post-hoc validation, so a human can inspect its sampler-health
@@ -308,30 +333,34 @@ picked `1400`) never needs scoring at all.
 
 ## 9. Curriculum checkpoint schema (solun_plani.md §9)
 
-Schema version **2** (`legged_gym/utils/ued/checkpoint.py`,
-`SCHEMA_VERSION = 2`; v2 dropped the standstill-era `valid_task_completion_counts`
-and `invalid_outcome_count` fields now that standstill is a reserved bucket that
-never reaches the curriculum). `EpisodeCurriculum.state_dict()` writes exactly:
+Schema version **5** (`legged_gym/utils/ued/checkpoint.py`). v5, rolling
+completion estimator'ın resume sözleşmesidir; v4 ve daha eski checkpoint'ler
+rolling state uydurularak açılmaz, fail-closed reddedilir. State sözlüğü v4'ün
+stage/controller/provenance/RNG alanlarına ek olarak şunları taşır:
 
 ```
-schema_version, algorithm, task_space_fingerprint, config_fingerprint,
-stage_index, sampler_revision, stage_start_global_steps, probabilities,
-previous_returns, current_returns, learning_progress, observed_masks,
-stage_return_sums, stage_episode_counts, task_assignment_counts,
-task_completion_counts, transition_occupancy, source_label,
-rng_bit_generator_state
+lp_estimator, rolling_completion_window,
+completion_return_ring, completion_length_ring, completion_step_ring,
+completion_ring_pos, completion_ring_count,
+rolling_ready_masks, rolling_previous_return_sems,
+rolling_current_return_sems
 ```
 
 - `load_state_dict` fails closed (raises `ValueError`, never silently resets)
   on schema-version mismatch, algorithm mismatch, task-space fingerprint
   mismatch, or config-fingerprint mismatch
-  (`checkpoint.py:10-31` `validate_checkpoint_state`; exercised by
-  `tests/test_v5_training_contract.py:198-223`
-  `test_curriculum_checkpoint_refuses_foreign_fingerprint`).
+  (`checkpoint.py:10-31` `validate_checkpoint_state`). Config fingerprint
+  artık `lp_estimator` ve K'yı da kapsar; `stage`↔`rolling_completion` veya
+  `K=64`↔başka K resume'u sessizce kabul edilmez.
+- Ring return/length/completion-step dizileri `(task_count, 2048)`, ring
+  position/count dizileri `(task_count,)` biçimindedir. Position `[0,2047]`,
+  count `[0,2048]` aralığında, uzunluk ve completion step negatif olmayan
+  tamsayıdır; wrap sonrası yalnız kronolojik son kayıtlar LP'ye girebilir.
 - The teacher RNG is `numpy.random.Generator(PCG64)`, checkpointed via
-  `rng_bit_generator_state` and restored bit-for-bit
-  (`episode_curriculum.py:83`, `251`, `292-296`, `308`) — separate from any
-  physics/observation RNG.
+  `rng_bit_generator_state` and restored bit-for-bit — separate from any
+  physics/observation RNG. Ring append, pencere/SEM hesabı ve diagnostic
+  üretimi RNG çağırmaz; bu nedenle logging/ring eklenmeden önceki ve sonraki
+  sampling RNG akışı aynı kalır.
 - The PPO checkpoint carries this dict under the `"episode_curriculum"` key
   only when `env_cfg.env.ued_enabled` is true and a curriculum is installed
   (`rsl_rl/runners/on_policy_runner.py:556-562` `save()`,
@@ -339,7 +368,54 @@ rng_bit_generator_state
   `handcrafted_v4` and every pre-existing v3/v4/bench task) leaves this key
   absent and is byte-for-byte unaffected.
 
-## 10. Faz B arm/seed/budget contract (solun_plani.md §11 Faz B, §3)
+## 10. Rolling completion doğrulaması ve UHeM pilotu
+
+Bu bölüm, yeni estimator'ın yalnız unit testte değil gerçek Genesis lifecycle
+ve resume yolunda kanıtlanması için kısa çalıştırma sözleşmesidir. Login node'da
+GPU işi başlatılmaz; önce `ssh makine` ile ayrılmış bir GPU compute node'a
+geçilir, sonra repository kökünde aşağıdaki komutlar çalıştırılır.
+
+```bash
+env PYTHONPATH=. SIMULATOR=genesis WANDB_MODE=disabled ./.venv/bin/python -m pytest -q \
+  tests/test_ued_teacher.py \
+  tests/test_ued_rolling_completion.py \
+  tests/test_ued_curriculum_lp.py \
+  tests/test_ued_genesis_integration.py \
+  tests/test_ued_resume_clock.py
+
+scripts/run_v5_fazB.sh --smoke
+scripts/run_v5_fazB.sh --beta-pilot
+```
+
+- İlk komut şu regression sözleşmelerini kapsamalıdır: ring/logging eklemek
+  sampling RNG state'ini değiştirmez; late completion ring'e girer ama ne eski
+  ne açık stage accumulator'ına yazılır; `count < 128` iken LP sıfırdır;
+  dolu iki pencerenin LP'si elle hesapla birebirdir; wrap-around doğrudur;
+  checkpoint save/load ring içeriğini ve takip eden LP/sample akışını
+  birebir korur; epsilon ve probability-cap testleri rolling modda da geçer.
+- `--smoke` küçük mekanik Genesis bağlantı kontrolüdür. 64 env / 3 iteration
+  varsayılanıyla her task için 128 completion garantisi yoktur; LP'nin sıfır
+  kalması tek başına başarısızlık değildir. Kabul: gerçek moving completion
+  adapter üzerinden ring'e ulaşır, startup ghost sızmaz, probability sonlu/
+  normalize kalır ve cap aşılmaz.
+- `--beta-pilot` (`go2_v5_lpacrl`, seed 1, 4096 env, 400 iteration) davranışı
+  görünür kılan pilotdur. `Go2V5LPACRLCfg` run manifest/config'te
+  `lp_estimator=rolling_completion`, `rolling_completion_window=64`,
+  `stage_length_control_steps=2000`, schema v5 doğrulanır. Diagnostic/log
+  çıktısı en az `late_outcome_count`, rolling completion toplamı,
+  `rolling_ready_task_count`, sıfır olmayan rolling-LP task sayısı,
+  shadow reward-per-step, `effective_sample_size`, `max_cell_probability` ve
+  `finite_probabilities` içermelidir.
+- Pilot kabul ölçütleri: late sayaç artıyorsa rolling completion toplamı da
+  artar; late outcome sonrası açık-stage sum/count değişmez; en az bir task
+  `count>=128` ile hazır olduğunda elle doğrulanabilen sıfır-dışı rolling LP
+  oluşur; probabilities toplamı 1, sonlu ve her hücre
+  `<=V5_MAX_CELL_PROBABILITY` (`0.25`)dır; checkpoint
+  save/resume sonrası ring ve takip eden sampling/LP akışı uninterrupted run
+  ile aynıdır. Bu pilot estimator/lifecycle kanıtıdır; SPNTE bilimsel üstünlük
+  veya Faz B sonuç iddiası değildir.
+
+## 11. Faz B arm/seed/budget contract (solun_plani.md §11 Faz B, §3)
 
 - Four arms, one task family, flag-selected
   (`curriculum.algorithm ∈ {handcrafted_v4, uniform, lp_acrl, alp}`,

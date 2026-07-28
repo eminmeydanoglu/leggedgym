@@ -67,6 +67,7 @@ class GenesisUEDAdapter:
         env_ids: torch.Tensor,
         *,
         completion_revision: int,
+        completion_global_control_steps: int = 0,
         timed_out: torch.Tensor,
     ) -> EpisodeOutcomeBatch:
         """Copy moving-task outcomes for *old* assignments before replacement.
@@ -87,6 +88,9 @@ class GenesisUEDAdapter:
             task_ids=self.active_task_id[ids].detach().cpu().numpy().astype(np.int64, copy=True),
             assigned_revision=self.active_sampler_revision[ids].detach().cpu().numpy().astype(np.int64, copy=True),
             completion_revision=int(completion_revision),
+            # Shared control-step clock at the lifecycle completion boundary;
+            # every member of one reset batch completes at the same tick.
+            completion_global_control_steps=int(completion_global_control_steps),
             episodic_returns=self.episode_return[ids].detach().cpu().numpy().astype(np.float64, copy=True),
             episode_lengths=self.episode_length[ids].detach().cpu().numpy().astype(np.int64, copy=True),
             terminal_reasons=reasons,
