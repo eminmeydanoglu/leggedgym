@@ -138,9 +138,15 @@ def train(args):
     # inside that call and needs env.episode_curriculum already installed to
     # restore the teacher state into (see rsl_rl OnPolicyRunner.load).
     if getattr(env_cfg.env, "ued_enabled", False):
-        from legged_gym.envs.go2.go2_v5_config import build_ued_teacher
+        algorithm = getattr(getattr(env_cfg, "curriculum", None), "algorithm", None)
+        if algorithm == "frontier":
+            from legged_gym.envs.go2.go2_v6_frontier_config import build_frontier_teacher
 
-        episode_curriculum, task_space = build_ued_teacher(env_cfg)
+            episode_curriculum, task_space = build_frontier_teacher(env_cfg)
+        else:
+            from legged_gym.envs.go2.go2_v5_config import build_ued_teacher
+
+            episode_curriculum, task_space = build_ued_teacher(env_cfg)
         env.enable_ued(episode_curriculum, task_space)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
 
@@ -177,6 +183,17 @@ def train(args):
         )
         if os.path.isfile(v5_config_path):
             shutil.copy(v5_config_path, log_dir)
+
+    if args.task.startswith("go2_v6_"):
+        v6_config_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR,
+            "legged_gym",
+            "envs",
+            "go2",
+            "go2_v6_frontier_config.py",
+        )
+        if os.path.isfile(v6_config_path):
+            shutil.copy(v6_config_path, log_dir)
 
     # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
     write_run_manifest(log_dir, args, env_cfg, train_cfg)

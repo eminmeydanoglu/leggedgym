@@ -22,7 +22,7 @@ def _velocity_labels(edges: tuple[float, ...]) -> list[str]:
 
 
 def dashboard_task_space(ued_task_space: Any) -> DashboardTaskSpace:
-    """Expose V5's irregular 84-cell support without inventing invalid cells.
+    """Expose V5 or the V4-frontier support without inventing invalid cells.
 
     V5 has 21 valid terrain cells (five terrain types at four levels plus one
     flat cell), crossed with four vx bins.  A synthetic 6×4 terrain grid would
@@ -31,11 +31,27 @@ def dashboard_task_space(ued_task_space: Any) -> DashboardTaskSpace:
     stable ``task_id = vx_bin * 21 + terrain_cell`` encoding.
     """
     terrain_cells = []
-    for task_id in range(21):
-        spec = ued_task_space.decode(task_id)
-        terrain_cells.append(
-            f"{ued_task_space.terrain_type_names[spec.terrain_type]} · L{spec.terrain_level + 1}"
+    if hasattr(ued_task_space, "FAMILY_COLUMNS"):
+        terrain_cell_count = (
+            int(ued_task_space.NUM_LEVELS) * int(ued_task_space.NUM_COLUMNS)
         )
+        for task_id in range(terrain_cell_count):
+            spec = ued_task_space.decode(task_id)
+            family = ued_task_space.family_for_column(spec.terrain_column)
+            columns = ued_task_space.columns_for_family(family)
+            replica = columns.index(spec.terrain_column) + 1
+            terrain_cells.append(
+                f"{ued_task_space.terrain_type_names[family]} r{replica} · "
+                f"L{spec.terrain_level + 1}"
+            )
+    else:
+        terrain_cell_count = 21
+        for task_id in range(terrain_cell_count):
+            spec = ued_task_space.decode(task_id)
+            terrain_cells.append(
+                f"{ued_task_space.terrain_type_names[spec.terrain_type]} · "
+                f"L{spec.terrain_level + 1}"
+            )
     return DashboardTaskSpace(
         dimensions=("vx_bin", "terrain_cell"),
         coordinates={
@@ -72,18 +88,23 @@ class V5DashboardBridge:
         raw_run_id = run_id or f"{task}-{Path(str(getattr(env, 'dashboard_log_dir', task))).name}"
         self.run_id = _safe_run_id(raw_run_id)
         task_space = dashboard_task_space(curriculum.task_space)
+        frontier = hasattr(curriculum.task_space, "FAMILY_COLUMNS")
         self.plugger = CurriculumDashboardPlugger(
             self.run_id,
             task_space,
             server_url=server_url,
             metadata={
-                "source": "leggedgym_v5_ued",
+                "source": "leggedgym_frontier" if frontier else "leggedgym_v5_ued",
                 "task": task,
                 "training_seed": training_seed,
                 "curriculum_algorithm": curriculum.algorithm,
                 "task_space_fingerprint": curriculum.task_space.fingerprint(),
                 "curriculum_config_fingerprint": curriculum.config_fingerprint,
-                "task_id_layout": "task_id = vx_bin * 21 + terrain_cell",
+                "task_id_layout": (
+                    "task_id = abs_vx_bin * 120 + terrain_cell"
+                    if frontier
+                    else "task_id = vx_bin * 21 + terrain_cell"
+                ),
             },
         )
 

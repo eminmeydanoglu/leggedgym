@@ -202,6 +202,9 @@ from legged_gym.envs.go2.go2_v5_config import (
     Go2V5LPACRLCfg, Go2V5LPACRLCfgPPO,
     Go2V5ALPCfg, Go2V5ALPCfgPPO,
 )
+from legged_gym.envs.go2.go2_v6_frontier_config import (
+    Go2V6FrontierCfg, Go2V6FrontierCfgPPO,
+)
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
 task_registry.register("go2_bench_nodr",   Go2BenchNoDR,   Go2BenchNoDRCfg(),   Go2BenchNoDRCfgPPO())
@@ -259,3 +262,9 @@ task_registry.register("go2_v5_handcrafted", Go2V3Mlp, Go2V5HandcraftedCfg(), Go
 task_registry.register("go2_v5_uniform", Go2V3Mlp, Go2V5UniformCfg(), Go2V5UniformCfgPPO())
 task_registry.register("go2_v5_lpacrl", Go2V3Mlp, Go2V5LPACRLCfg(), Go2V5LPACRLCfgPPO())
 task_registry.register("go2_v5_alp", Go2V3Mlp, Go2V5ALPCfg(), Go2V5ALPCfgPPO())
+task_registry.register(
+    "go2_v6_frontier",
+    Go2V3Mlp,
+    Go2V6FrontierCfg(),
+    Go2V6FrontierCfgPPO(),
+)

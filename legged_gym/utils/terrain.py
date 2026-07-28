@@ -595,6 +595,20 @@ class Terrain:
         slope = eval(self.terrain_curriculum_difficulty["slope"])
         step_height = eval(self.terrain_curriculum_difficulty["step_height"])
         discrete_obstacles_height = eval(self.terrain_curriculum_difficulty["discrete_height"])
+        # Optional per-tile severity jitter for geometry-bank curricula.  The
+        # legacy builder has no such field, so existing V4 maps consume no extra
+        # RNG draw and remain unchanged.  With the field enabled, replicas in
+        # one semantic level are nearby samples rather than byte-identical
+        # slope/stair tiles.
+        replica_variation = float(getattr(self.cfg, "terrain_replica_variation", 0.0))
+        replica_scale = (
+            np.random.uniform(1.0 - replica_variation, 1.0 + replica_variation)
+            if replica_variation > 0.0
+            else 1.0
+        )
+        slope *= replica_scale
+        step_height *= replica_scale
+        discrete_obstacles_height *= replica_scale
         stepping_stones_params = self.terrain_curriculum_difficulty["stepping_stones_params"]
         gap_size = eval(self.terrain_curriculum_difficulty["gap_size"])
         pit_depth = eval(self.terrain_curriculum_difficulty["pit_depth"])
@@ -609,9 +623,17 @@ class Terrain:
                                                  platform_size=self.platform_size,
                                                  terrain_type=self.type)
         elif choice < self.proportions[1]: # random uniform
+            # Legacy V4 keeps roughness fixed at ±5 cm.  A task-space
+            # curriculum may opt into a level-dependent amplitude while using
+            # the same generator; absence of the key preserves every existing
+            # terrain byte-for-byte.
+            rough_height_expr = self.terrain_curriculum_difficulty.get("rough_height")
+            rough_height = (
+                0.05 if rough_height_expr is None else eval(rough_height_expr)
+            ) * replica_scale
             terrain_utils.random_uniform_terrain(terrain, 
-                                                 min_height=-0.05, 
-                                                 max_height=0.05, 
+                                                 min_height=-rough_height,
+                                                 max_height=rough_height,
                                                  step=0.005, 
                                                  downsampled_scale=0.2, 
                                                  terrain_type=self.type)
