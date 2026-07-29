@@ -8,17 +8,45 @@ from legged_gym.utils import *
 from legged_gym.utils.viser_viewer import create_viser_viewer
 from legged_gym.utils.terrain import (
     build_taxonomy_label_map,
+    build_v6_showcase_label_map,
     format_taxonomy_console_map,
+    format_v6_showcase_console_map,
     is_taxonomy_terrain_cfg,
+    is_v6_showcase_terrain_cfg,
     teleport_env_to_taxonomy_tile,
     TAXONOMY_LABEL_Z_OFFSET,
     TAXONOMY_NUM_LEVELS,
     TAXONOMY_NUM_TYPES,
+    V6_LABEL_Z_OFFSET,
+    V6_PLAY_PLATFORM_SIZE,
+    V6_PLAY_TILE_LENGTH,
+    V6_PLAY_TILE_WIDTH,
+    V6_SHOWCASE_COLUMNS,
+    V6_SHOWCASE_LEVELS,
+    V6_TRAINING_NUM_COLS,
+    V6_TRAINING_NUM_ROWS,
 )
 
 import numpy as np
 import torch
 from legged_gym.scripts.joystick import Joystick
+
+
+# ``task_type`` is everything after the robot prefix:
+# ``"_".join(args.task.split("_")[1:])``.  DreamWaQ tasks return a 5-tuple from
+# ``get_observations()`` / ``step()`` instead of a bare obs tensor, so every
+# DreamWaQ-family task name has to be listed here or play unpacks the wrong
+# arity.  Keep this as the single source of truth -- it is consumed by
+# ``interaction_loop``, the step loop and ``export_policy``.
+# NOTE: ``v3_dreamwaq`` and ``bench_dreamwaq`` are deliberately NOT added here;
+# they were already absent before v6 and adding them would silently change how
+# those existing tasks replay.  If they turn out to be broken too, that is a
+# separate fix with its own verification.
+DREAMWAQ_TASK_TYPES = frozenset({
+    "dreamwaq",
+    "v4_dreamwaq",
+    "v6_frontier_dreamwaq",
+})
 
 
 def _pin_terrain_difficulty(env_cfg, terrain_level, default_level, max_level):
@@ -41,7 +69,12 @@ def _pin_terrain_difficulty(env_cfg, terrain_level, default_level, max_level):
     return level
 
 
-def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
+def configure_play_terrain(
+    env_cfg,
+    terrain_mode,
+    terrain_level=None,
+    v6_tile_size="play",
+):
     """Apply a visual-playback terrain override.
 
     Terrain is chosen by the *user* (``--terrain`` / ``--terrain_level``), never
@@ -51,7 +84,14 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
     world builds fast and the Viser heightfield mesh actually renders in the
     browser (the full 10x10 / border=20 training grid is a 1200x1200 sample
     heightfield ~120 m x 120 m; even downsampled that mesh is too heavy and gets
-    silently dropped, so the ground vanishes and the robot looks buried)."""
+    silently dropped, so the ground vanishes and the robot looks buried).
+
+    For V6/frontier showcases, ``v6_tile_size`` selects tile envelope only:
+    - ``play`` (default): legacy 8×8 m tiles so multi-tile grids stay light
+    - ``train``: live ``Go2V6FrontierCfg`` length/width/platform (e.g. 80 m)
+
+    Severity formulas always come from the training cfg either way.
+    """
     if terrain_mode == "flat":
         env_cfg.terrain.mesh_type = "plane"
         env_cfg.terrain.curriculum = False
@@ -99,6 +139,7 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
         env_cfg.terrain.terrain_kwargs = None
         env_cfg.terrain.mode = "taxonomy"
         env_cfg.terrain.taxonomy_showcase = True
+        env_cfg.terrain.v6_frontier_showcase = False
         # UED training grid has higher priority in Terrain.__init__; must clear
         # it or V5 play still builds the 21-config / 84-task training map.
         env_cfg.terrain.ued_training_grid = False
@@ -106,6 +147,68 @@ def configure_play_terrain(env_cfg, terrain_mode, terrain_level=None):
         env_cfg.terrain.num_cols = TAXONOMY_NUM_TYPES
         env_cfg.terrain.border_size = 2.0
         # Spawn on the easiest row so the robot does not bury itself in L3 stairs.
+        env_cfg.terrain.max_init_terrain_level = 0
+        env_cfg.terrain.fixed_terrain_level = 0
+        return
+
+    if terrain_mode in {"v6", "v6_frontier", "frontier", "v6_full"}:
+        # Real go2_v6_frontier task space (V4 ETH curriculum generators), not
+        # the V5 taxonomy tables.  Subsampled by default so play tiles fit in
+        # Viser; v6_full keeps both replicas of every family.
+        from legged_gym.envs.go2.go2_v6_frontier_config import Go2V6FrontierCfg
+
+        src = Go2V6FrontierCfg.terrain
+        tile_mode = str(v6_tile_size or "play").lower()
+        if tile_mode not in {"play", "train"}:
+            raise ValueError(
+                f"Unsupported v6_tile_size {v6_tile_size!r}; expected 'play' or 'train'"
+            )
+        env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+        env_cfg.terrain.curriculum = False
+        env_cfg.terrain.selected = False
+        env_cfg.terrain.terrain_kwargs = None
+        env_cfg.terrain.mode = "v6_full" if terrain_mode == "v6_full" else "v6"
+        env_cfg.terrain.v6_frontier_showcase = True
+        env_cfg.terrain.taxonomy_showcase = False
+        # UED grid would otherwise win if left True on a V5/V6 task cfg.
+        env_cfg.terrain.ued_training_grid = False
+        # Proportions + difficulty formulas always mirror live training so
+        # severity stays truthful.  Tile envelope is selectable: play default
+        # keeps the legacy 8 m multi-tile showcase light; train copies the
+        # current training length/width/platform (heavy for multi-tile grids).
+        env_cfg.terrain.terrain_proportions = list(src.terrain_proportions)
+        env_cfg.terrain.terrain_curriculum_difficulty = dict(
+            src.terrain_curriculum_difficulty
+        )
+        env_cfg.terrain.terrain_replica_variation = float(
+            src.terrain_replica_variation
+        )
+        env_cfg.terrain.v6_tile_size = tile_mode
+        if tile_mode == "train":
+            env_cfg.terrain.terrain_length = float(src.terrain_length)
+            env_cfg.terrain.terrain_width = float(src.terrain_width)
+            env_cfg.terrain.platform_size = float(src.platform_size)
+        else:
+            env_cfg.terrain.terrain_length = float(V6_PLAY_TILE_LENGTH)
+            env_cfg.terrain.terrain_width = float(V6_PLAY_TILE_WIDTH)
+            env_cfg.terrain.platform_size = float(V6_PLAY_PLATFORM_SIZE)
+        env_cfg.terrain.v6_showcase_seed = int(
+            getattr(env_cfg.terrain, "v6_showcase_seed", 0)
+        )
+        # Sharp stair risers for trimesh backends; heightfield path uses Viser
+        # edge-preserving meshing separately.
+        env_cfg.terrain.simplify_mesh = False
+        if terrain_mode == "v6_full":
+            env_cfg.terrain.v6_showcase_levels = tuple(range(V6_TRAINING_NUM_ROWS))
+            env_cfg.terrain.v6_showcase_columns = tuple(range(V6_TRAINING_NUM_COLS))
+            env_cfg.terrain.num_rows = V6_TRAINING_NUM_ROWS
+            env_cfg.terrain.num_cols = V6_TRAINING_NUM_COLS
+        else:
+            env_cfg.terrain.v6_showcase_levels = tuple(V6_SHOWCASE_LEVELS)
+            env_cfg.terrain.v6_showcase_columns = tuple(V6_SHOWCASE_COLUMNS)
+            env_cfg.terrain.num_rows = len(V6_SHOWCASE_LEVELS)
+            env_cfg.terrain.num_cols = len(V6_SHOWCASE_COLUMNS)
+        env_cfg.terrain.border_size = 2.0
         env_cfg.terrain.max_init_terrain_level = 0
         env_cfg.terrain.fixed_terrain_level = 0
         return
@@ -166,19 +269,27 @@ def override_configs(env_cfg, args, task_type):
     # override some parameters for testing
     # number of environments (respect --num_envs when given, e.g. to spread
     # robots across every terrain type on the training grid)
-    default_num_envs = 1 if getattr(args, "terrain", None) in {"taxonomy", "showcase"} else 2
+    showcase_terrains = {
+        "taxonomy", "showcase", "v6", "v6_frontier", "frontier", "v6_full",
+    }
+    default_num_envs = 1 if getattr(args, "terrain", None) in showcase_terrains else 2
     env_cfg.env.num_envs = args.num_envs if getattr(args, "num_envs", None) else default_num_envs
     if task_type == "cts" or task_type == "cts_amp": # concurrent teacher-student specific
         env_cfg.env.num_teacher = 1
     elif "depth" in task_type:  # depth specific
         env_cfg.env.num_envs = 1 # for depth observation, only support num_envs=1 for now
         env_cfg.env.num_camera_envs = 1
-    # Taxonomy exhibit: keep robots few so they do not occlude the 24-tile grid.
-    if getattr(args, "terrain", None) in {"taxonomy", "showcase"}:
+    # Showcase exhibits: keep robots few so they do not occlude the grid.
+    if getattr(args, "terrain", None) in showcase_terrains:
         env_cfg.env.num_envs = min(int(env_cfg.env.num_envs), 4)
     env_cfg.viewer.rendered_envs_idx = list(range(env_cfg.env.num_envs))
 
-    configure_play_terrain(env_cfg, args.terrain, getattr(args, "terrain_level", None))
+    configure_play_terrain(
+        env_cfg,
+        args.terrain,
+        getattr(args, "terrain_level", None),
+        v6_tile_size=getattr(args, "v6_tile_size", "play"),
+    )
 
     # Keep selected non-flat terrain compact and deterministic for interactive play.
     if env_cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
@@ -208,18 +319,24 @@ def override_configs(env_cfg, args, task_type):
     # disable it for both joystick and Viser control.
     env_cfg.commands.heading_command = False
 
-    # Elevated / oblique camera defaults for the taxonomy exhibit so the full
-    # 4×6 grid is visible without --follow_robot.  Offsets are absolute world
-    # eye/lookat when taxonomy is active (see interaction_loop).
-    if getattr(args, "terrain", None) in {"taxonomy", "showcase"}:
-        # Grid extents (default 6 m tiles, 4 rows × 6 cols) → center ≈ (12, 18).
+    # Elevated / oblique camera defaults for showcase exhibits so the full grid
+    # is visible without --follow_robot.  Offsets scale with the larger grid
+    # extent (taxonomy 4x6×6 m vs v6 5x6×8 m need different distances).
+    if getattr(args, "terrain", None) in showcase_terrains:
         length = float(env_cfg.terrain.terrain_length)
         width = float(env_cfg.terrain.terrain_width)
         cx = 0.5 * env_cfg.terrain.num_rows * length
         cy = 0.5 * env_cfg.terrain.num_cols * width
-        env_cfg.viewer.pos = [cx - 18.0, cy - 22.0, 32.0]
+        extent = max(
+            float(env_cfg.terrain.num_rows) * length,
+            float(env_cfg.terrain.num_cols) * width,
+        )
+        # Proportional oblique: ~0.45× extent XY pull-back, ~0.7× extent height.
+        cam_xy = 0.45 * extent
+        cam_z = 0.70 * extent
+        env_cfg.viewer.pos = [cx - cam_xy, cy - cam_xy * (22.0 / 18.0), cam_z]
         env_cfg.viewer.lookat = [cx, cy, 0.0]
-        # Relative-to-robot offsets unused for taxonomy fixed camera, but keep
+        # Relative-to-robot offsets unused for showcase fixed camera, but keep
         # sensible values if the user later enables --follow_robot.
     
     if args.viewer == "viser":
@@ -267,7 +384,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         obs_buf, privileged_obs_buf, obs_history, critic_obs = env.get_observations()
     elif task_type == "ee":
         estimator_features, _, _ = env.get_observations()
-    elif task_type in {"dreamwaq", "v4_dreamwaq"}:  # dreamwaq
+    elif task_type in DREAMWAQ_TASK_TYPES:  # dreamwaq
         obs_buf, privileged_obs_buf, obs_history, explicit_labels, next_states = env.get_observations()
     else: # vanilla
         obs_buf = env.get_observations()
@@ -276,22 +393,43 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
     if args.use_joystick:
         joystick = Joystick(joystick_type=args.joystick_type)
 
-    taxonomy_mode = is_taxonomy_terrain_cfg(env.cfg.terrain) or getattr(args, "terrain", None) in {
-        "taxonomy", "showcase",
+    showcase_mode = (
+        is_taxonomy_terrain_cfg(env.cfg.terrain)
+        or is_v6_showcase_terrain_cfg(env.cfg.terrain)
+        or getattr(args, "terrain", None) in {
+            "taxonomy", "showcase", "v6", "v6_frontier", "frontier", "v6_full",
+        }
+    )
+    v6_mode = is_v6_showcase_terrain_cfg(env.cfg.terrain) or getattr(args, "terrain", None) in {
+        "v6", "v6_frontier", "frontier", "v6_full",
     }
     taxonomy_camera_set = False
-    if taxonomy_mode:
+    if showcase_mode:
         # Console fallback for labels (Genesis has no draw_debug_text).
         terrain = getattr(env.simulator, "_terrain", None)
         label_map = None
         if terrain is not None and getattr(terrain, "taxonomy_labels", None):
             label_map = terrain.taxonomy_labels
         elif terrain is not None and hasattr(terrain, "env_origins"):
-            label_map = build_taxonomy_label_map(
-                terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
-            )
+            if v6_mode:
+                label_map = build_v6_showcase_label_map(
+                    terrain.env_origins,
+                    levels=getattr(env.cfg.terrain, "v6_showcase_levels", V6_SHOWCASE_LEVELS),
+                    columns=getattr(env.cfg.terrain, "v6_showcase_columns", V6_SHOWCASE_COLUMNS),
+                    difficulty_cfg=getattr(
+                        env.cfg.terrain, "terrain_curriculum_difficulty", None
+                    ),
+                    z_offset=V6_LABEL_Z_OFFSET,
+                )
+            else:
+                label_map = build_taxonomy_label_map(
+                    terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
+                )
         if label_map:
-            print(format_taxonomy_console_map(label_map))
+            if v6_mode:
+                print(format_v6_showcase_console_map(label_map))
+            else:
+                print(format_taxonomy_console_map(label_map))
             if viser_viewer is not None and hasattr(viser_viewer, "set_taxonomy_labels"):
                 viser_viewer.set_taxonomy_labels(label_map)
     
@@ -302,6 +440,25 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
     while True:
 
         t_start = time.perf_counter()
+        # Drain Viser GUI actions on the sim thread.  Teleport/Respawn buttons
+        # only queue work; executing env.reset_idx on the GUI worker races
+        # oracle history deques (RuntimeError: deque mutated during iteration).
+        if viser_viewer is not None:
+            if hasattr(viser_viewer, "take_pending_respawn") and viser_viewer.take_pending_respawn():
+                env.reset_idx(torch.tensor([robot_index], device=env.device))
+                if hasattr(viser_viewer, "clear_drive_command"):
+                    viser_viewer.clear_drive_command()
+            if hasattr(viser_viewer, "take_pending_taxonomy_spawn"):
+                spawn = viser_viewer.take_pending_taxonomy_spawn()
+                if spawn is not None:
+                    level, type_idx = spawn
+                    ok = teleport_env_to_taxonomy_tile(env, robot_index, level, type_idx)
+                    if ok and hasattr(viser_viewer, "clear_drive_command"):
+                        viser_viewer.clear_drive_command()
+                    if hasattr(viser_viewer, "report_taxonomy_spawn_result"):
+                        viser_viewer.report_taxonomy_spawn_result(level, type_idx, ok)
+                    print(f"[play] taxonomy spawn → type={type_idx} L{level} (ok={ok})")
+
         # update commands from joystick
         if args.use_joystick:
             joystick.update()
@@ -320,7 +477,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
             pos = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.pos, dtype=np.float32)
             lookat = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.lookat, dtype=np.float32)
             env.set_viewer_camera(pos, lookat)
-        elif taxonomy_mode and not taxonomy_camera_set and viser_viewer is None:
+        elif showcase_mode and not taxonomy_camera_set and viser_viewer is None:
             # One-shot elevated oblique view of the full showcase grid.
             # Headless / no native viewer: skip (scene.viewer is None).
             try:
@@ -342,7 +499,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         elif task_type == "ee":
             actions = policy(estimator_features.detach())
             estimator_features, estimator_labels, _, rews, dones, infos = env.step(actions.detach())
-        elif task_type in {"dreamwaq", "v4_dreamwaq"}:
+        elif task_type in DREAMWAQ_TASK_TYPES:
             actions = policy(obs_buf, obs_history)
             obs_buf, privileged_obs_buf, obs_history, explicit_labels, next_states, rews, dones, infos = env.step(actions.detach())
         elif task_type == "amp":
@@ -420,7 +577,7 @@ def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
     elif task_type == "ee":
         exporter = PolicyExporterEE(alg_runner.alg.actor_critic)
         exporter.export(path, env_cfg, args.export_onnx, train_cfg)
-    elif task_type in {"dreamwaq", "v4_dreamwaq"}:
+    elif task_type in DREAMWAQ_TASK_TYPES:
         exporter = PolicyExporterWaQ(alg_runner.alg.actor_critic)
         exporter.export(path, env_cfg, args.export_onnx, train_cfg)
     else:
@@ -500,25 +657,41 @@ def play(args):
     if args.viewer == 'viser':
         viser_viewer = create_viser_viewer(env, port=args.viser_port)
         robot_index = 0  # which robot the viewer tracks / respawns, matches interaction_loop
-        viser_viewer.set_respawn_callback(
-            lambda: env.reset_idx(torch.tensor([robot_index], device=env.device))
-        )
-        if is_taxonomy_terrain_cfg(env_cfg.terrain) or getattr(args, "terrain", None) in {
-            "taxonomy", "showcase",
-        }:
-            def _taxonomy_spawn(level: int, type_idx: int, _ri=robot_index) -> bool:
-                ok = teleport_env_to_taxonomy_tile(env, _ri, level, type_idx)
-                if ok and hasattr(viser_viewer, "clear_drive_command"):
-                    viser_viewer.clear_drive_command()
-                return ok
-            # Panel may already exist from create_viser_viewer; (re)bind callback.
+        # Respawn/Teleport are drained on the main thread in interaction_loop
+        # (see take_pending_respawn / take_pending_taxonomy_spawn).  Do not
+        # call env.reset_idx from Viser GUI worker callbacks.
+        if (
+            is_taxonomy_terrain_cfg(env_cfg.terrain)
+            or is_v6_showcase_terrain_cfg(env_cfg.terrain)
+            or getattr(args, "terrain", None) in {
+                "taxonomy", "showcase", "v6", "v6_frontier", "frontier", "v6_full",
+            }
+        ):
+            # Panel may already exist from create_viser_viewer; ensure it exists.
             if not hasattr(viser_viewer, "_taxonomy_spawn_gui"):
-                from legged_gym.utils.terrain import TAXONOMY_TYPE_NAMES
+                if is_v6_showcase_terrain_cfg(env_cfg.terrain) or getattr(
+                    args, "terrain", None
+                ) in {"v6", "v6_frontier", "frontier", "v6_full"}:
+                    from legged_gym.utils.terrain import (
+                        V6_FAMILY_NAMES,
+                        v6_family_index_for_column,
+                    )
+                    cols = getattr(
+                        env_cfg.terrain,
+                        "v6_showcase_columns",
+                        tuple(range(int(env_cfg.terrain.num_cols))),
+                    )
+                    type_names = tuple(
+                        f"{V6_FAMILY_NAMES[v6_family_index_for_column(c)]} c{c}"
+                        for c in cols
+                    )
+                else:
+                    from legged_gym.utils.terrain import TAXONOMY_TYPE_NAMES
+                    type_names = TAXONOMY_TYPE_NAMES
                 viser_viewer.setup_taxonomy_spawn_panel(
-                    type_names=TAXONOMY_TYPE_NAMES,
+                    type_names=type_names,
                     num_levels=int(env_cfg.terrain.num_rows),
                 )
-            viser_viewer.set_taxonomy_spawn_callback(_taxonomy_spawn)
         print(f"Viser web viewer started at http://localhost:{args.viser_port}")
     
     interaction_loop(env, policy, args, task_type, viser_viewer=viser_viewer)

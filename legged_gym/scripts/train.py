@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import subprocess
+import hashlib
+from pathlib import Path
 
 
 from legged_gym import *
@@ -61,7 +63,123 @@ def _dashboard_requested(args) -> bool:
     return bool(getattr(args, "dashboard", True)) or env_value in {"1", "true", "yes", "on"}
 
 
-def write_run_manifest(log_dir, args, env_cfg, train_cfg):
+_V7_INIT_TARGETS = {
+    "go2_v6_frontier_him",
+    "go2_v7_lpacrl_him",
+    "go2_v7_uniform_him",
+}
+
+
+def load_v7_flat_initialization(runner, task: str, checkpoint: str) -> dict[str, object]:
+    """Strictly initialize only deploy-relevant HIM policy state.
+
+    This is intentionally separate from ``runner.load``: a source prior is
+    not a resume.  Optimizer, critic, UED, RNG, selection and iteration state
+    therefore remain fresh in the downstream run.
+    """
+    if task not in _V7_INIT_TARGETS:
+        raise ValueError(
+            "--init_checkpoint is supported only by go2_v6_frontier_him, "
+            "go2_v7_lpacrl_him, and go2_v7_uniform_him"
+        )
+    source = Path(checkpoint).expanduser().resolve()
+    if source.name != "model_1000.pt":
+        raise ValueError("--init_checkpoint must name the flat source artifact model_1000.pt")
+    if not source.is_file():
+        raise FileNotFoundError(f"init checkpoint does not exist: {source}")
+    manifest_path = source.parent / "run_manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"init checkpoint lacks sibling provenance manifest: {manifest_path}")
+    try:
+        source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read init checkpoint manifest: {manifest_path}") from exc
+    if source_manifest.get("task") != "go2_v7_flat_lpacrl_him":
+        raise ValueError(
+            "init checkpoint must originate from go2_v7_flat_lpacrl_him; "
+            f"got {source_manifest.get('task')!r}"
+        )
+    import torch
+
+    payload = torch.load(source, map_location="cpu", weights_only=False)
+    source_iteration = payload.get("iter")
+    if source_iteration != 1000:
+        raise ValueError(
+            "init checkpoint must contain the completed flat iteration 1000; "
+            f"got {source_iteration!r}"
+        )
+    prefixes = tuple(runner.deploy_state_prefixes())
+    if prefixes != ("actor.", "estimator."):
+        raise ValueError("--init_checkpoint requires a HIM runner with actor and estimator deploy state")
+    # This strict component loader rejects a missing or structurally incompatible
+    # actor/estimator. It never sees critic / optimizers / curriculum state.
+    runner.load_deploy_state(str(source), map_location=runner.device)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    return {
+        "mode": "deploy_him_actor_estimator_only_v1",
+        "checkpoint_path": str(source),
+        "sha256": digest,
+        "source_task": source_manifest["task"],
+        "source_seed": source_manifest.get("training_seed", payload.get("training_seed")),
+        "source_iteration": source_iteration,
+    }
+
+
+def _v7_provenance(env):
+    """V7 task-space identity for the run manifest.
+
+    The semantic arms persist a family x |vx| x level LP identity and sample a
+    physical V6 column only at reset; the flat prior owns four |vx| cells and no
+    terrain.  Recording both fingerprints lets a paired run prove that V6-HIM,
+    V7-LP and V7-uniform share the exact 10x10 physical terrain bank while the
+    flat source deliberately does not teleport at all.  Returns ``None`` for
+    non-V7 (or non-UED) runs so the manifest stays unchanged for them.
+    """
+    adapter = getattr(env, "ued_adapter", None)
+    task_space = getattr(adapter, "task_space", None)
+    if task_space is None:
+        return None
+    from legged_gym.utils.v7.task_space import V7SemanticTaskSpace, V7VelocityTaskSpace
+
+    if isinstance(task_space, V7SemanticTaskSpace):
+        return {
+            "task_identity": "v7_semantic_family_abs_vx_level",
+            "task_space_fingerprint": task_space.fingerprint(),
+            "terrain_bank_fingerprint": task_space.terrain_bank_fingerprint(),
+            "num_cells": int(task_space.size),
+            "num_families": int(task_space.num_families),
+            "num_speed_bins": int(task_space.num_speed_bins),
+            "num_levels": int(task_space.NUM_LEVELS),
+            "family_columns": {
+                int(f): [int(c) for c in task_space.columns_for_family(f)]
+                for f in range(task_space.num_families)
+            },
+            "velocity_bin_edges": [float(x) for x in task_space.velocity_bin_edges],
+            "vx_sign": "persistent_per_episode_rademacher_0.5",
+            "physical_column_sampling": "uniform_within_family_at_reset",
+            "standstill_attribution": "reserved_bucket_never_learning_progress",
+            "requires_terrain_origins": bool(
+                getattr(adapter, "requires_terrain_origins", True)
+            ),
+        }
+    if isinstance(task_space, V7VelocityTaskSpace):
+        return {
+            "task_identity": "v7_flat_abs_vx",
+            "task_space_fingerprint": task_space.fingerprint(),
+            "terrain_bank_fingerprint": None,
+            "num_cells": int(task_space.size),
+            "velocity_bin_edges": [float(x) for x in task_space.velocity_bin_edges],
+            "vx_sign": "persistent_per_episode_rademacher_0.5",
+            "physical_column_sampling": None,
+            "standstill_attribution": "reserved_bucket_never_learning_progress",
+            "requires_terrain_origins": bool(
+                getattr(adapter, "requires_terrain_origins", True)
+            ),
+        }
+    return None
+
+
+def write_run_manifest(log_dir, args, env_cfg, train_cfg, env=None):
     """Write run_manifest.json into the run folder: full provenance for the run
     so a checkpoint can be traced back to its exact protocol (see codex_plan.md
     sec. 2). Best-effort: never let manifest writing break training."""
@@ -104,6 +222,9 @@ def write_run_manifest(log_dir, args, env_cfg, train_cfg):
             "ued_curriculum_algorithm": getattr(
                 getattr(env_cfg, "curriculum", None), "algorithm", None
             ),
+            "initialization": getattr(args, "_init_provenance", None),
+            # V7 semantic/flat task-space identity and shared physical-bank proof.
+            "v7_task_space": _v7_provenance(env),
             "max_iterations": runner.max_iterations,
             "num_envs": env_cfg.env.num_envs,
             "num_observations": env_cfg.env.num_observations,
@@ -143,12 +264,24 @@ def train(args):
             from legged_gym.envs.go2.go2_v6_frontier_config import build_frontier_teacher
 
             episode_curriculum, task_space = build_frontier_teacher(env_cfg)
+        elif args.task.startswith("go2_v7_"):
+            from legged_gym.envs.go2.go2_v7_lpacrl_him_config import build_v7_teacher
+
+            episode_curriculum, task_space = build_v7_teacher(env_cfg)
         else:
             from legged_gym.envs.go2.go2_v5_config import build_ued_teacher
 
             episode_curriculum, task_space = build_ued_teacher(env_cfg)
         env.enable_ued(episode_curriculum, task_space)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
+    if getattr(args, "init_checkpoint", None):
+        args._init_provenance = load_v7_flat_initialization(
+            ppo_runner, args.task, args.init_checkpoint
+        )
+        print(
+            "[init] loaded flat HIM actor/estimator only "
+            f"from {args._init_provenance['checkpoint_path']}"
+        )
 
     # Copy env.py and env_config.py to log_dir for backup
     log_dir = ppo_runner.log_dir
@@ -195,46 +328,64 @@ def train(args):
         if os.path.isfile(v6_config_path):
             shutil.copy(v6_config_path, log_dir)
 
-    # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
-    write_run_manifest(log_dir, args, env_cfg, train_cfg)
+    if args.task.startswith("go2_v7_"):
+        v7_config_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR,
+            "legged_gym",
+            "envs",
+            "go2",
+            "go2_v7_lpacrl_him_config.py",
+        )
+        if os.path.isfile(v7_config_path):
+            shutil.copy(v7_config_path, log_dir)
 
-    # Curriculum Atlas is on by default (see _dashboard_requested); it is
-    # attached only after the UED teacher and runner exist.  A missing server
-    # is harmless (the plugger retries quietly in a daemon thread), but the
-    # bridge is built from a caller-provided launcher script whose PYTHONPATH
-    # may not include the repo root, so both the import and construction are
-    # best-effort: any failure here must never cost hours of GPU training.
+    # Provenance manifest for the run (task/seed/git/simulator/P5/schedule/...)
+    write_run_manifest(log_dir, args, env_cfg, train_cfg, env=env)
+
+    # UED stage frames (sampling_probability, LP, episode counts, ...) are
+    # always written under <log_dir>/curriculum_atlas/frames.ndjson for UED
+    # arms -- independent of the live Curriculum Atlas server.  When the
+    # dashboard is requested we also POST to it; a missing server is still
+    # harmless because the local write is the durable analysis trail.
+    # Bridge construction is best-effort: a failure must never cost GPU hours.
     dashboard_bridge = None
-    if _dashboard_requested(args):
+    if getattr(env_cfg.env, "ued_enabled", False):
         try:
             if LEGGED_GYM_ROOT_DIR not in sys.path:
                 sys.path.insert(0, LEGGED_GYM_ROOT_DIR)
             from lpacr.dashboard.v5_integration import create_v5_dashboard_bridge
 
-            dashboard_url = (
-                getattr(args, "dashboard_url", None)
-                or os.getenv("LPACRL_DASHBOARD_URL")
-                or "http://127.0.0.1:8765"
-            )
+            want_live = _dashboard_requested(args)
+            dashboard_url = None
+            if want_live:
+                dashboard_url = (
+                    getattr(args, "dashboard_url", None)
+                    or os.getenv("LPACRL_DASHBOARD_URL")
+                    or "http://127.0.0.1:8765"
+                )
             default_run_id = f"{args.task}-{os.path.basename(os.path.normpath(log_dir))}"
+            local_frames_dir = os.path.join(log_dir, "curriculum_atlas")
             dashboard_bridge = create_v5_dashboard_bridge(
                 env,
                 task=args.task,
                 training_seed=train_cfg.seed,
                 server_url=dashboard_url,
                 run_id=getattr(args, "dashboard_run_id", None) or default_run_id,
+                local_dir=local_frames_dir,
             )
             if dashboard_bridge is None:
-                print("[ued-dashboard] requested, but this non-UED arm has no stage frames to publish")
+                print("[ued-frames] non-UED arm has no stage frames to record")
         except Exception as error:
-            print(f"[ued-dashboard] disabled: could not attach ({error!r})")
+            print(f"[ued-frames] disabled: could not attach ({error!r})")
             dashboard_bridge = None
         if dashboard_bridge is not None:
             env.set_ued_snapshot_listener(dashboard_bridge.publish)
-            print(
-                f"[ued-dashboard] enabled: run={dashboard_bridge.run_id} "
-                f"server={dashboard_url}"
-            )
+            where = f"local={dashboard_bridge.local_dir}"
+            if dashboard_url:
+                where += f" server={dashboard_url}"
+            else:
+                where += " server=off"
+            print(f"[ued-frames] enabled: run={dashboard_bridge.run_id} {where}")
 
     # Start training session.  ``close`` flushes the final stage frame without
     # changing error propagation from PPO training.

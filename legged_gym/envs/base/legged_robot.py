@@ -143,9 +143,12 @@ class LeggedRobot(BaseTask):
             **getattr(episode_curriculum, "adapter_kwargs", {}),
         )
         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
-        self._assign_ued_batch(env_ids)
-        self._resample_commands(env_ids)
-        self.ued_adapter.clear_episode_accumulators(env_ids)
+        # Enter through the normal reset lifecycle so the first assignment's
+        # terrain origin and the robot's physical root state are atomic.  Merely
+        # changing ``env_origins`` here would leave every robot at its pre-UED
+        # tile until the first termination and corrupt starting-terrain
+        # occupancy/provenance for that whole initial episode.
+        self.reset_idx(env_ids)
 
     def set_ued_snapshot_listener(self, listener) -> None:
         """Install an optional completed-stage observer for UED telemetry.

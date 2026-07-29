@@ -83,6 +83,83 @@ class TaskSpaceTest(unittest.TestCase):
             },
         )
 
+    def test_local_dir_records_frames_without_server(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            space = TaskSpace(("vx_bin",), {"vx_bin": ["a", "b", "c", "d"]})
+            plugger = CurriculumDashboardPlugger(
+                "flat-local",
+                space,
+                server_url=None,
+                local_dir=tmp,
+                metadata={"source": "v7_flat", "task": "go2_v7_flat_lpacrl_him"},
+            )
+            self.assertTrue(
+                plugger.log(
+                    2000,
+                    {
+                        "sampling_probability": [0.1, 0.2, 0.3, 0.4],
+                        "learning_progress": [0.0, 1.0, 2.0, 0.5],
+                    },
+                    frame_metadata={"stage_index": 1},
+                )
+            )
+            plugger.close()
+            frames_path = Path(tmp) / "frames.ndjson"
+            meta_path = Path(tmp) / "metadata.json"
+            self.assertTrue(frames_path.is_file())
+            self.assertTrue(meta_path.is_file())
+            frame = json.loads(frames_path.read_text(encoding="utf-8").strip())
+            self.assertEqual(frame["step"], 2000)
+            self.assertEqual(frame["metrics"]["sampling_probability"], [0.1, 0.2, 0.3, 0.4])
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta["run_id"], "flat-local")
+            self.assertEqual(meta["run_metadata"]["task"], "go2_v7_flat_lpacrl_him")
+
+
+    def test_http_queue_drop_does_not_lose_local_history(self):
+        """Even when the HTTP queue overflows, local frames stay complete."""
+        import tempfile
+        import time
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["content-length"])
+                self.rfile.read(length)
+                time.sleep(0.2)
+                self.send_response(202)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                space = TaskSpace(("a",), {"a": [1]})
+                plugger = CurriculumDashboardPlugger(
+                    "local-durable",
+                    space,
+                    server_url=f"http://127.0.0.1:{server.server_port}",
+                    local_dir=tmp,
+                    queue_size=2,
+                    timeout_seconds=0.5,
+                    retry_seconds=0.05,
+                )
+                for step in range(8):
+                    plugger.log(step, {"sampling_probability": [float(step)]})
+                plugger.close()
+                lines = (Path(tmp) / "frames.ndjson").read_text(encoding="utf-8").strip().splitlines()
+                self.assertEqual(len(lines), 8)
+                steps = [json.loads(line)["step"] for line in lines]
+                self.assertEqual(steps, list(range(8)))
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

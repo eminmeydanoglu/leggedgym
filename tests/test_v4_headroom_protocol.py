@@ -16,6 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 FULL_PATH = ROOT / "configs/eval/v4_headroom.yaml"
 SMOKE_PATH = ROOT / "configs/eval/v4_headroom_smoke.yaml"
+CONFIRM_PATH = ROOT / "configs/eval/v4_headroom_confirm.yaml"
 INVENTORY_PATH = ROOT / "configs/eval/v4_spnte_checkpoint_inventory.yaml"
 
 
@@ -29,6 +30,7 @@ class TestV4HeadroomProtocol(unittest.TestCase):
     def setUpClass(cls):
         cls.full = load(FULL_PATH)
         cls.smoke = load(SMOKE_PATH)
+        cls.confirm = load(CONFIRM_PATH)
         cls.inventory = load(INVENTORY_PATH)
 
     def test_eight_spnte_deployments_are_hash_locked_and_match_config_pins(self):
@@ -99,6 +101,8 @@ class TestV4HeadroomProtocol(unittest.TestCase):
         self.assertEqual(secondary["vx"], [])
         self.assertEqual(secondary["scenarios"], [])
         self.assertEqual(self.full["scorecard"]["headline_tier"], "primary_nominal_headroom")
+        self.assertFalse(self.full["scorecard"]["require_oracle_speed"])
+        self.assertFalse(self.smoke["scorecard"]["require_oracle_speed"])
 
     def test_declared_full_cell_budget_matches_the_matrix(self):
         protocol = self.full["protocol"]
@@ -137,11 +141,24 @@ class TestV4HeadroomProtocol(unittest.TestCase):
         self.assertEqual(smoke["protocol"]["commands"]["vx"], [0.6])
 
     def test_configs_target_the_dedicated_matrix_runner(self):
-        for cfg in (self.full, self.smoke):
+        for cfg in (self.full, self.smoke, self.confirm):
             execution = cfg["execution"]
             self.assertEqual(execution["runner_interface"], "v4_headroom_matrix_v1")
             self.assertTrue(str(execution["status"]).startswith("ready_for_"))
             self.assertFalse(execution["do_not_execute_with_current_v3_eval"])
+
+    def test_confirmation_is_only_the_two_preidentified_paired_worlds(self):
+        protocol = self.confirm["protocol"]
+        self.assertEqual(self.confirm["training_seeds"], [1, 2])
+        self.assertEqual(self.confirm["checkpoint_inventory"], self.full["checkpoint_inventory"])
+        self.assertEqual(protocol["terrain"]["types"], ["stairs_up"])
+        self.assertEqual(protocol["terrain"]["levels"], [3])
+        self.assertEqual(protocol["commands"]["vx"], [1.0])
+        self.assertEqual(protocol["primary_isolated_axes"]["axes"], [{
+            "name": "com_x_m", "dr_axis": "com_x", "id": [0.08], "ood": [0.10],
+        }])
+        self.assertEqual(protocol["planned_cell_budget"], {"primary": 8, "secondary": 0, "total": 8})
+        self.assertFalse(self.confirm["scorecard"]["require_oracle_speed"])
 
 
 if __name__ == "__main__":

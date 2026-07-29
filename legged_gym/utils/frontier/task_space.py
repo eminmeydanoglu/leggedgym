@@ -28,11 +28,11 @@ class FrontierTaskBatch:
 
 
 class V4FrontierTaskSpace:
-    """The real V4 10x10 terrain bank crossed with four |vx| bins.
+    """The real V4 10x10 starting-terrain bank crossed with four |vx| bins.
 
-    The V4 builder uses columns as fixed terrain replicas.  The frontier config
-    builds twelve columns: two replicas for each semantic family.  The
-    curriculum balances the six families first and chooses a replica second.
+    Columns are physical starting-terrain replicas.  Their counts are uneven
+    under V4's native proportions, so the curriculum balances six semantic
+    families first and chooses one of that family's columns second.
     """
 
     TERRAIN_FAMILIES = (
@@ -43,20 +43,20 @@ class V4FrontierTaskSpace:
         "stairs_down",
         "discrete_obstacles",
     )
-    # Exact mapping produced by Terrain.curiculum() with equal family weights
-    # [1/3, 1/6, 1/6, 1/6, 1/6] on twelve columns.  Slope and stairs each use
-    # two signed sub-ranges in the unchanged V4 builder.
+    # Exact mapping produced by Terrain.curiculum() with V4 proportions
+    # [0.2, 0.1, 0.25, 0.25, 0.2] on ten columns.  The generator splits the
+    # slope and stairs bands by sign; stairs therefore have 3/2 replicas.
     FAMILY_COLUMNS = (
-        (0, 1),
-        (2, 3),
-        (4, 5),
+        (0,),
+        (1,),
+        (2,),
+        (3, 4, 5),
         (6, 7),
         (8, 9),
-        (10, 11),
     )
     ABS_SPEED_BIN_EDGES = (0.2, 0.5, 1.0, 1.5, 2.0)
     NUM_LEVELS = 10
-    NUM_COLUMNS = 12
+    NUM_COLUMNS = 10
 
     def __init__(self, *, builder_parameters: Mapping[str, object] | None = None) -> None:
         self.terrain_type_names = self.TERRAIN_FAMILIES

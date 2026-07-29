@@ -116,6 +116,39 @@ aynen korur.
 `go2_v5_handcrafted` UED teacher/stage üretmediği için dashboard istenirse
 anlamlı bir no-op yapar ve eğitim normal sürer.
 
+### V6 frontier entegrasyonu
+
+`go2_v6_*` arm'ları için `create_v5_dashboard_bridge` otomatik olarak
+`FrontierDashboardBridge`'i seçer (curriculum'un task space'ine bakarak). Ek
+bayrak gerekmez; v5 ile v6 aynı sunucuda yan yana yaşar ve üstteki run
+seçicisinden geçiş yapılır.
+
+**Çözünürlük.** Frame `(vx_bin, terrain_family, terrain_level)` = 4×6×10 = 240
+hücredir. Terrain replikaları (aynı ailenin iki kolonu) curriculum kararı
+*değil* — hücre seçildikten sonra uniform çekilirler — bu yüzden eksen
+olmazlar; replika dengesi frame metadata'sındaki `replica_balance` alanında
+raporlanır.
+
+**Metrikler.** `FrontierCurriculum.cell_metrics()` hücre başına ~32 metrik
+yayınlar: `state` (0 locked / 1 frontier / 2 mastered / 3 unstable),
+`success_probability` ve stage başına `success_probability_delta`, pencere
+doluluğu (`window_episode_count`, `episodes_until_eligible`), sampling kütlesi,
+bucket provenance (`source_{frontier,replay,uniform}_{count,share}`), unlock ve
+mastery stage damgaları, ve mastery kuralının attığı sürekli episode sinyalleri
+(`mean_linear_error`, `mean_yaw_error`, `mean_episode_length`,
+`mean_episodic_return`, `timeout_fraction`) — hepsi EWMA. Gözlenmemiş hücreler
+uydurma sıfır değil, `null` kalır. Hepsi checkpoint'e yazılır, resume'da
+korunur (`SCHEMA_VERSION = 2`).
+
+**Görünüm.** Atlas varsayılan olarak X=level, Y=|vx|, panel=terrain family ile
+açılır ve `state` metriğini gösterir: frontier iki eksende birden ilerlediği
+için aile başına 10×4 ızgara "curriculum nerede" sorusunun tam cevabıdır.
+Hangi metrik seçilirse seçilsin frontier hücreleri amber çerçeveyle
+işaretlenir. Signal chain v6'da otomatik olarak
+`success_probability → delta → sampling_probability` zincirine geçer (frontier
+kuralının learning-progress sinyali yoktur). Alttaki panel v5'te ESS,
+v6'da lifecycle sayılarını çizer.
+
 Context manager zorunlu değildir; process normal kapanırsa `atexit` de son
 frame'leri göndermeyi dener.
 

@@ -82,6 +82,12 @@ class CurriculumDashboardPlugger:
     Flatten each metric in C order following ``task_space.dimensions``.
     Failed uploads are retried; if the queue fills, the oldest unsent frame is
     dropped so dashboard I/O can never stall the training loop.
+
+    When ``local_dir`` is set, every accepted frame is also appended to
+    ``local_dir/frames.ndjson`` (and a one-shot ``metadata.json``) *before*
+    the HTTP attempt.  That local write is the durable record for sample
+    probabilities / LP / episode counts even if the dashboard server is down
+    or never started -- critical for headless UHeM jobs.
     """
 
     def __init__(
@@ -90,11 +96,14 @@ class CurriculumDashboardPlugger:
         task_space: TaskSpace,
         *,
         metadata: Mapping[str, object] | None = None,
-        server_url: str = "http://127.0.0.1:8765",
+        server_url: str | None = "http://127.0.0.1:8765",
+        local_dir: str | None = None,
         queue_size: int = 32,
         timeout_seconds: float = 2.0,
         retry_seconds: float = 1.0,
     ) -> None:
+        if not server_url and not local_dir:
+            raise ValueError("CurriculumDashboardPlugger needs server_url and/or local_dir")
         self.run_id = run_id
         self.task_space = task_space
         # Run metadata is deliberately optional.  Existing generic users keep
@@ -102,11 +111,19 @@ class CurriculumDashboardPlugger:
         # provenance without teaching this framework-agnostic transport about
         # PPO, Genesis, or a particular curriculum implementation.
         self.metadata = dict(metadata) if metadata is not None else None
-        self.endpoint = f"{server_url.rstrip('/')}/api/runs/{run_id}/frames"
+        self.server_url = server_url.rstrip("/") if server_url else None
+        self.endpoint = (
+            f"{self.server_url}/api/runs/{run_id}/frames" if self.server_url else None
+        )
+        self.local_dir = local_dir
         self.timeout_seconds = timeout_seconds
         self.retry_seconds = retry_seconds
+        self._local_lock = threading.Lock()
+        self._local_metadata_written = False
         self._queue: queue.Queue[dict | None] = queue.Queue(maxsize=queue_size)
         self._closed = False
+        # Local-only mode still uses the worker so log() stays non-blocking;
+        # the worker just writes disk and skips HTTP when endpoint is None.
         self._thread = threading.Thread(target=self._worker, name="curriculum-dashboard", daemon=True)
         self._thread.start()
         atexit.register(self.close)
@@ -154,6 +171,16 @@ class CurriculumDashboardPlugger:
                 **({"run": self.metadata} if self.metadata is not None else {}),
                 **({"frame": dict(frame_metadata)} if frame_metadata is not None else {}),
             })
+        # Durable local write is synchronous and independent of the HTTP
+        # queue: a backed-up dashboard must never drop sample-probability
+        # history that analysis needs after the job ends.
+        if self.local_dir is not None:
+            try:
+                self._write_local(frame)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ued-dashboard] local frame write failed step={frame.get('step')}: {exc!r}")
+        if self.endpoint is None:
+            return True
         dropped = False
         try:
             self._queue.put_nowait(frame)
@@ -181,6 +208,42 @@ class CurriculumDashboardPlugger:
             pass
         self._thread.join(timeout=2)
 
+    def _write_local(self, frame: dict) -> None:
+        """Append one frame under local_dir; create metadata.json once.
+
+        Mirrors lpacr/dashboard/server.mjs storeFrame so analysis tools can
+        read either the live Atlas dir or the run-local copy interchangeably.
+        """
+        if not self.local_dir:
+            return
+        from pathlib import Path
+
+        run_dir = Path(self.local_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(frame, separators=(",", ":"), allow_nan=False) + "\n"
+        with self._local_lock:
+            meta_path = run_dir / "metadata.json"
+            if not self._local_metadata_written and not meta_path.is_file():
+                run_meta = None
+                if isinstance(frame.get("metadata"), dict):
+                    run_meta = frame["metadata"].get("run")
+                payload = {
+                    "run_id": self.run_id,
+                    "created_at": frame.get("wall_time"),
+                    "task_space": frame.get("task_space"),
+                    "metric_names": list(frame.get("metrics", {}).keys()),
+                }
+                if run_meta is not None:
+                    payload["run_metadata"] = run_meta
+                meta_path.write_text(
+                    json.dumps(payload, indent=2, allow_nan=False) + "\n",
+                    encoding="utf-8",
+                )
+                self._local_metadata_written = True
+            with (run_dir / "frames.ndjson").open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+
     def _worker(self) -> None:
         while True:
             frame = self._queue.get()
@@ -193,6 +256,9 @@ class CurriculumDashboardPlugger:
                 payload = json.dumps(frame, separators=(",", ":"), allow_nan=False).encode()
             except (TypeError, ValueError) as exc:
                 print(f"[ued-dashboard] drop non-JSON frame step={frame.get('step')}: {exc}")
+                self._queue.task_done()
+                continue
+            if self.endpoint is None:
                 self._queue.task_done()
                 continue
             request = urllib.request.Request(
@@ -224,5 +290,7 @@ class CurriculumDashboardPlugger:
                         break
                     time.sleep(self.retry_seconds)
                 except (urllib.error.URLError, TimeoutError):
+                    # Local frames already landed; keep retrying HTTP until
+                    # close() so a late-started Atlas still fills in.
                     time.sleep(self.retry_seconds)
             self._queue.task_done()

@@ -61,4 +61,5 @@ scorecard:
   relative_headroom: 0.10
   absolute_headroom: 0.10
   fall_gate_pp: 0.05
+  require_oracle_speed: false
   achieved_speed_ratio: 0.90

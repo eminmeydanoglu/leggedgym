@@ -104,6 +104,8 @@ class Go2V3SupersetOracle(Go2V3PhysicsResampleMixin, GO2):
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
+        # Snapshot the deques: compute_observations() may append (or a Viser
+        # GUI worker may race the main step loop) while we zero history slots.
         for history in (self.obs_history_deque, self.clean_history_deque):
-            for frame in history:
+            for frame in list(history):
                 frame[env_ids] = 0.0

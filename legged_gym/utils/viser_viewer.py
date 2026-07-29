@@ -918,21 +918,53 @@ class ViserViewer:
             )
 
     def _setup_respawn_button(self) -> None:
-        """Add a manual "Respawn" button that triggers self._respawn_callback."""
+        """Add a manual "Respawn" button that queues a main-thread reset.
+
+        Viser GUI handlers run on a worker thread.  Calling ``env.reset_idx``
+        there races the play loop's ``step`` / observation history deques, so
+        we only set a pending flag and let the main loop drain it.
+        """
         self._respawn_callback: Optional[object] = None
         self._taxonomy_spawn_callback: Optional[object] = None
+        self._pending_respawn = False
+        self._pending_taxonomy_spawn: Optional[Tuple[int, int]] = None
 
         with self.server.gui.add_folder("Reset", expand_by_default=True):
             respawn_button = self.server.gui.add_button("Respawn")
 
             @respawn_button.on_click
             def _(_) -> None:
+                # Defer to the sim thread; see take_pending_respawn().
+                self._pending_respawn = True
                 if self._respawn_callback is not None:
-                    self._respawn_callback()
+                    # Legacy hooks that only schedule work stay safe; hooks that
+                    # mutate the env directly should be replaced by the pending
+                    # drain in play.py.
+                    try:
+                        self._respawn_callback()
+                    except Exception as exc:
+                        print(f"[viser] respawn callback error: {exc}")
 
     def set_respawn_callback(self, callback) -> None:
-        """Register a callback invoked when the "Respawn" button is clicked."""
+        """Register a callback invoked when the "Respawn" button is clicked.
+
+        Prefer main-thread handling via ``take_pending_respawn()``; if a
+        callback is set it should ideally only schedule work, not call into
+        the simulator from the GUI thread.
+        """
         self._respawn_callback = callback
+
+    def take_pending_respawn(self) -> bool:
+        """Return True once if Respawn was clicked since the last poll."""
+        pending = bool(getattr(self, "_pending_respawn", False))
+        self._pending_respawn = False
+        return pending
+
+    def take_pending_taxonomy_spawn(self) -> Optional[Tuple[int, int]]:
+        """Return ``(level, type_idx)`` once if Teleport was clicked, else None."""
+        pending = getattr(self, "_pending_taxonomy_spawn", None)
+        self._pending_taxonomy_spawn = None
+        return pending
 
     def setup_taxonomy_spawn_panel(
         self,
@@ -943,8 +975,10 @@ class ViserViewer:
     ) -> None:
         """GUI to teleport the play robot onto a taxonomy tile (type × level).
 
-        Call ``set_taxonomy_spawn_callback(fn)`` with
-        ``fn(level: int, type_idx: int)`` to wire the teleport.
+        Click queues a ``(level, type_idx)`` for the main play loop via
+        ``take_pending_taxonomy_spawn()``.  Optional
+        ``set_taxonomy_spawn_callback`` is still notified for status hooks,
+        but must not mutate the simulator from the GUI thread.
         """
         from legged_gym.utils.terrain import TAXONOMY_TYPE_NAMES, TAXONOMY_NUM_LEVELS
 
@@ -953,6 +987,8 @@ class ViserViewer:
         level_options = [f"L{i}" for i in range(n_levels)]
         init_level = int(max(0, min(initial_level, n_levels - 1)))
         init_type = int(max(0, min(initial_type, len(names) - 1)))
+        if not hasattr(self, "_pending_taxonomy_spawn"):
+            self._pending_taxonomy_spawn = None
 
         with self.server.gui.add_folder("Spawn (taxonomy)", expand_by_default=True):
             self.server.gui.add_markdown(
@@ -986,12 +1022,17 @@ class ViserViewer:
                     level = level_options.index(dd_level.value)
                 except ValueError:
                     level = 0
-                ok = False
-                if self._taxonomy_spawn_callback is not None:
-                    ok = bool(self._taxonomy_spawn_callback(level, type_idx))
+                # Queue for the main sim thread — do not reset env here.
+                self._pending_taxonomy_spawn = (int(level), int(type_idx))
                 label = f"{names[type_idx]} L{level}"
-                status.value = f"{'OK' if ok else 'FAILED'}: {label}"
-                print(f"[viser] taxonomy spawn → {label} (ok={ok})")
+                status.value = f"Queued: {label}"
+                print(f"[viser] taxonomy spawn queued → {label}")
+                if self._taxonomy_spawn_callback is not None:
+                    try:
+                        # Optional notify-only hook (must not call env.reset).
+                        self._taxonomy_spawn_callback(int(level), int(type_idx))
+                    except Exception as exc:
+                        print(f"[viser] taxonomy spawn callback error: {exc}")
 
         self._taxonomy_spawn_gui = {
             "type": dd_type,
@@ -1000,8 +1041,23 @@ class ViserViewer:
         }
 
     def set_taxonomy_spawn_callback(self, callback) -> None:
-        """Register ``callback(level: int, type_idx: int) -> bool`` for Teleport."""
+        """Optional notify hook for Teleport (prefer pending-queue drain)."""
         self._taxonomy_spawn_callback = callback
+
+    def report_taxonomy_spawn_result(self, level: int, type_idx: int, ok: bool) -> None:
+        """Update the Spawn panel after the main loop finishes a teleport."""
+        gui = getattr(self, "_taxonomy_spawn_gui", None)
+        if not gui:
+            return
+        try:
+            names = list(gui["type"].options)
+            label = f"{names[int(type_idx)]} L{int(level)}" if names else f"type{type_idx} L{level}"
+        except Exception:
+            label = f"type{type_idx} L{level}"
+        try:
+            gui["status"].value = f"{'OK' if ok else 'FAILED'}: {label}"
+        except Exception:
+            pass
 
     def get_command(self) -> np.ndarray:
         """Current velocity command [lin_vel_x, lin_vel_y, ang_vel_yaw] derived
@@ -1336,13 +1392,21 @@ def create_viser_viewer(
             # The old forced min-stride=3 desynced 0.4 m stair treads (4 samples
             # at 0.1 m) and smoothed risers into soft hills.
             nx, ny = terrain.heightsamples.shape
-            from legged_gym.utils.terrain import is_taxonomy_terrain_cfg
-            taxonomy = is_taxonomy_terrain_cfg(env.cfg.terrain)
-            if taxonomy:
+            from legged_gym.utils.terrain import (
+                is_taxonomy_terrain_cfg,
+                is_v6_showcase_terrain_cfg,
+            )
+            showcase = (
+                is_taxonomy_terrain_cfg(env.cfg.terrain)
+                or is_v6_showcase_terrain_cfg(env.cfg.terrain)
+            )
+            if showcase:
                 # Flat-shaded faces (3 verts each).  ~500k verts is still fine
                 # for Viser on a laptop; taxonomy at stride 1 is ~1.1M and can
                 # be dropped by three.js, so the budget targets stride 2 with
-                # mode-preserving downsample + hard edges.
+                # mode-preserving downsample + hard edges.  V6 stairs /
+                # discrete obstacles need the same edge-preserving path so
+                # risers stay sharp rather than smeared ramps.
                 hard_edges = True
                 edge_preserving = True
                 max_verts = 500_000
@@ -1372,35 +1436,88 @@ def create_viser_viewer(
                 mesh.apply_transform(translation)
                 viewer.set_terrain_mesh(mesh)
 
-        # Taxonomy showcase labels (Viser text; Genesis has no draw_debug_text).
+        # Showcase labels (Viser text; Genesis has no draw_debug_text).
         from legged_gym.utils.terrain import (
+            V6_FAMILY_NAMES,
+            V6_LABEL_Z_OFFSET,
+            V6_SHOWCASE_COLUMNS,
+            V6_SHOWCASE_LEVELS,
             build_taxonomy_label_map,
+            build_v6_showcase_label_map,
             is_taxonomy_terrain_cfg,
+            is_v6_showcase_terrain_cfg,
             TAXONOMY_LABEL_Z_OFFSET,
             TAXONOMY_TYPE_NAMES,
         )
-        if is_taxonomy_terrain_cfg(env.cfg.terrain):
+        showcase_cfg = (
+            is_taxonomy_terrain_cfg(env.cfg.terrain)
+            or is_v6_showcase_terrain_cfg(env.cfg.terrain)
+        )
+        if showcase_cfg:
             label_map = getattr(terrain, "taxonomy_labels", None)
             if not label_map and hasattr(terrain, "env_origins"):
-                label_map = build_taxonomy_label_map(
-                    terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
-                )
+                if is_v6_showcase_terrain_cfg(env.cfg.terrain):
+                    label_map = build_v6_showcase_label_map(
+                        terrain.env_origins,
+                        levels=getattr(
+                            env.cfg.terrain, "v6_showcase_levels", V6_SHOWCASE_LEVELS
+                        ),
+                        columns=getattr(
+                            env.cfg.terrain, "v6_showcase_columns", V6_SHOWCASE_COLUMNS
+                        ),
+                        difficulty_cfg=getattr(
+                            env.cfg.terrain, "terrain_curriculum_difficulty", None
+                        ),
+                        z_offset=V6_LABEL_Z_OFFSET,
+                    )
+                else:
+                    label_map = build_taxonomy_label_map(
+                        terrain.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
+                    )
             if label_map:
                 viewer.set_taxonomy_labels(label_map)
                 # Elevated oblique default looking at the grid centre.
+                # Offset scales with the larger extent so v6's 5x6×8 m grid
+                # (40 m × 48 m) is framed similarly to taxonomy's 4x6×6 m.
                 length = float(env.cfg.terrain.terrain_length)
                 width = float(env.cfg.terrain.terrain_width)
                 cx = 0.5 * env.cfg.terrain.num_rows * length
                 cy = 0.5 * env.cfg.terrain.num_cols * width
-                viewer._camera_offset = np.array([cx - 18.0, cy - 22.0, 32.0]) - np.array([cx, cy, 0.0])
+                extent = max(
+                    float(env.cfg.terrain.num_rows) * length,
+                    float(env.cfg.terrain.num_cols) * width,
+                )
+                cam_xy = 0.45 * extent
+                cam_z = 0.70 * extent
+                cam_pos = np.array(
+                    [cx - cam_xy, cy - cam_xy * (22.0 / 18.0), cam_z],
+                    dtype=np.float64,
+                )
+                cam_look = np.array([cx, cy, 0.0], dtype=np.float64)
+                viewer._camera_offset = cam_pos - cam_look
                 # Absolute initial pose for new clients (not robot-relative).
                 @viewer.server.on_client_connect
-                def _taxonomy_cam(client, _cx=cx, _cy=cy) -> None:
-                    client.camera.position = np.array([_cx - 18.0, _cy - 22.0, 32.0])
-                    client.camera.look_at = np.array([_cx, _cy, 0.0])
+                def _showcase_cam(
+                    client, _pos=cam_pos, _look=cam_look
+                ) -> None:
+                    client.camera.position = np.asarray(_pos, dtype=np.float64)
+                    client.camera.look_at = np.asarray(_look, dtype=np.float64)
                     client.camera.fov = np.radians(55.0)
+            if is_v6_showcase_terrain_cfg(env.cfg.terrain):
+                from legged_gym.utils.terrain import v6_family_index_for_column
+                cols = getattr(
+                    env.cfg.terrain,
+                    "v6_showcase_columns",
+                    tuple(range(int(env.cfg.terrain.num_cols))),
+                )
+                type_names = tuple(
+                    f"{V6_FAMILY_NAMES[v6_family_index_for_column(c)]} c{c}"
+                    for c in cols
+                )
+            else:
+                type_names = TAXONOMY_TYPE_NAMES
             viewer.setup_taxonomy_spawn_panel(
-                type_names=TAXONOMY_TYPE_NAMES,
+                type_names=type_names,
                 num_levels=int(env.cfg.terrain.num_rows),
                 initial_level=0,
                 initial_type=0,

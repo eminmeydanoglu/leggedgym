@@ -18,6 +18,11 @@ from .task_space import TaskSpace
 class GenesisUEDAdapter:
     """Own per-environment UED provenance at the Genesis/Torch boundary."""
 
+    # Terrain curricula require the static grid supplied by Genesis.  The V7
+    # flat-prior adapter deliberately overrides this because it has a velocity
+    # task space only and must work with ``terrain.mesh_type = 'plane'``.
+    requires_terrain_origins = True
+
     def __init__(
         self,
         *,
@@ -29,7 +34,10 @@ class GenesisUEDAdapter:
     ) -> None:
         if commands.ndim != 2 or commands.shape[1] < 1:
             raise ValueError("commands must be a [num_envs, >=1] tensor")
-        if not getattr(simulator, "custom_origins", False) or not hasattr(simulator, "_terrain_origins"):
+        if self.requires_terrain_origins and (
+            not getattr(simulator, "custom_origins", False)
+            or not hasattr(simulator, "_terrain_origins")
+        ):
             raise ValueError("UED terrain teleport requires custom terrain origins")
         self.task_space = task_space
         self.simulator = simulator

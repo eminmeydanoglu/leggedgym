@@ -91,6 +91,8 @@ class TestV4Followup(unittest.TestCase):
             self.assertEqual(len(cells), 4)
             self.assertEqual({cell.model for cell in cells}, {"DreamWaQ", "HIM-fixed"})
             self.assertEqual({cell.seed for cell in cells}, {1, 2})
+            self.assertEqual(_v4_protocol_fingerprint(follow), _v4_protocol_fingerprint(cfg))
+            self.assertEqual(follow["protocol"].get("planned_cell_budget"), cfg["protocol"].get("planned_cell_budget"))
 
     def test_followup_aggregate_uses_hash_pinned_discovery_references(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,6 +187,7 @@ class TestV4Followup(unittest.TestCase):
             self.assertEqual(set(models), {"MLP", "Superset-Oracle", "DreamWaQ", "HIM-fixed"})
             self.assertTrue(models["DreamWaQ"]["run_paths"])
             self.assertTrue(models["HIM-fixed"]["run_paths"])
+            self.assertEqual(_v4_protocol_fingerprint(loaded), _v4_protocol_fingerprint(source_cfg))
 
 
 if __name__ == "__main__":

@@ -142,6 +142,190 @@ def is_ued_training_terrain_cfg(cfg) -> bool:
     return bool(getattr(cfg, "ued_training_grid", False))
 
 
+# ---------------------------------------------------------------------------
+# V6 frontier showcase — subsampled view of the real V4/ETH curriculum bank
+# used by go2_v6_frontier.  Geometry comes from make_terrain(choice, difficulty)
+# with training indices (level / 10, column / 12 + 0.001), NOT the V5 taxonomy
+# tables.
+# ---------------------------------------------------------------------------
+V6_TRAINING_NUM_ROWS = 10          # v6 difficulty levels
+V6_TRAINING_NUM_COLS = 10          # native V4 terrain columns
+# Display names in FAMILY_COLUMNS order.  Signs match *experienced* direction
+# (robot spawns on the center platform and walks outward): negative generator
+# slope/step_height → ascending, positive → descending.  Same mapping as
+# V4FrontierTaskSpace.TERRAIN_FAMILIES / FAMILY_COLUMNS.
+V6_FAMILY_NAMES = (
+    "Upslope",
+    "Downslope",
+    "Random roughness",
+    "Ascending stairs",
+    "Descending stairs",
+    "Discrete obstacles",
+)
+V6_FAMILY_COLUMNS = ((0,), (1,), (2,), (3, 4, 5), (6, 7), (8, 9))
+# Reuse the taxonomy palette style (one color per semantic family).
+V6_FAMILY_COLORS = (
+    (1.0, 0.65, 0.1, 1.0),   # upslope — orange
+    (0.15, 0.85, 0.35, 1.0), # downslope — green
+    (0.75, 0.25, 0.85, 1.0), # random roughness — purple
+    (1.0, 0.25, 0.2, 1.0),   # ascending stairs — red
+    (0.2, 0.45, 1.0, 1.0),   # descending stairs — blue
+    (0.85, 0.75, 0.2, 1.0),  # discrete obstacles — gold
+)
+V6_SHOWCASE_LEVELS = (0, 2, 4, 6, 9)           # default subsampled rows
+V6_SHOWCASE_COLUMNS = (0, 1, 2, 3, 6, 8)        # default: one column per family
+V6_LABEL_Z_OFFSET = 1.5  # m above tile origin
+# Play-default tile envelope matches the live V4-style training bank.
+V6_PLAY_TILE_LENGTH = 8.0
+V6_PLAY_TILE_WIDTH = 8.0
+V6_PLAY_PLATFORM_SIZE = 4.0
+# Default difficulty expressions (V4 base + v6 rough_height).  Used only when
+# a label map is built without a cfg; the Terrain builder always reads the cfg.
+V6_DEFAULT_DIFFICULTY = {
+    "slope": "difficulty * 0.4",
+    "step_height": "0.05 + 0.2 * difficulty",
+    "discrete_height": "0.05 + 0.2 * difficulty",
+    "rough_height": "0.01 + 0.10 * difficulty",
+}
+
+
+def is_v6_showcase_terrain_cfg(cfg) -> bool:
+    """True when cfg selects the V6 frontier showcase builder.
+
+    Takes precedence over ``ued_training_grid`` / taxonomy when dispatching in
+    ``Terrain.__init__`` (checked first after ``height_field_raw_override``).
+    """
+    mode = getattr(cfg, "mode", None)
+    if mode is not None and str(mode).lower() in (
+        "v6", "v6_frontier", "frontier", "v6_full",
+    ):
+        return True
+    return bool(getattr(cfg, "v6_frontier_showcase", False))
+
+
+def v6_family_index_for_column(column: int) -> int:
+    """Map a training column index to its semantic family (0..5)."""
+    column = int(column)
+    for family_idx, cols in enumerate(V6_FAMILY_COLUMNS):
+        if column in cols:
+            return family_idx
+    raise ValueError(
+        f"column {column} is outside the V6 bank (0..{V6_TRAINING_NUM_COLS - 1})"
+    )
+
+
+def v6_training_choice(column: int) -> float:
+    """``choice`` fed to ``make_terrain`` for a training column index."""
+    return int(column) / V6_TRAINING_NUM_COLS + 0.001
+
+
+def v6_training_difficulty(level: int) -> float:
+    """``difficulty`` fed to ``make_terrain`` for a training level index."""
+    return int(level) / V6_TRAINING_NUM_ROWS
+
+
+def _eval_terrain_difficulty_expr(expr: str, difficulty: float):
+    """Eval a terrain_curriculum_difficulty expression (same scope as make_terrain)."""
+    return eval(expr, {"np": np, "difficulty": float(difficulty)})
+
+
+def v6_severity_label(family_idx: int, level: int, difficulty_cfg) -> str:
+    """Human-readable label with evaluated severity for one showcase cell."""
+    family_idx = int(family_idx)
+    level = int(level)
+    if not 0 <= family_idx < len(V6_FAMILY_NAMES):
+        raise ValueError(f"family_idx out of range: {family_idx}")
+    if not 0 <= level < V6_TRAINING_NUM_ROWS:
+        raise ValueError(f"level out of range: {level}")
+    difficulty = v6_training_difficulty(level)
+    name = V6_FAMILY_NAMES[family_idx]
+    cfg = difficulty_cfg or V6_DEFAULT_DIFFICULTY
+    if family_idx in (0, 1):  # slopes
+        slope = abs(float(_eval_terrain_difficulty_expr(cfg["slope"], difficulty)))
+        deg = float(np.degrees(slope))
+        return f"{name} L{level}  {slope:.2f} rad ({deg:.1f} deg)"
+    if family_idx == 2:  # rough
+        rough_expr = cfg.get("rough_height") if isinstance(cfg, dict) else None
+        amp = (
+            0.05
+            if rough_expr is None
+            else abs(float(_eval_terrain_difficulty_expr(rough_expr, difficulty)))
+        )
+        return f"{name} L{level}  +/-{amp * 100.0:.1f}cm"
+    if family_idx in (3, 4):  # stairs
+        h = abs(float(_eval_terrain_difficulty_expr(cfg["step_height"], difficulty)))
+        return f"{name} L{level}  h={int(round(h * 100.0))}cm"
+    # discrete obstacles
+    h = abs(float(_eval_terrain_difficulty_expr(cfg["discrete_height"], difficulty)))
+    return f"{name} L{level}  h={int(round(h * 100.0))}cm"
+
+
+def build_v6_showcase_label_map(
+    env_origins,
+    levels=None,
+    columns=None,
+    difficulty_cfg=None,
+    z_offset: float = V6_LABEL_Z_OFFSET,
+):
+    """Build per-tile label metadata for a V6 frontier showcase grid.
+
+    Schema matches the taxonomy / Viser consumer: row, col, level, type_idx,
+    label, color, position (x,y,z with z_offset).
+    """
+    origins = np.asarray(env_origins, dtype=np.float64)
+    if origins.ndim != 3 or origins.shape[2] != 3:
+        raise ValueError(f"env_origins must be (R, C, 3), got {origins.shape}")
+    levels = tuple(int(x) for x in (V6_SHOWCASE_LEVELS if levels is None else levels))
+    columns = tuple(int(x) for x in (V6_SHOWCASE_COLUMNS if columns is None else columns))
+    num_rows, num_cols = origins.shape[0], origins.shape[1]
+    if len(levels) != num_rows or len(columns) != num_cols:
+        # Still label what we can; clamp display indices.
+        pass
+    labels = []
+    for i in range(num_rows):
+        for j in range(num_cols):
+            level = levels[i] if i < len(levels) else i
+            column = columns[j] if j < len(columns) else j
+            family_idx = v6_family_index_for_column(column)
+            ox, oy, oz = origins[i, j]
+            labels.append({
+                "row": i,
+                "col": j,
+                "level": int(level),
+                "type_idx": int(family_idx),
+                "label": v6_severity_label(family_idx, level, difficulty_cfg),
+                "color": V6_FAMILY_COLORS[family_idx],
+                "position": np.array([ox, oy, oz + z_offset], dtype=np.float64),
+            })
+    return labels
+
+
+def format_v6_showcase_console_map(label_map) -> str:
+    """Human-readable V6 showcase grid (hardest level printed first)."""
+    by_rc = {(e["row"], e["col"]): e for e in label_map}
+    if not by_rc:
+        return "(empty v6 showcase map)"
+    max_r = max(r for r, _ in by_rc)
+    max_c = max(c for _, c in by_rc)
+    lines = [
+        "V6 frontier showcase grid "
+        "(row=training level bottom→top, col=one column per family):"
+    ]
+    for i in range(max_r, -1, -1):
+        cells = []
+        for j in range(max_c + 1):
+            e = by_rc[(i, j)]
+            p = e["position"]
+            cells.append(f"{e['label']} @({p[0]:.1f},{p[1]:.1f})")
+        level_tag = by_rc[(i, 0)]["level"]
+        lines.append(f"  L{level_tag}: " + " | ".join(cells))
+    lines.append(
+        "Legend (family index): "
+        + ", ".join(f"{k}:{V6_FAMILY_NAMES[k]}" for k in range(len(V6_FAMILY_NAMES)))
+    )
+    return "\n".join(lines)
+
+
 def ued_training_builder_parameters(cfg) -> dict:
     """Stable JSON-ready geometry description for ``TaskSpace.fingerprint``."""
     return {
@@ -357,6 +541,7 @@ class Terrain:
         self.type = cfg.mesh_type
         self.simplify_mesh = cfg.simplify_mesh
         self.taxonomy_labels = []
+        self.v6_showcase_labels = []
         if self.type in ["none", 'plane']:
             return
         self.env_length = cfg.terrain_length
@@ -398,7 +583,16 @@ class Terrain:
             self.height_field_raw = raw.copy()
             self.heightsamples = self.height_field_raw
             return
-        if is_ued_training_terrain_cfg(cfg):
+        # V6 frontier showcase is checked before UED/taxonomy: those flags can
+        # stay set on a V5/V6 task cfg, and play clears them, but an explicit
+        # v6 mode must win if both are true (see is_v6_showcase_terrain_cfg).
+        if is_v6_showcase_terrain_cfg(cfg):
+            print(
+                "Generating V6 frontier showcase terrain "
+                f"({cfg.num_rows} levels x {cfg.num_cols} columns)..."
+            )
+            self.v6_frontier_showcase()
+        elif is_ued_training_terrain_cfg(cfg):
             print("Generating deterministic UED training terrain (21 configs / 84 tasks)...")
             self.ued_training_grid()
         elif is_taxonomy_terrain_cfg(cfg):
@@ -415,7 +609,7 @@ class Terrain:
             self.selected_terrain()
         else:
             print("Generating randomized terrain...")
-            self.randomized_terrain()   
+            self.randomized_terrain()
         
         self.heightsamples = self.height_field_raw
         if self.type=="trimesh":
@@ -493,6 +687,70 @@ class Terrain:
         self.taxonomy_labels = build_taxonomy_label_map(
             self.env_origins, z_offset=TAXONOMY_LABEL_Z_OFFSET
         )
+
+    def v6_frontier_showcase(self):
+        """Build a (sub)sampled V6 frontier task-space exhibit via make_terrain.
+
+        Display grid size is ``cfg.num_rows x cfg.num_cols``.  Each display cell
+        (r, c) is the *training* tile at
+        ``(v6_showcase_levels[r], v6_showcase_columns[c])``, generated with
+
+            difficulty = training_level / V6_TRAINING_NUM_ROWS   # always /10
+            choice     = training_column / V6_TRAINING_NUM_COLS + 0.001  # /12
+
+        i.e. the same arguments ``curiculum()`` would pass for that cell — not
+        ``r / num_display_rows``.  Labels are also assigned to
+        ``self.taxonomy_labels`` so existing Viser/console plumbing works.
+        """
+        levels = tuple(
+            int(x) for x in getattr(self.cfg, "v6_showcase_levels", V6_SHOWCASE_LEVELS)
+        )
+        columns = tuple(
+            int(x) for x in getattr(self.cfg, "v6_showcase_columns", V6_SHOWCASE_COLUMNS)
+        )
+        if len(levels) != self.cfg.num_rows or len(columns) != self.cfg.num_cols:
+            print(
+                f"[v6_showcase] warning: display grid is {self.cfg.num_rows}x"
+                f"{self.cfg.num_cols} but levels/columns lists are "
+                f"{len(levels)}x{len(columns)}; clamping indices"
+            )
+        # Must set before make_terrain (curriculum branch normally does this).
+        self.terrain_curriculum_difficulty = self.cfg.terrain_curriculum_difficulty
+
+        level_to_row = {int(lv): r for r, lv in enumerate(levels)}
+        col_to_display = {int(col): c for c, col in enumerate(columns)}
+
+        seed = int(getattr(self.cfg, "v6_showcase_seed", 0))
+        rng_state = np.random.get_state()
+        np.random.seed(seed)
+        try:
+            # Same outer/inner order as curiculum() (cols then rows) so that a
+            # full 10x10 exhibit is byte-identical to a curriculum build with
+            # the same seed.  When subsampled we still walk the full training
+            # bank and only *place* the selected tiles — this keeps rough /
+            # discrete RNG streams aligned with a full curriculum build at the
+            # same seed for every (level, column) that appears in the exhibit.
+            for j in range(V6_TRAINING_NUM_COLS):
+                for i in range(V6_TRAINING_NUM_ROWS):
+                    difficulty = v6_training_difficulty(i)
+                    choice = v6_training_choice(j)
+                    terrain = self.make_terrain(choice, difficulty)
+                    if i in level_to_row and j in col_to_display:
+                        self.add_terrain_to_map(
+                            terrain, level_to_row[i], col_to_display[j]
+                        )
+        finally:
+            np.random.set_state(rng_state)
+
+        self.v6_showcase_labels = build_v6_showcase_label_map(
+            self.env_origins,
+            levels=levels[: self.cfg.num_rows],
+            columns=columns[: self.cfg.num_cols],
+            difficulty_cfg=self.terrain_curriculum_difficulty,
+            z_offset=V6_LABEL_Z_OFFSET,
+        )
+        # Reuse taxonomy Viser/console plumbing without duplicating it.
+        self.taxonomy_labels = self.v6_showcase_labels
 
     def ued_training_grid(self):
         """Build the static teleport grid, intentionally separate from exhibit mode.

@@ -26,6 +26,18 @@ class TestTaskInference(unittest.TestCase):
                          "go2_bench_rma")
         self.assertEqual(pp.infer_task_from_run_name("Jul20_15-00-57_v4_him_fixed_genesis_seed1"),
                          "go2_v4_him_fixed")
+        self.assertEqual(
+            pp.infer_task_from_run_name(
+                "Jul28_14-12-45_v6_v4_frontier_oracle_genesis"
+            ),
+            "go2_v6_frontier_oracle",
+        )
+        self.assertEqual(
+            pp.infer_task_from_run_name(
+                "Jul28_12-00-00_v6_v4_frontier_dreamwaq_genesis"
+            ),
+            "go2_v6_frontier_dreamwaq",
+        )
 
     def test_ckpt_cli_mapping(self):
         self.assertEqual(pp.ckpt_filename_to_cli("best_tracking.pt"), "best_tracking")
@@ -33,6 +45,14 @@ class TestTaskInference(unittest.TestCase):
         self.assertEqual(pp.ckpt_filename_to_cli("model_3000.pt"), "3000")
         self.assertEqual(pp.prefer_checkpoint(["model_100.pt", "best_tracking.pt", "model_200.pt"]),
                          "best_tracking.pt")
+
+    def test_terrain_choices_include_v6(self):
+        self.assertIn("v6", pp.TERRAIN_CHOICES)
+        self.assertIn("v6_full", pp.TERRAIN_CHOICES)
+        self.assertIn("v6", pp.SHOWCASE_TERRAINS)
+        self.assertEqual(pp.default_num_envs_for_terrain("v6"), 1)
+        self.assertEqual(pp.default_num_envs_for_terrain("v6_full"), 1)
+        self.assertEqual(pp.default_num_envs_for_terrain("flat"), 2)
 
 
 class TestDiscovery(unittest.TestCase):

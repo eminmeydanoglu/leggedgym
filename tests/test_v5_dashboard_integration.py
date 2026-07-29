@@ -10,8 +10,11 @@ from unittest.mock import patch
 import numpy as np
 
 from legged_gym.envs.base.legged_robot import LeggedRobot
+from legged_gym.utils.frontier.curriculum import FrontierCurriculum, FrontierOutcomeBatch
+from legged_gym.utils.frontier.task_space import FrontierTaskSpec, V4FrontierTaskSpace
 from legged_gym.utils.ued import EpisodeOutcomeBatch, LPACRLEpisodeCurriculum, TaskSpace
 from lpacr.dashboard.v5_integration import (
+    FrontierDashboardBridge,
     V5DashboardBridge,
     create_v5_dashboard_bridge,
     dashboard_task_space,
@@ -97,6 +100,94 @@ def test_listener_receives_the_committed_stage_snapshot_and_observer_is_optional
     LeggedRobot.set_ued_snapshot_listener(shim, None)
     LeggedRobot._emit_ued_snapshot(shim, snapshot)
     assert received == [snapshot]
+
+
+def _frontier_env(family: int = 3):
+    space = V4FrontierTaskSpace()
+    curriculum = FrontierCurriculum(
+        space, update_interval_control_steps=10, min_episodes=4, window_size=4, seed=5
+    )
+    column = space.columns_for_family(family)[0]
+    task_id = space.encode(FrontierTaskSpec(column, 0, 0))
+    curriculum.sample(60, global_control_steps=0)
+    curriculum.observe(FrontierOutcomeBatch(
+        task_ids=np.full(4, task_id, dtype=np.int64),
+        assigned_revision=np.zeros(4, dtype=np.int64),
+        completion_revision=0,
+        episodic_returns=np.full(4, 2.0),
+        episode_lengths=np.full(4, 100, dtype=np.int64),
+        terminal_reasons=np.full(4, "timeout", dtype="U16"),
+        successes=np.ones(4, dtype=np.bool_),
+        mean_linear_errors=np.full(4, 0.2),
+        mean_yaw_errors=np.full(4, 0.1),
+    ))
+    snapshot = curriculum.advance(10)
+    env = SimpleNamespace(
+        cfg=SimpleNamespace(env=SimpleNamespace(ued_enabled=True)),
+        episode_curriculum=curriculum,
+        ued_adapter=SimpleNamespace(standstill_diagnostics=lambda: {"standstill_episode_count": 1.0}),
+    )
+    return env, curriculum, snapshot, space
+
+
+def test_frontier_arm_selects_the_v6_bridge_and_v5_arm_keeps_its_own():
+    env, _, _, _ = _frontier_env()
+    with patch("lpacr.dashboard.v5_integration.CurriculumDashboardPlugger", _Plugger):
+        bridge = create_v5_dashboard_bridge(
+            env, task="go2_v6_frontier", training_seed=1,
+            server_url="http://127.0.0.1:8765", run_id="v6-run",
+        )
+    assert isinstance(bridge, FrontierDashboardBridge)
+    assert _Plugger.instances[-1].kwargs["metadata"]["source"] == "leggedgym_frontier"
+
+    curriculum, _ = _snapshot()
+    v5_env = SimpleNamespace(
+        cfg=SimpleNamespace(env=SimpleNamespace(ued_enabled=True)),
+        episode_curriculum=curriculum,
+        ued_adapter=SimpleNamespace(standstill_diagnostics=dict),
+    )
+    with patch("lpacr.dashboard.v5_integration.CurriculumDashboardPlugger", _Plugger):
+        v5_bridge = create_v5_dashboard_bridge(
+            v5_env, task="go2_v5_lpacrl", training_seed=1,
+            server_url="http://127.0.0.1:8765", run_id="v5-run",
+        )
+    assert isinstance(v5_bridge, V5DashboardBridge)
+    assert _Plugger.instances[-1].kwargs["metadata"]["source"] == "leggedgym_v5_ued"
+
+
+def test_frontier_frame_is_cell_shaped_and_transposed_into_vx_major_order():
+    env, curriculum, snapshot, space = _frontier_env(family=3)
+    with patch("lpacr.dashboard.v5_integration.CurriculumDashboardPlugger", _Plugger):
+        bridge = FrontierDashboardBridge(
+            env=env, task="go2_v6_frontier", training_seed=1,
+            server_url="http://127.0.0.1:8765", run_id="v6-frame",
+        )
+        assert bridge.publish(snapshot)
+    step, metrics, kwargs = _Plugger.instances[-1].calls[0]
+    assert step == snapshot.global_control_steps
+
+    cells = curriculum.cell_metrics()
+    levels = space.NUM_LEVELS
+    families = space.num_families
+    for name, values in metrics.items():
+        assert values.shape == (space.num_speed_bins, families, levels), name
+        # (vx_bin, family, level) must be the (family, vx_bin, level) transpose.
+        np.testing.assert_allclose(
+            values.reshape(-1)[(0 * families + 3) * levels + 0],
+            cells[name][3, 0, 0],
+            equal_nan=True,
+            err_msg=name,
+        )
+    assert metrics["state"][0, 3, 0] == 1.0  # observed but not yet mastered
+
+    metadata = kwargs["frame_metadata"]
+    assert metadata["cell_state_names"][2] == "mastered"
+    assert metadata["standstill"]["standstill_episode_count"] == 1.0
+    assert metadata["diagnostics"]["algorithm"] == "frontier"
+    balance = metadata["replica_balance"]
+    assert len(balance["column_assignment_counts"]) == 10
+    assert sum(balance["column_assignment_counts"]) == 60
+    assert all(0.0 <= share <= 1.0 for share in balance["max_replica_share"])
 
 
 def test_handcrafted_arm_is_a_meaningful_dashboard_noop():

@@ -197,8 +197,11 @@ def build_followup_config(source_cfg: Mapping[str, Any], manifest_path: Path, ou
             raise ValueError(f"missing canonical deploy entry for follow-up method {label}")
         cfg["models"].append(dict(template[label]))
     # The frozen manifest, not the Cartesian discovery matrix, defines this
-    # phase's work budget.
-    cfg["protocol"].pop("planned_cell_budget", None)
+    # phase's *executed* cells.  Keep the declared discovery budget in the
+    # protocol fingerprint: it is provenance for the reference worlds and the
+    # V4 planner bypasses this check when a follow-up manifest is present.
+    # Removing it would make frozen MLP/Oracle references appear to belong to
+    # a different world protocol during aggregate.
     return cfg
 
 

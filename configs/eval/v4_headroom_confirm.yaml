@@ -1,0 +1,71 @@
+# V4 confirmation after the small broad discovery bank.
+#
+# This is not a new search: it remeasures the only two paired worlds whose
+# stable MLP→Oracle tracking gaps cleared both headroom thresholds in the
+# completed v4_headroom artifacts when Oracle command attainment is reported as
+# a diagnostic rather than a veto.  It is deliberately an 8-cell confirmation
+# before spending the 8-cell DreamWaQ/HIM follow-up budget.
+schema_version: v4_headroom_matrix_v1
+campaign: v4_headroom_confirm
+artifact_root: logs/eval/v4_headroom_confirm
+simulator: genesis
+training_seeds: [1, 2]
+checkpoint_inventory: configs/eval/v4_spnte_checkpoint_inventory.yaml
+execution:
+  runner_interface: v4_headroom_matrix_v1
+  status: ready_for_confirmation
+  do_not_execute_with_current_v3_eval: false
+  geometry_identity: terrain_hash_per_type_level
+
+comparison_scope: matched_mlp_vs_superset_oracle_headroom_confirmation
+models:
+  - {label: MLP, task: go2_v4_mlp, log_root: logs/go2_v4_terrain_curriculum, run_pattern: "*_v4_mlp_genesis_seed{seed}", run_paths: {1: Jul20_12-02-36_v4_mlp_genesis_seed1, 2: Jul24_15-28-10_v4_mlp_genesis_seed2}, checkpoint: best_spnte}
+  - {label: Superset-Oracle, task: go2_v4_superset_oracle, log_root: logs/go2_v4_terrain_curriculum, run_pattern: "*_v4_superset_oracle_genesis_seed{seed}", run_paths: {1: Jul20_11-49-05_v4_superset_oracle_genesis_seed1, 2: Jul24_15-28-33_v4_superset_oracle_genesis_seed2}, checkpoint: best_spnte}
+
+protocol:
+  eval_seed: 1
+  warmup_steps: 50
+  measured_steps: 500
+  replicas_per_cell: 16
+  commands: {vx: [1.0], vy: 0.0, yaw_rate: 0.0}
+  terrain:
+    generator: v4_curriculum_heightfield
+    num_rows: 10
+    num_cols: 5
+    proportions: [0.2, 0.1, 0.25, 0.25, 0.2]
+    types: [stairs_up]
+    levels: [3]
+    measure_heights: true
+  nominal_physics: {mass_kg: 0.0, com_x_m: 0.0, friction: 1.0}
+  training_support:
+    mass_kg: [-2.0, 5.0]
+    com_x_m: [-0.08, 0.08]
+    friction: [0.50, 1.25]
+  primary_isolated_axes:
+    tier: primary_nominal_headroom
+    pin_unswept_axes_to_nominal: true
+    axes:
+      - name: com_x_m
+        dr_axis: com_x
+        id: [0.08]
+        ood: [0.10]
+  secondary_combined_stress_payload:
+    tier: secondary_combined_stress_payload
+    terrain_levels: []
+    vx: []
+    scenarios: []
+  # 2 reference policies × 2 seeds × 2 fixed confirmation worlds.
+  planned_cell_budget: {primary: 8, secondary: 0, total: 8}
+
+scorecard:
+  baseline_label: MLP
+  oracle_label: Superset-Oracle
+  method_labels: []
+  headline_tier: primary_nominal_headroom
+  relative_headroom: 0.10
+  absolute_headroom: 0.10
+  fall_gate_pp: 0.05
+  # Keep this as a difficulty annotation. Do not delete observed, stable
+  # tracking headroom solely because the privileged controller is speed-limited.
+  require_oracle_speed: false
+  achieved_speed_ratio: 0.90

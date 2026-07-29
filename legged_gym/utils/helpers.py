@@ -149,7 +149,10 @@ def get_args():
     parser.add_argument('--cpu',            action='store_true', default=False, help="use CPU instead of CUDA")
     parser.add_argument('--num_envs',       type=int, default=None, help="number of parallel environments")
     parser.add_argument('--max_iterations', type=int, default=None, help="max number of training iterations")
-    parser.add_argument('--resume',         action='store_true', default=False, help="resume training from specified checkpoint")
+    init_group = parser.add_mutually_exclusive_group()
+    init_group.add_argument('--resume',     action='store_true', default=False, help="resume training from specified checkpoint")
+    init_group.add_argument('--init_checkpoint', type=str, default=None,
+                            help="strict V7 flat model_1000.pt HIM policy initialization (not resume)")
     parser.add_argument('--sync_wandb',     action='store_true', default=False, help="synchronize training log with wandb")
     parser.add_argument('--export_onnx',    action='store_true', default=False, help="export policy as onnx (besides jit)")
     parser.add_argument('--debug',          action='store_true', default=False, help="enable debug mode")
@@ -172,10 +175,27 @@ def get_args():
                         help="viewer backend: 'native' for simulator viewer, 'viser' for web-based 3D viewer")
     parser.add_argument('--viser_port',     type=int, default=8080, help="port for viser web server (only used with --viewer viser)")
     parser.add_argument('--terrain',        type=str, default='flat',
-                        choices=['flat', 'bumpy', 'course', 'rough', 'train', 'taxonomy', 'showcase'],
-                        help="play terrain override (user-chosen, independent of the model): 'flat', mildly 'bumpy', a rough 'course' with stairs, 'rough' for the full ETH curriculum terrain on ANY model, 'train' to deliberately reproduce the checkpoint's own training terrain, or 'taxonomy'/'showcase' for the LP-ACRL 6x4 exhibit (used by play.py)")
+                        choices=[
+                            'flat', 'bumpy', 'course', 'rough', 'train',
+                            'taxonomy', 'showcase',
+                            'v6', 'v6_frontier', 'frontier', 'v6_full',
+                        ],
+                        help="play terrain override (user-chosen, independent of the model): 'flat', mildly 'bumpy', a rough 'course' with stairs, 'rough' for the full ETH curriculum terrain on ANY model, 'train' to deliberately reproduce the checkpoint's own training terrain, 'taxonomy'/'showcase' for the LP-ACRL 6x4 exhibit, or the go2_v6_frontier V4 bank exhibit: 'v6'/'v6_frontier'/'frontier' (levels 0/2/4/6/9 x 6 families), 'v6_full' (all 10 levels x both replicas of every family). Every v6 exhibit renders the NOMINAL severity, i.e. the mean of training's terrain_replica_variation jitter (used by play.py)")
     parser.add_argument('--terrain_level',   type=int, default=None,
                         help="curriculum difficulty (0=easiest) for --terrain rough/train; independent of the checkpoint. Default: an easy, visible level.")
+    parser.add_argument(
+        '--v6_tile_size',
+        type=str,
+        default='play',
+        choices=['play', 'train'],
+        help=(
+            "V6/frontier showcase tile envelope only (severity formulas always "
+            "come from training cfg). 'play' (default): legacy 8×8 m tiles for "
+            "light multi-tile Viser exhibits. 'train': copy live "
+            "Go2V6FrontierCfg terrain_length/width/platform (e.g. 80 m; heavy "
+            "when stacking many tiles)."
+        ),
+    )
     parser.add_argument('--motion_file',    type=str, 
                         default=None, 
                         help="motion file to load, under resources/reference_motion")

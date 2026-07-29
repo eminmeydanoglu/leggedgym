@@ -1,0 +1,66 @@
+# V6 frontier diagnostic-only offline bank.
+#
+# Separate from the frozen V5 UED selection protocol.  Never writes
+# best_spnte.pt and is never eligible for checkpoint selection.
+schema_version: v6_frontier_diagnostic_v2
+purpose: diagnostic_only
+eligible_for_checkpoint_selection: false
+campaign: v6_frontier_diagnostic
+# v2: curriculum mesh + runtime progression off; real time_out_buf;
+# recompute obs after command pin; scene vs tile geometry hashes;
+# auto_reset=False so terminal metrics are pre-reset; artifacts under
+# frontier_diagnostic_v2/ (physically separate from v1).
+protocol_revision: v2_runtime_tile_timeout_obs_autoreset_off
+
+task: go2_v6_frontier
+simulator: genesis
+
+# Training-faithful frontier success uses these original thresholds.
+frontier_success:
+  linear_error_threshold: 0.35
+  yaw_error_threshold: 0.40
+  mastery_threshold: 0.80
+  window_size: 32
+  min_episodes: 24
+  mastery_updates: 2
+
+rollout:
+  warmup_steps: 0
+  measure_steps: 1000
+  domain_randomization: pinned_nominal
+  # Keep episode horizon equal to measure_steps so timed-out == survived 20 s.
+  episode_length_s: 20.0
+
+geometry:
+  seeds: [1, 61001, 61002]
+  training_geometry_seed: 1
+  num_rows: 10
+  num_cols: 10
+  terrain_level: 0
+  speed_bin: 0
+  speed_bin_edges: [0.2, 0.5, 1.0, 1.5, 2.0]
+  terrain_replica_variation: 0.10
+
+commands:
+  controlled_vx: [-0.45, -0.35, -0.25, 0.25, 0.35, 0.45]
+  regime_b_vy: [-0.75, -0.25, 0.25, 0.75]
+  regime_c_yaw: [-0.90, -0.50, -0.20, 0.20, 0.50, 0.90]
+  joint_seed: 62061
+  joint_pairs: 12
+  training_faithful_seed: 62062
+  training_faithful_episodes_per_column_sign: 12
+  training_faithful_segment_steps: 500
+  training_faithful_vx_signs: [-1.0, 1.0]
+  training_faithful_vx_bin: [0.2, 0.5]
+  training_faithful_vy_range: [-1.0, 1.0]
+  training_faithful_yaw_range: [-1.0, 1.0]
+
+threshold_sweep:
+  linear_error_threshold: [0.35, 0.40, 0.45]
+  yaw_error_threshold: [0.40, 0.50, 0.60, 0.70]
+  mastery_threshold: [0.70, 0.75, 0.80]
+
+artifact:
+  relative_root: frontier_diagnostic_v2
+  # Under run_dir/frontier_diagnostic_v2/model_<iteration>/
+  # Physically separate from invalidated v1 tree frontier_diagnostic/model_1500/.

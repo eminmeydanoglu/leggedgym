@@ -355,8 +355,27 @@ def _excluded_rows(worlds: Iterable[World]) -> str:
         valid, reason = _valid_headroom(world)
         if valid:
             continue
-        rows.append(f'<tr><th scope="row">{_escaped(world.name)}<small>{_escaped(world.id_ood)}</small></th><td>{_escaped(_exclusion_text(reason))}</td><td>{_fmt(world.tracking.get("MLP"))}</td><td>{_fmt(world.tracking.get("Oracle"))}</td></tr>')
-    return "\n".join(rows) or '<tr><td colspan="4">Dışlanan dünya yok.</td></tr>'
+        mlp, oracle = world.tracking.get("MLP"), world.tracking.get("Oracle")
+        absolute = None if mlp is None or oracle is None else mlp - oracle
+        relative = None if absolute is None or mlp is None or mlp <= 0 else absolute / mlp
+        reason_keys = {item.strip() for item in reason.split(";") if item.strip()}
+        has_headroom_gate = any("tracking_headroom" in item for item in reason_keys)
+        speed_limited = any("achieved_speed_ratio" in item for item in reason_keys)
+        fall_limited = any("fall_rate" in item for item in reason_keys)
+        if not has_headroom_gate and speed_limited and not fall_limited:
+            status = "Headroom var; Oracle hız-limitli"
+        elif not has_headroom_gate and fall_limited:
+            status = "Headroom var; Oracle düşme-limitli"
+        else:
+            status = "Headroom eşiğin altında"
+        rows.append(
+            f'<tr><th scope="row">{_escaped(world.name)}<small>{_escaped(world.id_ood)}</small></th>'
+            f'<td><b>{_escaped(status)}</b><small>{_escaped(_exclusion_text(reason))}</small></td>'
+            f'<td>{_fmt(mlp)}</td><td>{_fmt(oracle)}</td><td class="headroom">{_fmt(absolute)}</td>'
+            f'<td>{_pct(None if relative is None else 100.0 * relative)}</td>'
+            f'<td>{_fmt(world.speed_ratio.get("Oracle"))}</td><td>{_fmt(world.fall_rate.get("Oracle"))}</td></tr>'
+        )
+    return "\n".join(rows) or '<tr><td colspan="8">Dışlanan dünya yok.</td></tr>'
 
 
 def render_report(experiment: Experiment, worlds: Sequence[World]) -> str:
@@ -419,7 +438,7 @@ def render_report(experiment: Experiment, worlds: Sequence[World]) -> str:
   </section>
   <section aria-labelledby="excluded-title">
     <div class="section-head"><h2 id="excluded-title">Dışlanan dünyalar</h2><p>Başlık sonucu yalnızca geçerli tracking headroom üzerinde yorumlanır.</p></div>
-    <div class="table-wrap exclusions"><table><thead><tr><th>Dünya</th><th>Dışlama nedeni</th><th>MLP tracking hatası</th><th>Oracle tracking hatası</th></tr></thead><tbody>{_excluded_rows(worlds)}</tbody></table></div>
+    <div class="table-wrap exclusions"><table><caption>Her satır iki training seed'in medyanıdır. Headroom sütunları, strict headline gate'inden bağımsız olarak MLP−Oracle farkını gösterir.</caption><thead><tr><th>Dünya</th><th>Durum ve neden</th><th>MLP hata</th><th>Oracle hata</th><th>Mutlak headroom</th><th>Göreli headroom</th><th>Oracle speed ratio</th><th>Oracle fall rate</th></tr></thead><tbody>{_excluded_rows(worlds)}</tbody></table></div>
   </section>
   <section aria-labelledby="limitations-title"><div class="section-head"><h2 id="limitations-title">Sınırlılıklar</h2></div><ul class="limitations">{"".join(f"<li>{_escaped(item)}</li>" for item in limitations)}</ul></section>
   <footer>Üretici: legged_gym.scripts.eval.headroom_report · Girdi: normalize edilmiş JSON/CSV · Rapor tek dosyalı ve çevrimdışı okunabilir.</footer>

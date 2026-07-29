@@ -204,6 +204,17 @@ from legged_gym.envs.go2.go2_v5_config import (
 )
 from legged_gym.envs.go2.go2_v6_frontier_config import (
     Go2V6FrontierCfg, Go2V6FrontierCfgPPO,
+    Go2V6FrontierSupersetOracleCfg, Go2V6FrontierSupersetOracleCfgPPO,
+    Go2V6FrontierDreamwaqCfg, Go2V6FrontierDreamwaqCfgPPO,
+    Go2V6FrontierHIMFixedCfg, Go2V6FrontierHIMFixedCfgPPO,
+)
+from legged_gym.envs.go2.go2_v7_lpacrl_him_config import (
+    Go2V7FlatLPACRLHIMCfg,
+    Go2V7FlatLPACRLHIMCfgPPO,
+    Go2V7LPACRLHIMCfg,
+    Go2V7LPACRLHIMCfgPPO,
+    Go2V7UniformHIMCfg,
+    Go2V7UniformHIMCfgPPO,
 )
 
 task_registry.register("go2_bench_mlp",    Go2BenchMlp,    Go2BenchMlpCfg(),    Go2BenchCfgPPO())
@@ -262,9 +273,54 @@ task_registry.register("go2_v5_handcrafted", Go2V3Mlp, Go2V5HandcraftedCfg(), Go
 task_registry.register("go2_v5_uniform", Go2V3Mlp, Go2V5UniformCfg(), Go2V5UniformCfgPPO())
 task_registry.register("go2_v5_lpacrl", Go2V3Mlp, Go2V5LPACRLCfg(), Go2V5LPACRLCfgPPO())
 task_registry.register("go2_v5_alp", Go2V3Mlp, Go2V5ALPCfg(), Go2V5ALPCfgPPO())
+# V6 frontier arms: shared frontier curriculum substrate (10x10 V4 terrain +
+# success-gated sampler); each arm reuses the matching V3 env implementation
+# and only swaps the observation / PPO contract via config.
 task_registry.register(
     "go2_v6_frontier",
     Go2V3Mlp,
     Go2V6FrontierCfg(),
     Go2V6FrontierCfgPPO(),
+)
+task_registry.register(
+    "go2_v6_frontier_mlp",
+    Go2V3Mlp,
+    Go2V6FrontierCfg(),
+    Go2V6FrontierCfgPPO(),
+)
+task_registry.register(
+    "go2_v6_frontier_oracle",
+    Go2V3SupersetOracle,
+    Go2V6FrontierSupersetOracleCfg(),
+    Go2V6FrontierSupersetOracleCfgPPO(),
+)
+task_registry.register(
+    "go2_v6_frontier_dreamwaq",
+    Go2V3Dreamwaq,
+    Go2V6FrontierDreamwaqCfg(),
+    Go2V6FrontierDreamwaqCfgPPO(),
+)
+task_registry.register(
+    "go2_v6_frontier_him",
+    Go2V3HIMFixed,
+    Go2V6FrontierHIMFixedCfg(),
+    Go2V6FrontierHIMFixedCfgPPO(),
+)
+task_registry.register(
+    "go2_v7_lpacrl_him",
+    Go2V3HIMFixed,
+    Go2V7LPACRLHIMCfg(),
+    Go2V7LPACRLHIMCfgPPO(),
+)
+task_registry.register(
+    "go2_v7_uniform_him",
+    Go2V3HIMFixed,
+    Go2V7UniformHIMCfg(),
+    Go2V7UniformHIMCfgPPO(),
+)
+task_registry.register(
+    "go2_v7_flat_lpacrl_him",
+    Go2V3HIMFixed,
+    Go2V7FlatLPACRLHIMCfg(),
+    Go2V7FlatLPACRLHIMCfgPPO(),
 )

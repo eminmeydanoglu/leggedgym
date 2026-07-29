@@ -1,3 +1,9 @@
+import {
+  CELL_STATES, cellInk, color, extent, formatValue, groupLabels, healthSpec,
+  metricKind, paletteFor, parseGroupedLabel, pickDefaultMetric, pickDefaultSelection,
+  pickSignals, pretty, shortAxisLabel,
+} from "./atlas_core.js";
+
 const $ = (selector) => document.querySelector(selector);
 const els = {
   atlas: $("#atlas"), triptych: $("#triptych"), timelines: $("#timelines"), health: $("#health"),
@@ -15,41 +21,10 @@ const state = {
   /** True after the user changes X/Y/Panels/Filter; protects defaults from stream re-init. */
   selectionLocked: false,
 };
-// Sequential / probability: low = light, high = dark (readable on dark UI).
-const PALETTES = {
-  sequential: ["#dce8e2", "#a8c9b8", "#6fa08a", "#3f7a64", "#245445", "#132c24"],
-  probability: ["#e4eee8", "#b7d4c4", "#7fad95", "#4a8268", "#2b5a48", "#16352b"],
-  diverging: ["#3d6eb0", "#6a9fc4", "#1a2220", "#c98a52", "#e0b86a"],
-  count: ["#e2e8e4", "#b0bbb4", "#7a8a82", "#4d5a54", "#2c342f", "#161c19"],
-};
-const LABELS = {
-  terrain_type: "Terrain", terrain_level: "Level", terrain_cell: "Terrain",
-  vx_bin: "|vx|", yaw_bin: "|ωz|",
-  performance: "Performance", learning_progress: "Learning progress",
-  sampling_probability: "Sampling probability", success_rate: "Success rate",
-  sample_count: "Sample count", stage_episode_count: "Stage episodes",
-  task_assignment_count: "Assignments", task_completion_count: "Completions",
-};
-const pretty = (value) => LABELS[value] || String(value).replaceAll("_", " ");
-
-/** Prefer single map: terrain across X (many cells), velocity on Y (few bins). */
-function pickDefaultSelection(dims) {
-  const has = (name) => dims.includes(name);
-  let x = null;
-  if (has("terrain_cell")) x = "terrain_cell";
-  else if (has("terrain_type")) x = "terrain_type";
-  else if (has("terrain_level")) x = "terrain_level";
-  else x = dims[0];
-  let y = null;
-  if (has("vx_bin") && "vx_bin" !== x) y = "vx_bin";
-  else y = dims.find((d) => d !== x) || x;
-  return {
-    x,
-    y,
-    facet: "__none__",
-    filterDim: null,
-    filterIndex: 0,
-  };
+/** Names the publisher gave the categorical cell states, when it supplied any. */
+function stateNames(frame) {
+  const names = frame?.metadata?.frame?.cell_state_names;
+  return Array.isArray(names) && names.length ? names : CELL_STATES.map((entry) => entry.name);
 }
 
 function sanitizeSelection(dims) {
@@ -66,40 +41,6 @@ function sanitizeSelection(dims) {
   if (state.selection.facet === state.selection.x || state.selection.facet === state.selection.y) {
     state.selection.facet = "__none__";
   }
-}
-
-/** Parse "stairs_up · L2" style labels into hierarchical type/level. */
-function parseGroupedLabel(label) {
-  const text = String(label);
-  const match = text.match(/^(.*?)\s*[·•|]\s*(L?\d+)\s*$/i);
-  if (!match) return null;
-  const level = match[2].toUpperCase().startsWith("L") ? match[2].toUpperCase() : `L${match[2]}`;
-  return { group: match[1].trim(), leaf: level, raw: text };
-}
-
-function groupLabels(labels) {
-  const parsed = labels.map(parseGroupedLabel);
-  if (!parsed.length || !parsed.every(Boolean)) return null;
-  const groups = [];
-  let current = null;
-  parsed.forEach((item, index) => {
-    if (!current || current.name !== item.group) {
-      current = { name: item.group, start: index, end: index, leaves: [] };
-      groups.push(current);
-    }
-    current.end = index;
-    current.leaves.push(item.leaf);
-  });
-  return groups;
-}
-
-function shortAxisLabel(label, maxLen = 14) {
-  const text = String(label);
-  if (text.length <= maxLen) return text;
-  // Prefer dropping units for velocity labels.
-  const noUnit = text.replace(/\s*m\/s\s*$/i, "").trim();
-  if (noUnit.length <= maxLen) return noUnit;
-  return `${text.slice(0, maxLen - 1)}…`;
 }
 
 async function json(url, options) {
@@ -149,10 +90,12 @@ function initializeControls() {
   }
   sanitizeSelection(dims);
   updateDimensionControls();
-  const preferredMetric = ["sampling_probability", "learning_progress", "performance"]
-    .find((name) => name in frame.metrics) || Object.keys(frame.metrics)[0];
   if (!els.metric.value || !(els.metric.value in frame.metrics)) {
-    setOptions(els.metric, Object.keys(frame.metrics), preferredMetric);
+    setOptions(
+      els.metric,
+      Object.keys(frame.metrics),
+      pickDefaultMetric(Object.keys(frame.metrics)),
+    );
   } else {
     setOptions(els.metric, Object.keys(frame.metrics), els.metric.value);
   }
@@ -246,53 +189,23 @@ function sliceMatrix(frame, metric, facetIndex = null) {
   return matrix;
 }
 
-function extent(values, metric) {
-  const clean = values.flat(Infinity).filter(Number.isFinite);
-  if (!clean.length) return [0, 1];
-  if (metric === "learning_progress") {
-    const bound = Math.max(...clean.map(Math.abs), 1e-9);
-    return [-bound, bound];
+function renderColorLegend(metric, range, frame) {
+  const palette = paletteFor(metric);
+  // Categorical states get one named swatch each; a gradient would imply that
+  // "mastered" sits halfway between "frontier" and "unstable".
+  if (metricKind(metric) === "categorical") {
+    const names = stateNames(frame);
+    els.colorLegend.replaceChildren(...palette.flatMap((value, index) => {
+      const swatch = document.createElement("i");
+      swatch.className = "legend-swatch";
+      swatch.style.background = value;
+      const label = document.createElement("span");
+      label.className = "legend-label";
+      label.textContent = names[index] ?? String(index);
+      return [swatch, label];
+    }));
+    return;
   }
-  if (metric === "success_rate") return [0, 1];
-  if (metric === "sampling_probability") return [0, Math.max(...clean, 1e-9)];
-  return [Math.min(...clean), Math.max(...clean)];
-}
-
-function paletteFor(metric) {
-  if (metric === "learning_progress") return PALETTES.diverging;
-  if (metric === "sampling_probability") return PALETTES.probability;
-  if (
-    metric === "sample_count" || metric === "stage_episode_count" ||
-    metric === "task_assignment_count" || metric === "task_completion_count"
-  ) return PALETTES.count;
-  return PALETTES.sequential;
-}
-
-function color(value, range, metric) {
-  if (!Number.isFinite(value)) return "#1a2220";
-  const palette = paletteFor(metric);
-  const t = Math.max(0, Math.min(.9999, (value - range[0]) / (range[1] - range[0] || 1)));
-  const scaled = t * (palette.length - 1);
-  const a = palette[Math.floor(scaled)];
-  const b = palette[Math.ceil(scaled)];
-  const mix = scaled - Math.floor(scaled);
-  const channels = [1, 3, 5].map((offset) => Math.round(
-    parseInt(a.slice(offset, offset + 2), 16) * (1 - mix) + parseInt(b.slice(offset, offset + 2), 16) * mix
-  ));
-  return `rgb(${channels.join(",")})`;
-}
-
-/** Lightness 0–1 of a filled cell color; used to pick ink for in-cell labels. */
-function cellInk(value, range, metric) {
-  if (!Number.isFinite(value)) return "#8d9894";
-  const t = Math.max(0, Math.min(1, (value - range[0]) / (range[1] - range[0] || 1)));
-  // Probability/sequential: light cells → dark text; dark cells → light text.
-  if (metric === "learning_progress") return Math.abs(t - 0.5) < 0.12 ? "#c5cdc9" : (t > 0.5 ? "#1a1410" : "#e8ecea");
-  return t > 0.55 ? "#e8ecea" : "#152019";
-}
-
-function renderColorLegend(metric, range) {
-  const palette = paletteFor(metric);
   const start = document.createElement("span");
   start.className = "legend-label";
   start.textContent = range ? format(range[0], metric) : "Low";
@@ -305,7 +218,7 @@ function renderColorLegend(metric, range) {
     swatch.style.background = value;
     return swatch;
   });
-  if (metric === "learning_progress" && range) {
+  if (metricKind(metric) === "diverging" && range) {
     const zero = document.createElement("span");
     zero.className = "legend-label";
     zero.textContent = "0";
@@ -497,26 +410,15 @@ function drawHeatmapAxes(ctx, layout) {
   }
 }
 
-function formatCellValue(value, metric) {
-  if (!Number.isFinite(value)) return "";
-  if (metric === "sampling_probability" || metric === "success_rate") {
-    const s = value.toFixed(3);
-    return s.startsWith("0") ? s.slice(1) : s;
-  }
-  if (
-    metric === "sample_count" || metric === "stage_episode_count" ||
-    metric === "task_assignment_count" || metric === "task_completion_count"
-  ) {
-    return String(Math.round(value));
-  }
-  if (metric === "learning_progress") {
-    const sign = value > 0 ? "+" : "";
-    return `${sign}${value.toFixed(1)}`;
-  }
-  return value.toFixed(1);
-}
+const formatCellValue = (value, metric, frame) =>
+  formatValue(value, metric, { compact: true, stateNames: stateNames(frame) });
 
-function drawHeatmap(canvas, matrix, range, metric, frame, facetIndex, mode = "full") {
+/**
+ * @param {number[][]|null} frontierMask  matrix of cell states, when the run
+ *   publishes them; frontier cells get an outline so the active edge of the
+ *   curriculum is visible no matter which metric is being coloured.
+ */
+function drawHeatmap(canvas, matrix, range, metric, frame, facetIndex, mode = "full", frontierMask = null) {
   const layout = computeHeatmapLayout(frame, mode);
   const { ctx, width, height } = setupCanvas(canvas, layout.width, layout.height);
   const { xLabels, yLabels, margin } = layout;
@@ -547,8 +449,14 @@ function drawHeatmap(canvas, matrix, range, metric, frame, facetIndex, mode = "f
     const h = Math.max(0, cellH - gap * 2);
     ctx.fillStyle = color(value, range, metric);
     ctx.fillRect(x, y, w, h);
+    // 1 === CELL_STATE_FRONTIER: unlocked but not yet mastered.
+    if (frontierMask && Math.round(frontierMask[yi]?.[xi]) === 1) {
+      ctx.strokeStyle = "#d9a24c";
+      ctx.lineWidth = mode === "full" ? 1.5 : 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, w - 1), Math.max(0, h - 1));
+    }
     if (showValues) {
-      const text = formatCellValue(value, metric);
+      const text = formatCellValue(value, metric, frame);
       if (text) {
         ctx.fillStyle = cellInk(value, range, metric);
         ctx.font = valueFont;
@@ -590,35 +498,31 @@ function showDetail(event, frame, indices) {
     }
     return `<dt>${pretty(dim)}</dt><dd>${label}</dd>`;
   });
-  for (const metric of [
-    "sampling_probability", "learning_progress", "performance", "success_rate",
-    "sample_count", "stage_episode_count", "task_assignment_count", "task_completion_count",
-  ]) {
-    if (frame.metrics[metric]) {
-      const value = frame.metrics[metric][index];
-      rows.push(`<dt>${pretty(metric)}</dt><dd>${format(value, metric)}</dd>`);
-    }
+  // Lead with the decision-bearing metrics, then everything else the run
+  // publishes -- a V6 cell carries ~30 of them and all of them are inspectable.
+  const lead = [
+    "state", "sampling_probability", "success_probability", "success_probability_delta",
+    "learning_progress", "performance", "success_rate",
+  ];
+  const names = Object.keys(frame.metrics);
+  const ordered = [
+    ...lead.filter((name) => names.includes(name)),
+    ...names.filter((name) => !lead.includes(name)),
+  ];
+  for (const metric of ordered) {
+    const value = frame.metrics[metric][index];
+    rows.push(`<dt>${pretty(metric)}</dt><dd>${format(value, metric, frame)}</dd>`);
   }
   els.detail.innerHTML = `<dl>${rows.join("")}</dl>`;
   els.detail.classList.add("visible");
   els.detail.style.left = `${Math.min(event.clientX + 15, innerWidth - 235)}px`;
-  els.detail.style.top = `${Math.min(event.clientY + 15, innerHeight - 230)}px`;
+  // Measure after painting: the readout is as tall as the run has metrics.
+  const height = els.detail.offsetHeight || 230;
+  els.detail.style.top = `${Math.max(8, Math.min(event.clientY + 15, innerHeight - height - 12))}px`;
 }
 function hideDetail() { els.detail.classList.remove("visible"); }
-function format(value, metric) {
-  if (!Number.isFinite(value)) return "—";
-  if (metric === "sampling_probability" || metric === "success_rate") {
-    const s = value.toFixed(3);
-    return s.startsWith("0") ? s.slice(1) : s;
-  }
-  if (
-    metric === "sample_count" || metric === "stage_episode_count" ||
-    metric === "task_assignment_count" || metric === "task_completion_count"
-  ) {
-    return Math.round(value).toLocaleString();
-  }
-  return value.toFixed(3);
-}
+const format = (value, metric, frame) =>
+  formatValue(value, metric, { stateNames: stateNames(frame) });
 
 function renderAtlas(frame) {
   const facet = state.selection.facet;
@@ -626,8 +530,11 @@ function renderAtlas(frame) {
   const facetValues = faceted ? frame.task_space.coordinates[facet] : ["All tasks"];
   const metric = els.metric.value;
   const matrices = facetValues.map((_, i) => sliceMatrix(frame, metric, i));
+  const stateMatrices = frame.metrics.state && metric !== "state"
+    ? facetValues.map((_, i) => sliceMatrix(frame, "state", i))
+    : null;
   const range = extent(matrices, metric);
-  renderColorLegend(metric, range);
+  renderColorLegend(metric, range, frame);
   els.atlas.classList.toggle("single", !faceted);
   const figures = facetValues.map((label, i) => {
     const figure = document.createElement("article");
@@ -640,12 +547,15 @@ function renderAtlas(frame) {
   els.atlas.replaceChildren(...figures);
   // Draw immediately with explicit pixel sizes (no rAF layout race → no blur).
   figures.forEach((figure, i) => {
-    drawHeatmap(figure.querySelector("canvas"), matrices[i], range, metric, frame, i, "full");
+    drawHeatmap(
+      figure.querySelector("canvas"), matrices[i], range, metric, frame, i, "full",
+      stateMatrices ? stateMatrices[i] : null,
+    );
   });
 }
 
 function renderTriptych(frame) {
-  const signals = ["performance", "learning_progress", "sampling_probability"].filter((m) => frame.metrics[m]);
+  const signals = pickSignals(Object.keys(frame.metrics));
   const facetIndex = state.selection.facet && state.selection.facet !== "__none__" ? 0 : null;
   const figures = signals.map((metric) => {
     const figure = document.createElement("article");
@@ -997,36 +907,26 @@ function renderTimelines(frame) {
   }));
 }
 
-/** Effective sample size is a scalar per stage (adaptive_ess sampler_diagnostics),
- * not a per-cell metric -- it can't go through marginal()/drawHeatmap like the
- * task-space signals above, but drawTimeline's (series, labels) contract is
- * generic enough to reuse directly for a two-line "actual vs. target" chart. */
-function samplerHealthSeries(frames) {
-  return frames.map((item) => {
-    const diagnostics = item?.metadata?.frame?.diagnostics || {};
-    const ess = Number(diagnostics.effective_sample_size);
-    const target = Number(diagnostics.target_ess);
-    return [Number.isFinite(ess) ? ess : 0, Number.isFinite(target) ? target : 0];
-  });
-}
-
+/** Per-stage scalars from frame metadata: LP-ACRL's ESS, or V6's frontier. They
+ * aren't per-cell metrics, but drawTimeline's (series, labels) contract is
+ * generic enough to reuse directly. */
 function renderHealth() {
   const maxTimelineFrames = 360;
   const stride = Math.max(1, Math.ceil(state.frames.length / maxTimelineFrames));
   const sampledFrames = state.frames.filter((_, index) => index % stride === 0 || index === state.frames.length - 1);
   const sampledActive = Math.min(sampledFrames.length - 1, Math.round(state.index / stride));
   const steps = sampledFrames.map((item) => item.step);
+  const spec = healthSpec(sampledFrames);
   const figure = document.createElement("article");
   figure.className = "timeline-figure";
-  figure.innerHTML = `<header><strong>Effective sample size</strong><span>uniform-equivalent cell count · hover for values</span></header><canvas></canvas>`;
-  const series = samplerHealthSeries(sampledFrames);
+  figure.innerHTML = `<header><strong>${spec.title}</strong><span>${spec.subtitle}</span></header><canvas></canvas>`;
   requestAnimationFrame(() =>
     drawTimeline(
       figure.querySelector("canvas"),
-      series,
-      ["Effective sample size", "Target ESS"],
+      spec.series,
+      spec.labels,
       sampledActive,
-      { steps, yKind: "count" },
+      { steps, yKind: spec.yKind },
     )
   );
   els.health.replaceChildren(figure);

@@ -105,10 +105,13 @@ scorecard:
   baseline_label: MLP
   oracle_label: Superset-Oracle
   method_labels: []
-  # Primary cells only.  The existing score gates remain physical gates; this
-  # declaration forbids calculating one headline by mixing primary/secondary.
+  # Primary cells only. This declaration forbids calculating one headline by
+  # mixing primary/secondary worlds.
   headline_tier: primary_nominal_headroom
   relative_headroom: 0.10
   absolute_headroom: 0.10
   fall_gate_pp: 0.05
+  # Command attainment remains visible in the report, but is not a hard
+  # eligibility gate: a stable observed Oracle advantage is still headroom.
+  require_oracle_speed: false
   achieved_speed_ratio: 0.90

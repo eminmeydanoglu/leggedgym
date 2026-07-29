@@ -1357,13 +1357,14 @@ def score_cell(
     """Pure scorecard rule used by aggregation and CPU-only contract tests."""
     fall_gate = float(score_cfg["fall_gate_pp"])
     speed_gate = float(score_cfg["achieved_speed_ratio"])
+    require_oracle_speed = bool(score_cfg.get("require_oracle_speed", True))
     stable = [row for row in oracle_candidates if float(row["fall_rate"]) <= float(baseline["fall_rate"]) + fall_gate]
     speed_ok = [row for row in stable if float(row["achieved_speed_ratio"]) >= speed_gate]
     if not stable:
         return {"headline_status": "oracle_unstable", "headline_include": False, "reasons": "oracle_fall_gate"}
-    if not speed_ok:
+    if require_oracle_speed and not speed_ok:
         return {"headline_status": "oracle_speed_saturated", "headline_include": False, "reasons": "oracle_achieved_speed"}
-    oracle = min(speed_ok, key=lambda row: float(row["tracking_error"]))
+    oracle = min(speed_ok if require_oracle_speed else stable, key=lambda row: float(row["tracking_error"]))
     numerator = float(baseline["tracking_error"]) - float(method["tracking_error"])
     denominator = float(baseline["tracking_error"]) - float(oracle["tracking_error"])
     rel = denominator / max(abs(float(baseline["tracking_error"])), 1e-12)
@@ -1522,7 +1523,10 @@ def classify_v4_tracking_world(mlp: Mapping[str, Any], oracle: Mapping[str, Any]
             "tracking_exclusion_reasons": ";".join(reasons),
             "absolute_tracking_headroom": absolute_headroom, "relative_tracking_headroom": relative_headroom,
         }
-    if not np.isfinite(oracle_speed) or oracle_speed < speed_gate:
+    # In V4 discovery, command attainment describes the world's difficulty but
+    # must not erase a stable, directly observed MLP→Oracle tracking gap.  Keep
+    # the old scorecard behavior as the default for other campaigns.
+    if bool(score_cfg.get("require_oracle_speed", True)) and (not np.isfinite(oracle_speed) or oracle_speed < speed_gate):
         reasons.append(f"oracle_achieved_speed_ratio_lt_{speed_gate:.2f}")
     if not np.isfinite(absolute_headroom) or absolute_headroom < absolute_gate:
         reasons.append(f"absolute_tracking_headroom_lt_{absolute_gate:.2f}")

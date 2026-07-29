@@ -165,6 +165,12 @@ class TestV3Scorecard(unittest.TestCase):
         self.assertFalse(out["headline_include"])
         self.assertNotIn("headline_gap_closed", out)
 
+    def test_speed_diagnostic_can_keep_a_stable_oracle_headroom_world(self):
+        score_cfg = {**self.score_cfg, "require_oracle_speed": False}
+        out = score_cell(self.row(0, 1.0, 0.0), [self.row(1, 0.6, 0.0, 0.7)], self.row(1, 0.8, 0.0), score_cfg)
+        self.assertEqual(out["headline_status"], "eligible")
+        self.assertTrue(out["headline_include"])
+
     def test_method_fall_gate_retains_raw_score_but_zeroes_headline(self):
         out = score_cell(self.row(0, 1.0, 0.0), [self.row(1, 0.5, 0.0)], self.row(1, 0.6, 0.10), self.score_cfg)
         self.assertEqual(out["headline_status"], "method_fall_gated")
@@ -478,6 +484,17 @@ class TestV4WorldHeadroomAggregation(unittest.TestCase):
             )["tracking_exclusion_reasons"],
             "oracle_achieved_speed_ratio_lt_0.90;absolute_tracking_headroom_lt_0.10;relative_tracking_headroom_lt_0.10",
         )
+
+    def test_v4_can_treat_oracle_speed_as_a_diagnostic(self):
+        gates = {"fall_gate_pp": 0.05, "achieved_speed_ratio": 0.90, "absolute_headroom": 0.10,
+                 "relative_headroom": 0.10, "require_oracle_speed": False}
+        result = classify_v4_tracking_world(
+            {"tracking_error": 1.0, "fall_rate": 0.0},
+            {"tracking_error": 0.6, "fall_rate": 0.0, "achieved_speed_ratio": 0.70},
+            gates,
+        )
+        self.assertTrue(result["tracking_include"])
+        self.assertEqual(result["tracking_exclusion_reasons"], "")
 
     def test_v4_rejects_mismatched_geometry_inside_one_world_seed(self):
         with tempfile.TemporaryDirectory() as tmp:

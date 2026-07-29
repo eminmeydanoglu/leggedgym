@@ -36,12 +36,14 @@ this explicit budget; it prevents accidental duplication when a loop is
 changed.
 
 The tracking inclusion gates are the explicit `scorecard` values in the config:
-MLP and Oracle fall rate at most `fall_gate_pp`, Oracle achieved-speed ratio at
-least `achieved_speed_ratio`, absolute error headroom at least
+MLP and Oracle fall rate at most `fall_gate_pp`, absolute error headroom at least
 `absolute_headroom`, and relative headroom
 `(MLP error - Oracle error) / MLP error` at least `relative_headroom`. These
 values are part of the protocol fingerprint; changing one starts a distinct
-campaign. An adaptation method that exceeds the same fall gate remains visible
+campaign. Oracle achieved-speed ratio is retained as a world-difficulty
+diagnostic, not a V4 eligibility gate (`require_oracle_speed: false`): a stable,
+measured tracking advantage is still usable headroom even if the Oracle does
+not attain 90% of the requested speed. An adaptation method that exceeds the same fall gate remains visible
 in survival output but contributes `0` to the headline GapClosed score and is
 marked `survival-gated` in the HTML instead of receiving a misleading percent.
 

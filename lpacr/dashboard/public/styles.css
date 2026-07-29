@@ -370,6 +370,10 @@ main {
   border: 1px solid var(--hairline);
   font-size: 13px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+  /* A V6 cell carries ~30 metrics; keep the readout inside the viewport.
+     showDetail() orders them by importance, so a clip drops the least useful. */
+  max-height: 78vh;
+  overflow: hidden;
 }
 
 .detail.visible { display: block; }
