@@ -98,6 +98,8 @@ class LeggedRobot(BaseTask):
         # Optional observability hook.  The UED environment never imports the
         # dashboard: a launcher may install a callable after construction.
         self._ued_snapshot_listener = None
+        self._pending_ued_snapshots = []
+        self._pending_ued_stage_checkpoints = []
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, sim_device, headless)
         
@@ -173,6 +175,43 @@ class LeggedRobot(BaseTask):
             # would only risk repeating an I/O/configuration failure.
             self._ued_snapshot_listener = None
             print(f"[ued-dashboard] disabled after publish error: {exc}")
+
+    def flush_ued_snapshots(self) -> None:
+        """Publish closed stages after the rollout's raw GAE is available."""
+        pending = self._pending_ued_snapshots
+        self._pending_ued_snapshots = []
+        for snapshot in pending:
+            self._emit_ued_snapshot(snapshot)
+            if hasattr(self.episode_curriculum, "finalize_shadow_stage"):
+                self.episode_curriculum.finalize_shadow_stage(snapshot.stage_index)
+
+    def consume_ued_stage_checkpoints(self):
+        """Return closed-stage identities for safe post-update checkpointing."""
+        pending = self._pending_ued_stage_checkpoints
+        self._pending_ued_stage_checkpoints = []
+        return pending
+
+    def capture_ued_transition_provenance(self):
+        """Return immutable action-time identity for read-only shadow metrics."""
+        adapter = self._active_ued_adapter()
+        if adapter is None or not hasattr(self.episode_curriculum, "observe_shadow_gae"):
+            return None
+        if torch.any(adapter.active_task_id < 0):
+            raise RuntimeError("UED action transition has no active task identity")
+        stage_index = torch.full_like(adapter.active_task_id, int(self.episode_curriculum.stage_index) + 1)
+        return (
+            adapter.active_task_id.detach().clone(),
+            adapter.episode_standstill.detach().clone(),
+            stage_index,
+        )
+
+    def observe_ued_shadow_rollout(self, task_ids, standstill, raw_gae, stage_indices) -> None:
+        if self._active_ued_adapter() is None or not hasattr(self.episode_curriculum, "observe_shadow_gae"):
+            return
+        self.episode_curriculum.observe_shadow_gae(
+            task_ids.detach().cpu().numpy(), standstill.detach().cpu().numpy(),
+            raw_gae.detach().cpu().numpy(), stage_indices.detach().cpu().numpy(),
+        )
 
     def _active_ued_adapter(self):
         if getattr(self.cfg.env, "ued_enabled", False):
@@ -394,7 +433,8 @@ class LeggedRobot(BaseTask):
             self._observe_ued_outcomes(env_ids)
             snapshot = self.episode_curriculum.advance(self.common_step_counter)
             if snapshot is not None:
-                self._emit_ued_snapshot(snapshot)
+                self._pending_ued_snapshots.append(snapshot)
+                self._pending_ued_stage_checkpoints.append(snapshot)
             self._assign_ued_batch(env_ids)
         # update curriculum
         if self.cfg.terrain.curriculum and ued_adapter is None:

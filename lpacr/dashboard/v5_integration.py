@@ -169,6 +169,23 @@ class V5DashboardBridge(_DashboardBridge):
     def publish(self, snapshot: Any) -> bool:
         """Accept the actual snapshot returned by ``EpisodeCurriculum.advance``."""
         standstill = self.adapter.standstill_diagnostics()
+        gae_count = np.asarray(snapshot.gae_timestep_counts, dtype=np.float64)
+        completion_count = np.asarray(snapshot.completion_stage_episode_counts, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pvl = np.divide(snapshot.positive_gae_sums, gae_count, out=np.full_like(gae_count, np.nan), where=gae_count > 0)
+            abs_gae = np.divide(snapshot.absolute_gae_sums, gae_count, out=np.full_like(gae_count, np.nan), where=gae_count > 0)
+            positive_fraction = np.divide(snapshot.positive_gae_counts, gae_count, out=np.full_like(gae_count, np.nan), where=gae_count > 0)
+            success_rate = np.divide(snapshot.success_counts, completion_count, out=np.full_like(completion_count, np.nan), where=completion_count > 0)
+            cross_fraction = np.divide(
+                snapshot.cross_revision_completion_counts, completion_count,
+                out=np.full_like(completion_count, np.nan), where=completion_count > 0
+            )
+        pvl = np.where(gae_count > 0, pvl, np.nan)
+        abs_gae = np.where(gae_count > 0, abs_gae, np.nan)
+        positive_fraction = np.where(gae_count > 0, positive_fraction, np.nan)
+        success_rate = np.where(completion_count > 0, success_rate, np.nan)
+        frontier = 4.0 * success_rate * (1.0 - success_rate)
+        cross_fraction = np.where(completion_count > 0, cross_fraction, np.nan)
         return self.plugger.log(
             snapshot.global_control_steps,
             {
@@ -182,6 +199,31 @@ class V5DashboardBridge(_DashboardBridge):
                 "stage_episode_count": snapshot.stage_episode_counts,
                 "task_assignment_count": snapshot.task_assignment_counts,
                 "task_completion_count": snapshot.task_completion_counts,
+                "completion_stage_episode_count": snapshot.completion_stage_episode_counts,
+                "assigned_same_revision_count": snapshot.assigned_same_revision_counts,
+                "cross_revision_completion_count": snapshot.cross_revision_completion_counts,
+                "cross_revision_completion_fraction": cross_fraction,
+                "completion_age_revision_sum": snapshot.completion_age_revisions["sum"],
+                "completion_age_revision_sq_sum": snapshot.completion_age_revisions["sq_sum"],
+                "gae_timestep_count": snapshot.gae_timestep_counts,
+                "raw_gae_sum": snapshot.raw_gae_sums,
+                "raw_gae_sq_sum": snapshot.raw_gae_sq_sums,
+                "positive_gae_sum": snapshot.positive_gae_sums,
+                "positive_gae_sq_sum": snapshot.positive_gae_sq_sums,
+                "positive_gae_count": snapshot.positive_gae_counts,
+                "absolute_gae_sum": snapshot.absolute_gae_sums,
+                "absolute_gae_sq_sum": snapshot.absolute_gae_sq_sums,
+                "pvl": pvl,
+                "abs_gae": abs_gae,
+                "positive_gae_fraction": positive_fraction,
+                "success_count": snapshot.success_counts,
+                "completion_count": snapshot.completion_stage_episode_counts,
+                "timeout_count": snapshot.timeout_counts,
+                "terminal_count": snapshot.terminal_counts,
+                "episode_length_sum": snapshot.episode_length_sums,
+                "episode_length_sq_sum": snapshot.episode_length_sq_sums,
+                "success_rate": success_rate,
+                "frontier": frontier,
             },
             frame_metadata={
                 "stage_index": snapshot.stage_index,

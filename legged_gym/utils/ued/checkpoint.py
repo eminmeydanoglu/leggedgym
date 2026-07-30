@@ -10,8 +10,10 @@ from typing import Mapping
 # v3 added per-cell return uncertainty and deterministic adaptive-temperature
 # controller state. v4 adds two-stage sample-count admission, coverage
 # diagnostics, and the adaptive-controller bootstrap flag. v5 adds the
-# revision-independent rolling completion estimator's per-task rings.
-SCHEMA_VERSION = 5
+# revision-independent rolling completion estimator's per-task rings. v6 makes
+# stage admission completion-time based and persists the V5 Uniform shadow
+# metric accumulators.
+SCHEMA_VERSION = 6
 
 
 def validate_checkpoint_state(
@@ -31,6 +33,15 @@ def validate_checkpoint_state(
         "completion_ring_pos", "completion_ring_count", "rolling_ready_masks",
         "rolling_previous_return_sems", "rolling_current_return_sems",
         "task_completion_counts", "transition_occupancy", "source_label",
+        "completion_stage_episode_counts", "assigned_same_revision_counts",
+        "cross_revision_completion_counts", "completion_age_revision_sums",
+        "completion_age_revision_sq_sums", "stage_success_counts",
+        "stage_timeout_counts", "stage_terminal_counts", "stage_length_sums",
+        "stage_length_sq_sums", "shadow_stage_index", "shadow_gae_timestep_counts",
+        "shadow_raw_gae_sums", "shadow_raw_gae_sq_sums",
+        "shadow_positive_gae_sums", "shadow_positive_gae_sq_sums",
+        "shadow_positive_gae_counts", "shadow_absolute_gae_sums",
+        "shadow_absolute_gae_sq_sums",
         "effective_beta", "target_ess", "signal_quality", "has_adaptive_signal",
         "ess_guard_uniform_mix",
     }

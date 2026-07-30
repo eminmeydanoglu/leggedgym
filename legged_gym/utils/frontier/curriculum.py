@@ -455,6 +455,11 @@ class FrontierCurriculum:
         # buffer describes the stage this snapshot closes.
         self._previous_stage_completion_counts = self._stage_completion_counts
         self._stage_completion_counts = np.zeros(self._shape, dtype=np.int64)
+        # V6 does not collect the V5 raw-GAE shadow telemetry, but it shares
+        # the public StageSnapshot transport.  Keep unsupported fields empty
+        # (not fabricated measurements) so the dashboard remains fail-open.
+        zeros_i = np.zeros(self.task_space.size, dtype=np.int64)
+        zeros_f = np.zeros(self.task_space.size, dtype=np.float64)
         return StageSnapshot(
             global_control_steps=int(global_control_steps),
             stage_index=self.stage_index,
@@ -472,6 +477,23 @@ class FrontierCurriculum:
             task_assignment_counts=self._assignment_counts.copy(),
             task_completion_counts=self._completion_counts.copy(),
             transition_occupancy={},
+            completion_stage_episode_counts=flat_counts.copy(),
+            assigned_same_revision_counts=zeros_i.copy(),
+            cross_revision_completion_counts=zeros_i.copy(),
+            completion_age_revisions={"count": flat_counts.copy(), "sum": zeros_f.copy(), "sq_sum": zeros_f.copy()},
+            success_counts=zeros_i.copy(),
+            timeout_counts=zeros_i.copy(),
+            terminal_counts=zeros_i.copy(),
+            episode_length_sums=zeros_f.copy(),
+            episode_length_sq_sums=zeros_f.copy(),
+            gae_timestep_counts=zeros_i.copy(),
+            raw_gae_sums=zeros_f.copy(),
+            raw_gae_sq_sums=zeros_f.copy(),
+            positive_gae_sums=zeros_f.copy(),
+            positive_gae_sq_sums=zeros_f.copy(),
+            positive_gae_counts=zeros_i.copy(),
+            absolute_gae_sums=zeros_f.copy(),
+            absolute_gae_sq_sums=zeros_f.copy(),
             diagnostics=self.diagnostics(),
         )
 

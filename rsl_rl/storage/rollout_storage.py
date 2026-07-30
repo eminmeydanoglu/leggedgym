@@ -49,6 +49,11 @@ class RolloutStorage:
             self.action_mean: Optional[torch.Tensor] = None
             self.action_sigma: Optional[torch.Tensor] = None
             self.hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
+            # Optional, read-only V5 UED shadow telemetry provenance.  It is
+            # captured before env.step(), never enters PPO minibatches.
+            self.ued_task_ids: Optional[torch.Tensor] = None
+            self.ued_standstill: Optional[torch.Tensor] = None
+            self.ued_stage_index: Optional[torch.Tensor] = None
         
         def clear(self) -> None:
             self.__init__()  # type: ignore[misc]
@@ -80,6 +85,9 @@ class RolloutStorage:
         self.advantages: torch.Tensor = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.mu: torch.Tensor = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma: torch.Tensor = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.ued_task_ids: Optional[torch.Tensor] = None
+        self.ued_standstill: Optional[torch.Tensor] = None
+        self.ued_stage_index: Optional[torch.Tensor] = None
 
         self.num_transitions_per_env: int = num_transitions_per_env
         self.num_envs: int = num_envs
@@ -111,6 +119,23 @@ class RolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        if transition.ued_task_ids is not None:
+            if transition.ued_standstill is None or transition.ued_stage_index is None:
+                raise ValueError("incomplete UED shadow transition provenance")
+            if self.ued_task_ids is None:
+                self.ued_task_ids = torch.empty(
+                    self.num_transitions_per_env, self.num_envs, dtype=torch.long, device=self.device
+                )
+                self.ued_standstill = torch.empty(
+                    self.num_transitions_per_env, self.num_envs, dtype=torch.bool, device=self.device
+                )
+                self.ued_stage_index = torch.empty(
+                    self.num_transitions_per_env, self.num_envs, dtype=torch.long, device=self.device
+                )
+            self.ued_task_ids[self.step].copy_(transition.ued_task_ids)
+            assert self.ued_standstill is not None and self.ued_stage_index is not None
+            self.ued_standstill[self.step].copy_(transition.ued_standstill)
+            self.ued_stage_index[self.step].copy_(transition.ued_stage_index)
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -150,7 +175,18 @@ class RolloutStorage:
 
         # Compute and normalize the advantages
         self.advantages = self.returns - self.values
+        # The copy is deliberately retained before global normalization for
+        # V5 shadow metrics.  PPO below continues to consume only advantages.
+        self.raw_advantages = self.advantages.detach().clone()
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+
+    def ued_shadow_tensors(self) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return action-time UED provenance and raw GAE, if this rollout has it."""
+        if self.ued_task_ids is None:
+            return None
+        if not hasattr(self, "raw_advantages") or self.ued_standstill is None or self.ued_stage_index is None:
+            raise RuntimeError("UED shadow rollout is incomplete")
+        return self.ued_task_ids, self.ued_standstill, self.raw_advantages.squeeze(-1), self.ued_stage_index
 
     def get_statistics(self) -> Tuple[torch.Tensor, torch.Tensor]:
         done = self.dones

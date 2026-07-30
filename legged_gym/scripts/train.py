@@ -139,7 +139,13 @@ def _v7_provenance(env):
     task_space = getattr(adapter, "task_space", None)
     if task_space is None:
         return None
-    from legged_gym.utils.v7.task_space import V7SemanticTaskSpace, V7VelocityTaskSpace
+    # V5 must be able to write its provenance manifest from an intentionally
+    # minimal isolated source tree.  V7 is an optional sibling feature there,
+    # not a dependency of a non-V7 run.
+    try:
+        from legged_gym.utils.v7.task_space import V7SemanticTaskSpace, V7VelocityTaskSpace
+    except ModuleNotFoundError:
+        return None
 
     if isinstance(task_space, V7SemanticTaskSpace):
         return {
@@ -187,6 +193,24 @@ def write_run_manifest(log_dir, args, env_cfg, train_cfg, env=None):
         dr = env_cfg.domain_rand
         runner = train_cfg.runner
         git_dirty, git_diff_sha256 = _git_state()
+        curriculum = getattr(env, "episode_curriculum", None)
+        task_space = getattr(curriculum, "task_space", None)
+        curriculum_schema = None
+        if curriculum is not None:
+            # Reading this small state dictionary is provenance-only and occurs
+            # before learning; it does not sample either PPO or sampler RNG.
+            curriculum_schema = curriculum.state_dict().get("schema_version")
+        shadow_telemetry = None
+        if curriculum is not None and args.task == "go2_v5_uniform":
+            shadow_telemetry = {
+                "telemetry_schema_version": 6,
+                "checkpoint_schema_version": curriculum_schema,
+                "curriculum_config_fingerprint": getattr(curriculum, "config_fingerprint", None),
+                "task_space_fingerprint": task_space.fingerprint() if task_space is not None else None,
+                "stage_admission_semantics": "completion_stage_all_moving_v1",
+                "stage_checkpoint_contract": "even_closed_stages_after_ppo_update_v1",
+                "shadow_metrics": ["pvl_raw_gae", "absolute_raw_gae", "success_rate", "frontier"],
+            }
         manifest = {
             "task": args.task,
             "training_seed": train_cfg.seed,
@@ -222,6 +246,7 @@ def write_run_manifest(log_dir, args, env_cfg, train_cfg, env=None):
             "ued_curriculum_algorithm": getattr(
                 getattr(env_cfg, "curriculum", None), "algorithm", None
             ),
+            "v5_shadow_telemetry": shadow_telemetry,
             "initialization": getattr(args, "_init_provenance", None),
             # V7 semantic/flat task-space identity and shared physical-bank proof.
             "v7_task_space": _v7_provenance(env),

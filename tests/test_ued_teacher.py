@@ -158,13 +158,8 @@ def test_missing_task_uses_neutral_lp_without_fabricating_a_return():
     assert snapshot.transition_occupancy[f"{rev}:{rev}"] == 2 * reps
 
 
-def test_late_revision_outcomes_do_not_contaminate_open_stage_returns():
-    """Returns belong to the assignment stage, not the completion wall-clock.
-
-    Review probe: rev-0 mean 0, a rev-0 episode finishing in rev-1 with return
-    100, plus a genuine rev-1 return 0 must yield rev-1 mean 0 and LP 0 — not
-    mean 50 / LP +50 from contaminating the open stage.
-    """
+def test_late_revision_outcomes_are_admitted_to_their_completion_stage():
+    """Long, cross-revision episodes are real data for the open stage."""
     curriculum = LPACRLEpisodeCurriculum(TaskSpace(), stage_length_control_steps=10, beta=0.2, seed=11)
     _advance_with_return(curriculum, [0], [0.0], 10)
     assert curriculum.sampler_revision == 1
@@ -173,19 +168,22 @@ def test_late_revision_outcomes_do_not_contaminate_open_stage_returns():
     curriculum.observe(
         _outcomes([0], [0.0], assigned_revision=1, completion_revision=1)
     )
-    # Late rev-0 completion: provenance only, must not enter stage-1 averages.
+    # Late rev-0 completion: accepted by completion time, with provenance kept.
     curriculum.observe(
         _outcomes([0], [100.0], assigned_revision=0, completion_revision=1)
     )
     diag = curriculum.diagnostics()
     assert diag["late_outcome_count"] == 1
-    assert curriculum._stage_episode_counts[0] == 1
-    assert curriculum._stage_return_sums[0] == pytest.approx(0.0)
+    assert curriculum._stage_episode_counts[0] == 2
+    assert curriculum._stage_return_sums[0] == pytest.approx(100.0)
 
     snapshot = curriculum.advance(20)
     assert snapshot is not None
-    assert snapshot.current_returns[0] == pytest.approx(0.0)
-    assert snapshot.learning_progress[0] == pytest.approx(0.0)
+    assert snapshot.current_returns[0] == pytest.approx(50.0)
+    assert snapshot.learning_progress[0] == pytest.approx(50.0)
+    assert snapshot.completion_stage_episode_counts[0] == 2
+    assert snapshot.assigned_same_revision_counts[0] == 1
+    assert snapshot.cross_revision_completion_counts[0] == 1
     assert snapshot.transition_occupancy["1:1"] == 1
     assert snapshot.transition_occupancy["0:1"] == 1
 

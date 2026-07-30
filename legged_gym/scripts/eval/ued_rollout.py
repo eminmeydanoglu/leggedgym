@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -98,6 +99,52 @@ def _final_path(run_dir: Path, iteration: int, config: dict, bank_kind: str) -> 
     selection = config["selection"]
     return (run_dir / _artifact_dir(config, bank_kind)
             / str(selection["artifact_pattern"]).format(iteration=iteration))
+
+
+def _checkpoint_path(args: argparse.Namespace, run_dir: Path) -> Path:
+    """Resolve a periodic model or an explicit stage-boundary checkpoint.
+
+    Shadow future-gain evaluation must preserve the actual PPO iteration from
+    its stage manifest, but those files intentionally have names such as
+    ``shadow_stage_0004_iter_000417.pt`` rather than pretending to be a normal
+    save-interval ``model_417.pt``.  The explicit path keeps that provenance
+    visible while artifacts still key on the real completed iteration.
+    """
+    path = Path(args.checkpoint).expanduser() if args.checkpoint else run_dir / f"model_{args.iteration}.pt"
+    if not path.is_absolute():
+        path = (run_dir / path).resolve()
+    if not path.is_file():
+        source = "explicit checkpoint" if args.checkpoint else "periodic checkpoint"
+        raise FileNotFoundError(f"missing {source}: {path}")
+    return path
+
+
+def _stable_fingerprint(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, default=str, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _shadow_stage_provenance(args: argparse.Namespace, checkpoint_path: Path) -> dict[str, Any] | None:
+    if not args.stage_manifest:
+        return None
+    path = Path(args.stage_manifest).expanduser()
+    if not path.is_absolute():
+        path = (Path(args.run_dir) / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"missing shadow stage manifest: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if int(manifest.get("ppo_completed_iteration", -1)) != int(args.iteration):
+        raise ValueError("shadow stage manifest iteration disagrees with --iteration")
+    if str(manifest.get("checkpoint_file")) != checkpoint_path.name:
+        raise ValueError("shadow stage manifest checkpoint_file disagrees with --checkpoint")
+    return {
+        "manifest": path.name,
+        "closed_stage_index": int(manifest["closed_stage_index"]),
+        "snapshot_stage_index": int(manifest["snapshot_stage_index"]),
+        "global_control_steps": int(manifest["global_control_steps"]),
+        "curriculum_schema_version": int(manifest["curriculum_schema_version"]),
+    }
 
 
 def _git_commit() -> str:
@@ -346,9 +393,7 @@ def run_shard(args) -> None:
     v_scale = support_scale(config)
     v_scale_yaw = yaw_support_scale(config)
     run_dir = Path(args.run_dir)
-    checkpoint_path = str(run_dir / f"model_{args.iteration}.pt")
-    if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(f"missing periodic checkpoint: {checkpoint_path}")
+    checkpoint_path = _checkpoint_path(args, run_dir)
 
     shard_rows = bank[args.shard_index::args.num_shards] if args.num_shards > 1 else bank
     num_envs = args.num_envs or len(shard_rows)
@@ -359,7 +404,7 @@ def run_shard(args) -> None:
         )
 
     env, ppo_runner = build_eval_env(args.task, num_envs, args.seed, args.cpu)
-    _load_checkpoint_into(ppo_runner, checkpoint_path)
+    _load_checkpoint_into(ppo_runner, str(checkpoint_path))
     policy = ppo_runner.get_inference_policy(device=env.device)
 
     assign_rows_to_env(env, shard_rows)
@@ -372,7 +417,7 @@ def run_shard(args) -> None:
 
     payload = make_shard_payload(
         checkpoint_iteration=args.iteration,
-        checkpoint_sha256=sha256_file(checkpoint_path),
+        checkpoint_sha256=sha256_file(str(checkpoint_path)),
         bank_kind=args.bank,
         shard_index=args.shard_index,
         num_shards=args.num_shards,
@@ -380,8 +425,14 @@ def run_shard(args) -> None:
         measurements=measurements,
         rollout_steps=args.rollout_steps,
         warmup_steps=args.warmup_steps,
-        provenance=_rollout_provenance(args, config, Path(checkpoint_path)),
+        provenance=_rollout_provenance(args, config, checkpoint_path),
     )
+    provenance = payload["provenance"]
+    provenance["eval_config_fingerprint"] = _stable_fingerprint(config)
+    provenance["eval_runner_fingerprint"] = _stable_fingerprint(
+        getattr(ppo_runner, "cfg", None)
+    )
+    provenance["shadow_stage"] = _shadow_stage_provenance(args, checkpoint_path)
     out_path = _partial_path(run_dir, args.iteration, args.shard_index, args.num_shards, config, args.bank)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -391,7 +442,7 @@ def run_shard(args) -> None:
 def run_merge(args) -> None:
     config = load_config(args.config)
     run_dir = Path(args.run_dir)
-    checkpoint_path = run_dir / f"model_{args.iteration}.pt"
+    checkpoint_path = _checkpoint_path(args, run_dir)
     checkpoint_sha256 = sha256_file(str(checkpoint_path))
     payloads: list[dict[str, Any]] = []
     for shard_index in range(args.num_shards):
@@ -427,6 +478,9 @@ def run_merge(args) -> None:
     # Final artifact provenance must report the same effective horizon the
     # shards used; never re-default to the frozen config when shards were smoke.
     provenance = _rollout_provenance(args, config, checkpoint_path)
+    shard_provenance = payloads[0].get("provenance") or {}
+    for key in ("eval_config_fingerprint", "eval_runner_fingerprint", "shadow_stage"):
+        provenance[key] = shard_provenance.get(key)
     if args.rollout_steps is None and merge_rollout_steps is not None:
         provenance["rollout_steps"] = int(merge_rollout_steps)
     if args.warmup_steps is None and merge_warmup_steps is not None:
@@ -461,6 +515,11 @@ def parse_args(argv=None):
     p.add_argument("--task", required=True, help="a registered go2_v5_* task (policy/PPO hyperparameters only)")
     p.add_argument("--run_dir", required=True, help="training run directory containing model_<iteration>.pt")
     p.add_argument("--iteration", type=int, required=True)
+    p.add_argument("--checkpoint", default=None,
+                   help="explicit checkpoint path, for a shadow stage-boundary .pt; "
+                        "must correspond to --iteration")
+    p.add_argument("--stage_manifest", default=None,
+                   help="matching shadow_stage_*.json; validates stage/checkpoint/iteration provenance")
     p.add_argument("--config", default=os.path.join(LEGGED_GYM_ROOT_DIR, "configs", "eval", "v5_ued.yaml"))
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--shard_index", type=int, default=0)

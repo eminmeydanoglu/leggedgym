@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import time
 import os
+import json
 import math
 import shutil
 from collections import deque
@@ -258,6 +259,10 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
+                    if hasattr(self.env, "capture_ued_transition_provenance"):
+                        provenance = self.env.capture_ued_transition_provenance()
+                        if provenance is not None:
+                            self.alg.set_ued_transition_provenance(*provenance)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     self._update_live_viser_bridge()
                     critic_obs = privileged_obs if privileged_obs is not None else obs
@@ -287,13 +292,20 @@ class OnPolicyRunner:
                 # Learning step
                 start = stop
                 self.alg.compute_returns(critic_obs)
+                if hasattr(self.env, "observe_ued_shadow_rollout"):
+                    shadow = self.alg.storage.ued_shadow_tensors() if self.alg.storage is not None else None
+                    if shadow is not None:
+                        self.env.observe_ued_shadow_rollout(*shadow)
+                if hasattr(self.env, "flush_ued_snapshots"):
+                    self.env.flush_ued_snapshots()
             
             mean_value_loss, mean_surrogate_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
+            completed_iteration = self.completed_iteration(it)
+            self._save_ued_stage_checkpoints(completed_iteration)
             if self.log_dir is not None:
                 self.log(locals())
-            completed_iteration = self.completed_iteration(it)
             if completed_iteration % self.save_interval == 0:
                 assert self.log_dir is not None
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(completed_iteration)),
@@ -545,6 +557,75 @@ class OnPolicyRunner:
                           })
                 print(f"[eval] new best_spnte.pt @ it={it} (spnte_lin={spnte_lin:.4f})")
         return metrics
+
+    def _save_ued_stage_checkpoints(self, completed_iteration: int) -> None:
+        """Persist predeclared V5 shadow checkpoints only after a PPO update.
+
+        A curriculum stage can close during rollout collection, but saving from
+        the environment would interrupt PPO and can perturb lifecycle timing.
+        The runner therefore consumes identities after ``update`` and writes
+        the real stage/control-step/iteration correspondence beside the model.
+        """
+        env = getattr(self, "env", None)
+        consume = getattr(env, "consume_ued_stage_checkpoints", None)
+        interval = int(self.cfg.get("ued_stage_checkpoint_interval", 0) or 0)
+        if not callable(consume):
+            return
+        snapshots = consume()
+        if self.log_dir is None or interval <= 0:
+            return
+        for snapshot in snapshots:
+            closed_stage_index = int(snapshot.stage_index) - 1
+            if closed_stage_index < 0 or closed_stage_index % interval:
+                continue
+            stem = f"shadow_stage_{closed_stage_index:04d}_iter_{completed_iteration:06d}"
+            path = os.path.join(self.log_dir, stem + ".pt")
+            manifest = {
+                "schema_version": 1,
+                "purpose": "v5_uniform_shadow_future_gain_checkpoint",
+                "closed_stage_index": closed_stage_index,
+                "snapshot_stage_index": int(snapshot.stage_index),
+                "global_control_steps": int(snapshot.global_control_steps),
+                "ppo_completed_iteration": int(completed_iteration),
+                "checkpoint_file": os.path.basename(path),
+                "curriculum_schema_version": getattr(getattr(env, "episode_curriculum", None), "state_dict", lambda: {})().get("schema_version"),
+            }
+            self.save(path, iteration=completed_iteration, infos={"shadow_stage_checkpoint": manifest})
+            with open(os.path.join(self.log_dir, stem + ".json"), "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+            self._append_shadow_stage_manifest(manifest)
+
+    def _append_shadow_stage_manifest(self, stage_manifest: Dict[str, Any]) -> None:
+        """Atomically maintain the run-level stage-to-checkpoint index.
+
+        The per-stage JSON remains the source of detailed provenance; this
+        compact index lets held-out validation enumerate the exact, observed
+        stage correspondence without inferring it from filenames.
+        """
+        if self.log_dir is None:
+            return
+        path = os.path.join(self.log_dir, "run_manifest.json")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                run_manifest = json.load(handle)
+            entries = list(run_manifest.get("shadow_stage_checkpoints", []))
+            entries = [
+                entry for entry in entries
+                if int(entry.get("closed_stage_index", -1))
+                != int(stage_manifest["closed_stage_index"])
+            ]
+            entries.append(dict(stage_manifest))
+            entries.sort(key=lambda entry: int(entry["closed_stage_index"]))
+            run_manifest["shadow_stage_checkpoints"] = entries
+            temporary = path + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(run_manifest, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            # Stage checkpoint persistence is already complete.  A provenance
+            # index failure must remain fail-open, matching Atlas telemetry.
+            print(f"[ued] could not update run stage-checkpoint index: {exc}")
 
     def save(
         self,

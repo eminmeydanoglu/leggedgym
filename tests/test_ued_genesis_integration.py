@@ -172,14 +172,15 @@ class TestGenesisUEDAdapter(unittest.TestCase):
         ))
         teacher.advance(1)
         self.assertEqual(teacher.state_dict()["transition_occupancy"], {"0:2": 1})
-        # A previous-revision completion after advance is provenance-only.
+        # A previous-revision completion after advance belongs to its
+        # completion stage; assignment revision stays provenance only.
         teacher.observe(EpisodeOutcomeBatch(
             task_ids=np.array([0]), assigned_revision=np.array([0]), completion_revision=1,
             episodic_returns=np.array([100.0]), episode_lengths=np.array([10]),
             terminal_reasons=np.array(["timeout"]),
         ))
         self.assertEqual(teacher.diagnostics()["late_outcome_count"], 1)
-        self.assertEqual(int(teacher._stage_episode_counts[0]), 0)
+        self.assertEqual(int(teacher._stage_episode_counts[0]), 1)
 
 
 class TestUEDTrainingTerrain(unittest.TestCase):

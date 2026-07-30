@@ -51,6 +51,9 @@ ALLOWED_ENV_DIFF_KEYS = {
 ALLOWED_TRAIN_DIFF_KEYS = {
     # naming only, not a training-semantic parameter
     "runner.run_name",
+    # V5 Uniform shadow telemetry writes predeclared future-gain checkpoints;
+    # the sampler arms retain their frozen selection contract unchanged.
+    "runner.ued_stage_checkpoint_interval",
     # (2) command_schedule: only handcrafted_v4 has one.
     "runner.command_schedule",
 }

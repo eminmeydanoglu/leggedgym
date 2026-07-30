@@ -72,6 +72,23 @@ class StageSnapshot:
     task_assignment_counts: np.ndarray
     task_completion_counts: np.ndarray
     transition_occupancy: Mapping[str, int]
+    completion_stage_episode_counts: np.ndarray
+    assigned_same_revision_counts: np.ndarray
+    cross_revision_completion_counts: np.ndarray
+    completion_age_revisions: Mapping[str, np.ndarray]
+    success_counts: np.ndarray
+    timeout_counts: np.ndarray
+    terminal_counts: np.ndarray
+    episode_length_sums: np.ndarray
+    episode_length_sq_sums: np.ndarray
+    gae_timestep_counts: np.ndarray
+    raw_gae_sums: np.ndarray
+    raw_gae_sq_sums: np.ndarray
+    positive_gae_sums: np.ndarray
+    positive_gae_sq_sums: np.ndarray
+    positive_gae_counts: np.ndarray
+    absolute_gae_sums: np.ndarray
+    absolute_gae_sq_sums: np.ndarray
     diagnostics: Mapping[str, object]
 
 
@@ -206,8 +223,33 @@ class _FiniteEpisodeCurriculum:
         self._task_assignment_counts = np.zeros(self._n, dtype=np.int64)
         self._task_completion_counts = np.zeros(self._n, dtype=np.int64)
         self._transition_occupancy: dict[str, int] = {}
-        # Completions assigned under a previous sampler_revision (stage already
-        # closed).  Tracked for diagnostics only; never enter stage return sums.
+        # Stage admission is defined by completion time, never by assignment
+        # revision.  Keep the revision split as provenance rather than turning
+        # it into a censoring gate.
+        self._completion_stage_episode_counts = np.zeros(self._n, dtype=np.int64)
+        self._assigned_same_revision_counts = np.zeros(self._n, dtype=np.int64)
+        self._cross_revision_completion_counts = np.zeros(self._n, dtype=np.int64)
+        self._completion_age_revision_sums = np.zeros(self._n, dtype=np.float64)
+        self._completion_age_revision_sq_sums = np.zeros(self._n, dtype=np.float64)
+        self._stage_success_counts = np.zeros(self._n, dtype=np.int64)
+        self._stage_timeout_counts = np.zeros(self._n, dtype=np.int64)
+        self._stage_terminal_counts = np.zeros(self._n, dtype=np.int64)
+        self._stage_length_sums = np.zeros(self._n, dtype=np.float64)
+        self._stage_length_sq_sums = np.zeros(self._n, dtype=np.float64)
+        # These arrays are intentionally stage-local and detached from PPO.
+        # Snapshot fields retain references until the runner flushes the frame,
+        # allowing raw GAE (computed at rollout end) to join a stage that closed
+        # during that rollout without mutating a previously published frame.
+        self._shadow_stage_index = 1
+        self._shadow_gae_timestep_counts = np.zeros(self._n, dtype=np.int64)
+        self._shadow_raw_gae_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_raw_gae_sq_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_positive_gae_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_positive_gae_sq_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_positive_gae_counts = np.zeros(self._n, dtype=np.int64)
+        self._shadow_absolute_gae_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_absolute_gae_sq_sums = np.zeros(self._n, dtype=np.float64)
+        self._closed_shadow_stages: dict[int, tuple[np.ndarray, ...]] = {}
         self._late_outcome_count = 0
         # Curriculum-quality diagnostics (computed each advance, exposed via
         # ``diagnostics``).  Previous-stage sampling distribution is held in
@@ -237,6 +279,7 @@ class _FiniteEpisodeCurriculum:
             "confidence_scale": self.confidence_scale,
             "lp_estimator": self._lp_estimator,
             "rolling_completion_window": self._rolling_window_size,
+            "stage_admission_semantics": "completion_stage_all_moving_v1",
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -284,11 +327,11 @@ class _FiniteEpisodeCurriculum:
         """Ingest completed moving-task episodes.
 
         Provenance (completion counts, transition occupancy) records every
-        outcome.  The legacy ``stage`` estimator only admits outcomes assigned
-        under the currently open ``sampler_revision``.  In
-        ``rolling_completion`` mode every real moving completion is appended to
-        its task's ring, independent of assignment/completion revision; it
-        never enters either an old or the open stage accumulator.
+        outcome.  Every real moving completion belongs to the currently open
+        completion stage, independent of its assignment revision.  The
+        revision split remains available for staleness diagnostics.  In
+        ``rolling_completion`` mode every real moving completion is also
+        appended to its task's ring.
 
         Callers pass only genuinely-run episodes; never-stepped startup ghosts
         are filtered upstream at the episode-lifecycle boundary (see
@@ -337,24 +380,103 @@ class _FiniteEpisodeCurriculum:
         late = ~same_stage
         self._late_outcome_count += int(late.sum())
 
+        # Completion-stage telemetry is shared by every estimator.  This is
+        # deliberately before the estimator branch: a Uniform shadow run uses
+        # the stage clock but must not silently drop long cross-revision
+        # episodes.
+        self._completion_stage_episode_counts += np.bincount(ids, minlength=self._n)
+        self._assigned_same_revision_counts += np.bincount(ids[same_stage], minlength=self._n)
+        self._cross_revision_completion_counts += np.bincount(ids[late], minlength=self._n)
+        age = (self.sampler_revision - assigned_revisions).astype(np.float64, copy=False)
+        self._completion_age_revision_sums += np.bincount(ids, weights=age, minlength=self._n)
+        self._completion_age_revision_sq_sums += np.bincount(ids, weights=np.square(age), minlength=self._n)
+        self._stage_timeout_counts += np.bincount(
+            ids, weights=(np.asarray(outcomes.terminal_reasons) == "timeout"), minlength=self._n
+        ).astype(np.int64)
+        self._stage_success_counts += np.bincount(
+            ids, weights=(np.asarray(outcomes.terminal_reasons) == "timeout"), minlength=self._n
+        ).astype(np.int64)
+        self._stage_terminal_counts += np.bincount(
+            ids, weights=(np.asarray(outcomes.terminal_reasons) != "timeout"), minlength=self._n
+        ).astype(np.int64)
+        lengths_float = episode_lengths.astype(np.float64, copy=False)
+        self._stage_length_sums += np.bincount(ids, weights=lengths_float, minlength=self._n)
+        self._stage_length_sq_sums += np.bincount(ids, weights=np.square(lengths_float), minlength=self._n)
+
         if self._lp_estimator == "rolling_completion":
             self._append_rolling_completions(
                 ids, returns, episode_lengths.astype(np.int64, copy=False),
                 completion_global_control_steps,
             )
             return
-        admitted = same_stage
-        if not np.any(admitted):
-            return
-        admitted_ids = ids[admitted]
-        admitted_returns = returns[admitted]
         self._stage_return_sums += np.bincount(
-            admitted_ids, weights=admitted_returns, minlength=self._n
+            ids, weights=returns, minlength=self._n
         )
         self._stage_return_sq_sums += np.bincount(
-            admitted_ids, weights=np.square(admitted_returns), minlength=self._n
+            ids, weights=np.square(returns), minlength=self._n
         )
-        self._stage_episode_counts += np.bincount(admitted_ids, minlength=self._n)
+        self._stage_episode_counts += np.bincount(ids, minlength=self._n)
+
+    def observe_shadow_gae(
+        self,
+        task_ids: np.ndarray,
+        standstill: np.ndarray,
+        raw_gae: np.ndarray,
+        stage_indices: np.ndarray,
+    ) -> None:
+        """Aggregate detached, pre-normalisation GAE by action-time task id.
+
+        The runner captures identity immediately before ``env.step``.  A done
+        may replace the adapter's active task by the time this method runs, so
+        this method intentionally accepts only stored rollout provenance.
+        """
+        ids = np.asarray(task_ids)
+        still = np.asarray(standstill)
+        gae = np.asarray(raw_gae, dtype=np.float64)
+        stages = np.asarray(stage_indices)
+        if ids.shape != still.shape or ids.shape != gae.shape or ids.shape != stages.shape:
+            raise ValueError("shadow GAE fields must have identical [steps, envs] shapes")
+        if not np.issubdtype(ids.dtype, np.integer) or np.any(ids < 0) or np.any(ids >= self._n):
+            raise ValueError("shadow GAE task_ids are outside the task space")
+        if not np.issubdtype(stages.dtype, np.integer) or np.any(stages < 1):
+            raise ValueError("shadow GAE stage indices must be positive integers")
+        if np.any(~np.isfinite(gae)):
+            raise ValueError("shadow GAE requires finite raw advantages")
+        moving = ~still.astype(bool, copy=False)
+        for stage in np.unique(stages):
+            if int(stage) != self._shadow_stage_index:
+                # A stage can close during rollout collection.  Its arrays are
+                # held by the queued snapshot until the runner flushes it.
+                try:
+                    arrays = self._closed_shadow_stages[int(stage)]
+                except KeyError as exc:
+                    raise ValueError("shadow GAE refers to an unknown closed stage") from exc
+            else:
+                arrays = (
+                    self._shadow_gae_timestep_counts, self._shadow_raw_gae_sums,
+                    self._shadow_raw_gae_sq_sums, self._shadow_positive_gae_sums,
+                    self._shadow_positive_gae_sq_sums, self._shadow_positive_gae_counts,
+                    self._shadow_absolute_gae_sums, self._shadow_absolute_gae_sq_sums,
+                )
+            mask = moving & (stages == stage)
+            flat_ids = ids[mask].astype(np.int64, copy=False)
+            values = gae[mask]
+            if not len(flat_ids):
+                continue
+            arrays[0][:] += np.bincount(flat_ids, minlength=self._n)
+            arrays[1][:] += np.bincount(flat_ids, weights=values, minlength=self._n)
+            arrays[2][:] += np.bincount(flat_ids, weights=np.square(values), minlength=self._n)
+            positive = np.maximum(values, 0.0)
+            arrays[3][:] += np.bincount(flat_ids, weights=positive, minlength=self._n)
+            arrays[4][:] += np.bincount(flat_ids, weights=np.square(positive), minlength=self._n)
+            arrays[5][:] += np.bincount(flat_ids, weights=(values > 0.0), minlength=self._n).astype(np.int64)
+            absolute = np.abs(values)
+            arrays[6][:] += np.bincount(flat_ids, weights=absolute, minlength=self._n)
+            arrays[7][:] += np.bincount(flat_ids, weights=np.square(absolute), minlength=self._n)
+
+    def finalize_shadow_stage(self, stage_index: int) -> None:
+        """Release a closed stage after its atomic telemetry frame is published."""
+        self._closed_shadow_stages.pop(self._non_negative_integer(stage_index, name="shadow stage index"), None)
 
     def _append_rolling_completions(
         self,
@@ -794,6 +916,24 @@ class _FiniteEpisodeCurriculum:
             self._effective_learning_progress = effective_report
         self._observed_masks = observed
         closed_stage_episode_counts = self._stage_episode_counts.copy()
+        completion_stage_episode_counts = self._completion_stage_episode_counts.copy()
+        assigned_same_revision_counts = self._assigned_same_revision_counts.copy()
+        cross_revision_completion_counts = self._cross_revision_completion_counts.copy()
+        completion_age_revisions = {
+            "count": completion_stage_episode_counts,
+            "sum": self._completion_age_revision_sums.copy(),
+            "sq_sum": self._completion_age_revision_sq_sums.copy(),
+        }
+        closed_shadow = (
+            self._shadow_gae_timestep_counts,
+            self._shadow_raw_gae_sums,
+            self._shadow_raw_gae_sq_sums,
+            self._shadow_positive_gae_sums,
+            self._shadow_positive_gae_sq_sums,
+            self._shadow_positive_gae_counts,
+            self._shadow_absolute_gae_sums,
+            self._shadow_absolute_gae_sq_sums,
+        )
         self._previous_stage_episode_counts = closed_stage_episode_counts
         self.stage_index += 1
         self.sampler_revision += 1
@@ -805,12 +945,37 @@ class _FiniteEpisodeCurriculum:
             self._observed_masks.copy(), self._eligible_masks.copy(),
             previous_stage_episode_counts, closed_stage_episode_counts,
             self._task_assignment_counts.copy(),
-            self._task_completion_counts.copy(), dict(self._transition_occupancy), self.diagnostics(),
+            self._task_completion_counts.copy(), dict(self._transition_occupancy),
+            completion_stage_episode_counts, assigned_same_revision_counts,
+            cross_revision_completion_counts, completion_age_revisions,
+            self._stage_success_counts.copy(), self._stage_timeout_counts.copy(),
+            self._stage_terminal_counts.copy(), self._stage_length_sums.copy(),
+            self._stage_length_sq_sums.copy(), *closed_shadow, self.diagnostics(),
         )
         self._snapshots.append(snapshot)
+        self._closed_shadow_stages[self._shadow_stage_index] = closed_shadow
+        self._shadow_stage_index += 1
+        self._shadow_gae_timestep_counts = np.zeros(self._n, dtype=np.int64)
+        self._shadow_raw_gae_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_raw_gae_sq_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_positive_gae_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_positive_gae_sq_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_positive_gae_counts = np.zeros(self._n, dtype=np.int64)
+        self._shadow_absolute_gae_sums = np.zeros(self._n, dtype=np.float64)
+        self._shadow_absolute_gae_sq_sums = np.zeros(self._n, dtype=np.float64)
         self._stage_return_sums.fill(0.0)
         self._stage_return_sq_sums.fill(0.0)
         self._stage_episode_counts.fill(0)
+        self._completion_stage_episode_counts.fill(0)
+        self._assigned_same_revision_counts.fill(0)
+        self._cross_revision_completion_counts.fill(0)
+        self._completion_age_revision_sums.fill(0.0)
+        self._completion_age_revision_sq_sums.fill(0.0)
+        self._stage_success_counts.fill(0)
+        self._stage_timeout_counts.fill(0)
+        self._stage_terminal_counts.fill(0)
+        self._stage_length_sums.fill(0.0)
+        self._stage_length_sq_sums.fill(0.0)
         return snapshot
 
     def probabilities(self) -> np.ndarray:
@@ -849,6 +1014,8 @@ class _FiniteEpisodeCurriculum:
             "task_assignment_coverage": float(np.count_nonzero(self._task_assignment_counts) / self._n),
             "completed_outcome_coverage": float(np.count_nonzero(self._task_completion_counts) / self._n),
             "late_outcome_count": int(self._late_outcome_count),
+            "stage_admission_semantics": "completion_stage_all_moving_v1",
+            "cross_revision_completion_count": int(self._cross_revision_completion_counts.sum()),
             # Curriculum-quality diagnostics (see _update_curriculum_diagnostics).
             "top10_overlap_prev": float(self._top10_overlap_prev),
             "tv_distance_uniform": float(0.5 * np.sum(np.abs(p - 1.0 / self._n), dtype=np.float64)),
@@ -883,6 +1050,29 @@ class _FiniteEpisodeCurriculum:
             "rolling_current_return_sems": self._rolling_current_return_sems.copy(),
             "task_assignment_counts": self._task_assignment_counts.copy(), "task_completion_counts": self._task_completion_counts.copy(),
             "transition_occupancy": dict(self._transition_occupancy),
+            "completion_stage_episode_counts": self._completion_stage_episode_counts.copy(),
+            "assigned_same_revision_counts": self._assigned_same_revision_counts.copy(),
+            "cross_revision_completion_counts": self._cross_revision_completion_counts.copy(),
+            "completion_age_revision_sums": self._completion_age_revision_sums.copy(),
+            "completion_age_revision_sq_sums": self._completion_age_revision_sq_sums.copy(),
+            "stage_success_counts": self._stage_success_counts.copy(),
+            "stage_timeout_counts": self._stage_timeout_counts.copy(),
+            "stage_terminal_counts": self._stage_terminal_counts.copy(),
+            "stage_length_sums": self._stage_length_sums.copy(),
+            "stage_length_sq_sums": self._stage_length_sq_sums.copy(),
+            # The active shadow bucket is the next snapshot ordinal.  Derive
+            # it from the public stage counter so save/resume stays robust to
+            # legacy tests/tools that set stage_index while constructing a
+            # synthetic resume state.
+            "shadow_stage_index": self.stage_index + 1,
+            "shadow_gae_timestep_counts": self._shadow_gae_timestep_counts.copy(),
+            "shadow_raw_gae_sums": self._shadow_raw_gae_sums.copy(),
+            "shadow_raw_gae_sq_sums": self._shadow_raw_gae_sq_sums.copy(),
+            "shadow_positive_gae_sums": self._shadow_positive_gae_sums.copy(),
+            "shadow_positive_gae_sq_sums": self._shadow_positive_gae_sq_sums.copy(),
+            "shadow_positive_gae_counts": self._shadow_positive_gae_counts.copy(),
+            "shadow_absolute_gae_sums": self._shadow_absolute_gae_sums.copy(),
+            "shadow_absolute_gae_sq_sums": self._shadow_absolute_gae_sq_sums.copy(),
             "source_label": self._source_label,
             "effective_beta": self._effective_beta, "target_ess": self._target_ess,
             "signal_quality": self._signal_quality,
@@ -910,10 +1100,23 @@ class _FiniteEpisodeCurriculum:
             "eligible_masks", "previous_stage_episode_counts",
             "stage_return_sq_sums", "stage_episode_counts",
             "task_assignment_counts", "task_completion_counts",
+            "completion_stage_episode_counts", "assigned_same_revision_counts",
+            "cross_revision_completion_counts", "completion_age_revision_sums",
+            "completion_age_revision_sq_sums", "stage_success_counts",
+            "stage_timeout_counts", "stage_terminal_counts", "stage_length_sums",
+            "stage_length_sq_sums", "shadow_gae_timestep_counts",
+            "shadow_raw_gae_sums", "shadow_raw_gae_sq_sums",
+            "shadow_positive_gae_sums", "shadow_positive_gae_sq_sums",
+            "shadow_positive_gae_counts", "shadow_absolute_gae_sums",
+            "shadow_absolute_gae_sq_sums",
         )
         count_arrays = {
             "previous_stage_episode_counts", "stage_episode_counts",
             "task_assignment_counts", "task_completion_counts",
+            "completion_stage_episode_counts", "assigned_same_revision_counts",
+            "cross_revision_completion_counts", "stage_success_counts",
+            "stage_timeout_counts", "stage_terminal_counts", "shadow_gae_timestep_counts",
+            "shadow_positive_gae_counts",
         }
         loaded_arrays: dict[str, np.ndarray] = {}
         for name in arrays:
@@ -980,6 +1183,9 @@ class _FiniteEpisodeCurriculum:
         stage_index = self._non_negative_integer(state["stage_index"], name="checkpoint stage_index")
         sampler_revision = self._non_negative_integer(state["sampler_revision"], name="checkpoint sampler_revision")
         stage_start_global_steps = self._non_negative_integer(state["stage_start_global_steps"], name="checkpoint stage_start_global_steps")
+        shadow_stage_index = self._non_negative_integer(state["shadow_stage_index"], name="checkpoint shadow_stage_index")
+        if shadow_stage_index != stage_index + 1:
+            raise ValueError("checkpoint shadow_stage_index must equal stage_index + 1")
         effective_beta = float(state["effective_beta"])
         target_ess = float(state["target_ess"])
         signal_quality = float(state["signal_quality"])
@@ -1029,6 +1235,7 @@ class _FiniteEpisodeCurriculum:
         self.stage_index = stage_index
         self.sampler_revision = sampler_revision
         self.stage_start_global_steps = stage_start_global_steps
+        self._shadow_stage_index = shadow_stage_index
         self._effective_beta = effective_beta
         self._target_ess = target_ess
         self._signal_quality = signal_quality

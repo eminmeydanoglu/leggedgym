@@ -200,6 +200,16 @@ class PPO(BaseAlgorithm):
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.actor_critic.reset(dones)
+
+    def set_ued_transition_provenance(
+        self, task_ids: torch.Tensor, standstill: torch.Tensor, stage_index: torch.Tensor
+    ) -> None:
+        """Attach action-time V5 shadow provenance without changing PPO inputs."""
+        if task_ids.ndim != 1 or standstill.shape != task_ids.shape or stage_index.shape != task_ids.shape:
+            raise ValueError("UED provenance must be one scalar per environment")
+        self.transition.ued_task_ids = task_ids.detach()
+        self.transition.ued_standstill = standstill.detach()
+        self.transition.ued_stage_index = stage_index.detach()
     
     def compute_returns(self, last_critic_obs: torch.Tensor) -> None:
         """Compute returns and advantages using GAE.

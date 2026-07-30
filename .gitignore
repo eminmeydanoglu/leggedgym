@@ -95,3 +95,6 @@ lpacr/dashboard/data/
 /atlas-single-map.png
 /dashboard-fixed-lp.png
 /dashboard-full.png
+
+# Local upstream reference checkout; do not track.
+/go2_rl_gym/

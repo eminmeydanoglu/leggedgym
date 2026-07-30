@@ -229,6 +229,10 @@ class Go2V5UniformCfg(_Go2V5UedArmCfg):
 
     class curriculum(_Go2V5UedArmCfg.curriculum):
         algorithm = "uniform"
+        # The shadow experiment retains the original V5 stage clock.  Rolling
+        # completion is deliberately not enabled: all candidate signals are
+        # telemetry, never a sampler input in this arm.
+        lp_estimator = "stage"
 
 
 class Go2V5LPACRLCfg(_Go2V5UedArmCfg):
@@ -282,6 +286,9 @@ class Go2V5HandcraftedCfgPPO(Go2V5CfgPPO):
 class Go2V5UniformCfgPPO(Go2V5CfgPPO):
     class runner(Go2V5CfgPPO.runner):
         run_name = "v5_uniform" + get_simulator_suffix()
+        # Shadow checkpoints generate only future-gain targets.  They never
+        # participate in the existing best_spnte.pt selection contract.
+        ued_stage_checkpoint_interval = 2
 
 
 class Go2V5LPACRLCfgPPO(Go2V5CfgPPO):

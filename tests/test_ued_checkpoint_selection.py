@@ -583,6 +583,29 @@ class TestUEDCheckpointSelection(unittest.TestCase):
         self.assertEqual(artifact["checkpoint_iteration"], 1000)
         self.assertEqual(len(artifact["measurements"]), BANK_SIZE)
 
+    def test_shadow_stage_checkpoint_path_is_explicit_not_a_fake_periodic_name(self):
+        from argparse import Namespace
+        from legged_gym.scripts.eval.ued_rollout import _checkpoint_path, _shadow_stage_provenance
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "shadow_stage_0004_iter_000417.pt"
+            checkpoint.write_bytes(b"shadow")
+            args = Namespace(checkpoint=str(checkpoint), iteration=417)
+            self.assertEqual(_checkpoint_path(args, root), checkpoint)
+            with self.assertRaisesRegex(FileNotFoundError, "explicit checkpoint"):
+                _checkpoint_path(Namespace(checkpoint="missing.pt", iteration=417), root)
+            stage_manifest = root / "shadow_stage_0004_iter_000417.json"
+            stage_manifest.write_text(json.dumps({
+                "closed_stage_index": 4, "snapshot_stage_index": 5,
+                "global_control_steps": 10_000, "ppo_completed_iteration": 417,
+                "checkpoint_file": checkpoint.name, "curriculum_schema_version": 6,
+            }))
+            args.stage_manifest = str(stage_manifest)
+            self.assertEqual(_shadow_stage_provenance(args, checkpoint)["snapshot_stage_index"], 5)
+            args.iteration = 418
+            with self.assertRaisesRegex(ValueError, "iteration"):
+                _shadow_stage_provenance(args, checkpoint)
+
     # --- mid-window command resampling must not fire during bank scoring -------
 
     def test_bank_eval_env_disables_in_window_command_resampling(self):
