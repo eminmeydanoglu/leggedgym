@@ -972,6 +972,8 @@ class ViserViewer:
         num_levels: int = 4,
         initial_level: int = 0,
         initial_type: int = 0,
+        level_names: Optional[Sequence[str]] = None,
+        title: str = "Spawn (taxonomy)",
     ) -> None:
         """GUI to teleport the play robot onto a taxonomy tile (type × level).
 
@@ -984,13 +986,20 @@ class ViserViewer:
 
         names = list(type_names) if type_names is not None else list(TAXONOMY_TYPE_NAMES)
         n_levels = int(num_levels) if num_levels else TAXONOMY_NUM_LEVELS
-        level_options = [f"L{i}" for i in range(n_levels)]
+        # ``level_names`` lets a grid whose rows are not 0..n-1 label them by the
+        # difficulty they actually carry (the moe showcase rows are L0/L2/L4/...);
+        # the queued value stays the ROW index either way.
+        if level_names is not None:
+            level_options = [str(name) for name in level_names]
+            n_levels = len(level_options)
+        else:
+            level_options = [f"L{i}" for i in range(n_levels)]
         init_level = int(max(0, min(initial_level, n_levels - 1)))
         init_type = int(max(0, min(initial_type, len(names) - 1)))
         if not hasattr(self, "_pending_taxonomy_spawn"):
             self._pending_taxonomy_spawn = None
 
-        with self.server.gui.add_folder("Spawn (taxonomy)", expand_by_default=True):
+        with self.server.gui.add_folder(title, expand_by_default=True):
             self.server.gui.add_markdown(
                 "Teleport the robot to a **type × level** tile of the taxonomy "
                 "showcase grid."
@@ -1024,7 +1033,7 @@ class ViserViewer:
                     level = 0
                 # Queue for the main sim thread — do not reset env here.
                 self._pending_taxonomy_spawn = (int(level), int(type_idx))
-                label = f"{names[type_idx]} L{level}"
+                label = f"{names[type_idx]} {level_options[level]}"
                 status.value = f"Queued: {label}"
                 print(f"[viser] taxonomy spawn queued → {label}")
                 if self._taxonomy_spawn_callback is not None:
@@ -1051,7 +1060,8 @@ class ViserViewer:
             return
         try:
             names = list(gui["type"].options)
-            label = f"{names[int(type_idx)]} L{int(level)}" if names else f"type{type_idx} L{level}"
+            levels = list(gui["level"].options)
+            label = f"{names[int(type_idx)]} {levels[int(level)]}"
         except Exception:
             label = f"type{type_idx} L{level}"
         try:

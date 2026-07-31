@@ -725,7 +725,15 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, map_location=map_location, weights_only=False)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
-            self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+            # Playback-only checkpoints (e.g. policies imported from an external
+            # release, see legged_gym/scripts/import_go2_rl_gym_policy.py) carry
+            # weights but no optimizer moments. Skip instead of crashing; a real
+            # training resume always has them.
+            if loaded_dict.get('optimizer_state_dict') is not None:
+                self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+            else:
+                print(f"[load] {path}: no optimizer state, keeping a fresh optimizer "
+                      "(playback/eval checkpoint -- do not resume training from it)")
             # Restore auxiliary-head optimizers when present (older checkpoints
             # predate them -> skipped, keeping backward compatibility).
             for name, opt in self._aux_optimizers().items():
