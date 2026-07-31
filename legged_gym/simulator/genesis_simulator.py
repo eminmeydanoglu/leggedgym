@@ -751,7 +751,11 @@ class GenesisSimulator(Simulator):
                                     self._default_dof_pos - self._dof_pos)
             - self._kd_scale * self._d_gains * self._dof_vel
         )
-        return torques
+        # A real motor cannot exceed its stall torque, and IsaacGym-based legged_gym
+        # clips here too. Without this a large tracking error asks for a torque no
+        # actuator could produce, the joint reaches an impossible velocity, and the
+        # observation leaves the distribution the policy was trained on.
+        return torch.clip(torques, -self._torque_limits, self._torque_limits)
 
     def _init_domain_params(self):
         """ Initializes domain randomization parameters, which are used to randomize the environment."""
