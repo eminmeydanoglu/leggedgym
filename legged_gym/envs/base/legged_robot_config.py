@@ -65,6 +65,11 @@ class LeggedRobotCfg(BaseConfig):
         # the 84-cell UED training task space (flat only consumes level zero).
         ued_training_grid: bool = False
         ued_training_seed: int = 0
+        # go2_rl_gym (wty-yy) MoE-CTS curriculum grid: rows = difficulty levels,
+        # cols = terrain types, `terrain_spacing` [m] gaps between sub-terrains,
+        # IS_HARD difficulty table. Heightfield-only; wins over `curriculum`.
+        moe_grid: bool = False
+        terrain_spacing: float = 0.5 # [m] gap between sub-terrains (moe_grid only)
         # terrain types: [smooth slope, random uniform, stairs up, stairs down, discrete]
         terrain_proportions: List[float] = [0.1, 0.1, 0.35, 0.25, 0.2]
         # difficulty scaling of the terrain parameters, the actual parameters will be computed by eval() with difficulty as the variable in make_terrain() function

@@ -35,6 +35,7 @@ from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_ts import ActorCriticTS
 from .actor_critic_ee import ActorCriticEE
 from .actor_critic_cts import ActorCriticCTS
+from .actor_critic_moe_cts import ActorCriticMoECTS
 from .actor_critic_dreamwaq import ActorCriticDreamWaQ
 from .actor_critic_ts_depth import ActorCriticTSDepth
 from .him_estimator import HIMEstimator
@@ -46,6 +47,7 @@ __all__: List[str] = [
     "ActorCriticTS",
     "ActorCriticEE",
     "ActorCriticCTS",
+    "ActorCriticMoECTS",
     "ActorCriticDreamWaQ",
     "ActorCriticTSDepth",
     "HIMEstimator",

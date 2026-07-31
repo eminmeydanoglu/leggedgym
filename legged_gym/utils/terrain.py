@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from typing import Sequence
+from collections import defaultdict
 
 import numpy as np
 import trimesh
@@ -534,6 +535,64 @@ def teleport_env_to_taxonomy_tile(env, env_index: int, level: int, type_idx: int
     return True
 
 
+# ---------------------------------------------------------------------------
+# go2_moects showcase helpers. Module level so play.py can size the exhibit grid
+# without constructing a Terrain.
+# ---------------------------------------------------------------------------
+
+# Rows the go2_moects TRAINING grid uses; showcase difficulty is level / this,
+# i.e. exactly what moe_grid() passes for that level.
+MOE_TRAINING_NUM_ROWS = 10
+# Easy / medium / hardest — one robot per cell keeps the exhibit light enough
+# for laptop GPUs (the full 5-level grid was 40 envs and crawled even on a T4).
+MOE_SHOWCASE_LEVELS = (0, 4, 9)
+
+
+def moe_showcase_columns(terrain_proportions):
+    """[(terrain_name, choice)] -- one entry per DISTINCT moe terrain type.
+
+    The training grid repeats types across columns in proportion to
+    ``terrain_proportions`` (with the go2_moects config: slope x4, stairs_up x5,
+    ...). An exhibit wants each type exactly once, so walk the dispatch bands of
+    ``Terrain.make_moe_terrain`` and take the midpoint of every band with
+    non-zero width. A midpoint hits the same branch the training grid would, so
+    a showcase tile comes off the same code path as its training counterpart.
+    The slope band is split in two by the training dispatch: its halves are
+    different terrain (descending vs ascending pyramid). The exhibit keeps only
+    the ascending half -- slope_down reads almost identical to slope_up on a
+    static grid and dropping it trims a whole column of robots.
+    """
+    p = [float(np.sum(terrain_proportions[:i + 1])) for i in range(len(terrain_proportions))]
+    bands = [
+        ("wave",            0.0,               p[0]),
+        ("slope_up",        (p[0] + p[1]) / 2, p[1]),
+        ("rough_slope",     p[1],              p[2]),
+        ("stairs_up",       p[2],              p[3]),
+        ("stairs_down",     p[3],              p[4]),
+        ("obstacles",       p[4],              p[5]),
+        ("stepping_stones", p[5],              p[6]),
+        ("gap",             p[6],              p[7]),
+        ("flat",            p[7],              1.0),
+    ]
+    return [(name, 0.5 * (lo + hi)) for name, lo, hi in bands if hi - lo > 1e-9]
+
+
+def moe_showcase_num_columns(terrain_proportions):
+    return len(moe_showcase_columns(terrain_proportions))
+
+
+def format_moe_showcase_console_map(columns, levels):
+    """Readable ASCII legend for the --terrain moe exhibit."""
+    head = ("MoE-CTS terrain showcase — columns (+Y) = distinct terrain types, "
+            "rows (+X) = difficulty levels")
+    lines = [head, "=" * len(head),
+             f"  levels (X, near -> far): {', '.join('L%d' % l for l in levels)}",
+             "  columns (Y, left -> right):"]
+    for j, (name, choice) in enumerate(columns):
+        lines.append(f"    col {j:>2}  {name}")
+    return "\n".join(lines)
+
+
 class Terrain:
     def __init__(self, cfg) -> None:
 
@@ -598,6 +657,18 @@ class Terrain:
         elif is_taxonomy_terrain_cfg(cfg):
             print("Generating taxonomy showcase terrain (6 types x 4 levels)...")
             self.taxonomy_showcase()
+        elif getattr(cfg, "moe_showcase", False):
+            print(
+                "Generating MoE-CTS showcase terrain "
+                f"({cfg.num_rows} levels x {cfg.num_cols} distinct types)..."
+            )
+            self.moe_grid_showcase()
+        elif getattr(cfg, "moe_grid", False):
+            print(
+                "Generating MoE-CTS curriculum terrain grid "
+                f"({cfg.num_rows} levels x {cfg.num_cols} types, go2_rl_gym layout)..."
+            )
+            self.moe_grid()
         elif cfg.curriculum and cfg.selected:
             raise ValueError("Curriculum and selected terrain cannot be both True.")
         elif cfg.curriculum:
@@ -639,6 +710,183 @@ class Terrain:
 
                 terrain = self.make_terrain(choice, difficulty)
                 self.add_terrain_to_map(terrain, i, j)
+
+    # ------------------------------------------------------------------
+    # MoE-CTS (go2_rl_gym / wty-yy) curriculum grid.
+    # Rows = difficulty levels, columns = terrain types. Unlike curiculum()
+    # this layout keeps `terrain_spacing` meter gaps between sub-terrains and
+    # records per-column type bookkeeping (name2cols / cols2id) used for
+    # per-terrain-type command limits and metrics. Difficulty scaling is the
+    # paper's IS_HARD table. Heightfield-only (the Genesis handoff path).
+    # ------------------------------------------------------------------
+
+    def moe_grid(self):
+        # add_moe_terrain_to_map only writes the heightfield; it never collects
+        # per-tile trimeshes, so __init__'s trimesh tail would concatenate an
+        # empty mesh list. Fail here with the reason instead of there.
+        if self.type != "heightfield":
+            raise ValueError(
+                f"terrain.moe_grid requires mesh_type='heightfield', got '{self.type}'"
+            )
+        self._moe_alloc_map()
+        for j in range(self.cfg.num_cols):     # Y, terrain type
+            for i in range(self.cfg.num_rows): # X, difficulty level
+                difficulty = i / self.cfg.num_rows
+                choice = j / self.cfg.num_cols + 0.001
+                terrain = self.make_moe_terrain(choice, difficulty)
+                self.add_moe_terrain_to_map(terrain, i, j)
+            self.name2cols[terrain.terrain_name].add(j)
+            self.cols2id.append(terrain.terrain_id)
+
+    def _moe_alloc_map(self):
+        """Allocate the heightfield including inter-tile gaps + reset bookkeeping.
+
+        Shared by moe_grid() and moe_grid_showcase(): both lay tiles out with
+        `terrain_spacing` metre gaps, which the base map sizing does not account
+        for.
+        """
+        if self.type != "heightfield":
+            raise ValueError(
+                f"terrain.moe_grid requires mesh_type='heightfield', got '{self.type}'"
+            )
+        spacing = float(getattr(self.cfg, "terrain_spacing", 0.5))
+        self.spacing_pixels = int(spacing / self.cfg.horizontal_scale)
+        self.tot_cols = int(self.cfg.num_cols * self.width_per_env_pixels
+                            + max(0, self.cfg.num_cols - 1) * self.spacing_pixels) + 2 * self.border
+        self.tot_rows = int(self.cfg.num_rows * self.length_per_env_pixels
+                            + max(0, self.cfg.num_rows - 1) * self.spacing_pixels) + 2 * self.border
+        self.height_field_raw = np.zeros((self.tot_rows, self.tot_cols), dtype=np.int16)
+        self.edge_mask = np.zeros((self.tot_rows, self.tot_cols), dtype=bool)
+        self.env_origins = np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3))
+        self.name2cols = defaultdict(set)  # terrain type name -> column indices
+        self.cols2id = []                  # column index -> semantic terrain id
+
+    def moe_showcase_columns(self):
+        return moe_showcase_columns(self.cfg.terrain_proportions)
+
+    def moe_grid_showcase(self):
+        """Static exhibit: every distinct moe terrain type x a few levels.
+
+        Same tile generator, spacing and origin bookkeeping as moe_grid(); only
+        the column/row selection differs (distinct types instead of
+        proportional repeats, a handful of spaced levels instead of all 10).
+        cfg.num_rows/num_cols are authoritative and are set by the caller from
+        moe_showcase_levels / moe_showcase_columns().
+        """
+        levels = [int(x) for x in getattr(self.cfg, "moe_showcase_levels",
+                                          MOE_SHOWCASE_LEVELS)]
+        columns = self.moe_showcase_columns()
+        self._moe_alloc_map()
+        self.moe_showcase_labels = []
+        for j, (name, choice) in enumerate(columns[:self.cfg.num_cols]):
+            for i, level in enumerate(levels[:self.cfg.num_rows]):
+                difficulty = level / MOE_TRAINING_NUM_ROWS
+                terrain = self.make_moe_terrain(choice, difficulty)
+                self.add_moe_terrain_to_map(terrain, i, j)
+            self.name2cols[terrain.terrain_name].add(j)
+            self.cols2id.append(terrain.terrain_id)
+            self.moe_showcase_labels.append((j, name, tuple(levels)))
+
+    def make_moe_terrain(self, choice, difficulty):
+        """Sub-terrain table from go2_rl_gym (IS_HARD difficulty scaling).
+
+        Type ids: 0 wave, 1 slope, 2 rough_slope, 3 stairs_up, 4 stairs_down,
+        5 obstacles, 6 stepping_stones, 7 gap, 8 flat.
+        """
+        terrain = terrain_utils.SubTerrain("terrain",
+                                width=self.width_per_env_pixels,
+                                length=self.length_per_env_pixels,
+                                vertical_scale=self.cfg.vertical_scale,
+                                horizontal_scale=self.cfg.horizontal_scale)
+        # IS_HARD = True difficulty table from the paper
+        slope = 0.1 + difficulty * 0.52                     # max ~29.6 deg
+        step_height = 0.05 + 0.23 * difficulty              # max 0.257 m
+        discrete_obstacles_height = 0.05 + difficulty * 0.25  # max 0.275 m
+        stepping_stones_size = 1.5 * (1.05 - difficulty)
+        stone_distance = 0.05 if difficulty == 0 else 0.1
+        gap_size = 1. * difficulty
+        amplitude = 0.1 + 0.2 * difficulty
+
+        if choice < self.proportions[0]:
+            terrain.terrain_name = "wave"
+            terrain.terrain_id = 0
+            terrain_utils.wave_terrain(terrain, num_waves=5, amplitude=amplitude,
+                                       terrain_type=self.type)
+            terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05,
+                                                 step=0.005, downsampled_scale=0.2,
+                                                 terrain_type=self.type)
+        elif choice < self.proportions[1]:
+            terrain.terrain_name = "slope"
+            terrain.terrain_id = 1
+            if choice < (self.proportions[0] + self.proportions[1]) / 2:  # half of the band is negative slope
+                slope *= -1
+            terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.,
+                                                 terrain_type=self.type)
+        elif choice < self.proportions[2]:
+            terrain.terrain_name = "rough_slope"
+            terrain.terrain_id = 2
+            terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.,
+                                                 terrain_type=self.type)
+            terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05,
+                                                 step=0.005, downsampled_scale=0.2,
+                                                 terrain_type=self.type)
+        elif choice < self.proportions[4]:
+            terrain.terrain_name = "stairs_down"
+            terrain.terrain_id = 4
+            if choice < self.proportions[3]:
+                terrain.terrain_name = "stairs_up"
+                terrain.terrain_id = 3
+                step_height *= -1
+            terrain_utils.pyramid_stairs_terrain(terrain, step_width=0.31, step_height=step_height,
+                                                 platform_size=3., terrain_type=self.type,
+                                                 simplify_mesh=self.simplify_mesh)
+        elif choice < self.proportions[5]:
+            terrain.terrain_name = "obstacles"
+            terrain.terrain_id = 5
+            terrain_utils.discrete_obstacles_terrain(terrain, discrete_obstacles_height, 1., 2., 20,
+                                                     platform_size=3., terrain_type=self.type,
+                                                     simplify_mesh=self.simplify_mesh)
+        elif choice < self.proportions[6]:
+            terrain.terrain_name = "stepping_stones"
+            terrain.terrain_id = 6
+            terrain_utils.stepping_stones_terrain(terrain, stone_length=stepping_stones_size,
+                                                  stone_width=stepping_stones_size,
+                                                  stone_distance_x=stone_distance,
+                                                  stone_distance_y=stone_distance,
+                                                  max_height=0., platform_size=4.,
+                                                  terrain_type=self.type,
+                                                  simplify_mesh=self.simplify_mesh)
+        elif choice < self.proportions[7]:
+            terrain.terrain_name = "gap"
+            terrain.terrain_id = 7
+            terrain_utils.gap_terrain(terrain, gap_size=gap_size, platform_size=3.,
+                                      terrain_type=self.type, simplify_mesh=self.simplify_mesh)
+        else:
+            terrain.terrain_name = "flat"
+            terrain.terrain_id = 8
+            terrain_utils.pit_terrain(terrain, depth=0.0, platform_size=4.,
+                                      terrain_type=self.type, simplify_mesh=self.simplify_mesh)
+        return terrain
+
+    def add_moe_terrain_to_map(self, terrain, row, col):
+        i, j = row, col
+        start_x = self.border + i * (self.length_per_env_pixels + self.spacing_pixels)
+        end_x = start_x + self.length_per_env_pixels
+        start_y = self.border + j * (self.width_per_env_pixels + self.spacing_pixels)
+        end_y = start_y + self.width_per_env_pixels
+        self.height_field_raw[start_x:end_x, start_y:end_y] = terrain.height_field_raw
+        self.edge_mask[start_x:end_x, start_y:end_y] = terrain.edge_mask
+
+        spacing = self.spacing_pixels * self.cfg.horizontal_scale
+        env_origin_x = (i + 0.5) * self.env_length + i * spacing
+        env_origin_y = (j + 0.5) * self.env_width + j * spacing
+        # use the origin height as the max height of a 2mx2m square
+        x1 = int((self.env_length / 2. - 1) / terrain.horizontal_scale)
+        x2 = int((self.env_length / 2. + 1) / terrain.horizontal_scale)
+        y1 = int((self.env_width / 2. - 1) / terrain.horizontal_scale)
+        y2 = int((self.env_width / 2. + 1) / terrain.horizontal_scale)
+        env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2]) * terrain.vertical_scale
+        self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
 
     def selected_terrain(self):
         terrain_type = self.cfg.terrain_kwargs.pop('type')

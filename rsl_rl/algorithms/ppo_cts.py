@@ -130,9 +130,19 @@ class PPO_CTS(PPO):
         self.transition.privileged_observations = privileged_obs.detach()
         self.transition.observation_histories = obs_history.detach()
         self.transition.critic_observations = critic_obs.detach()
-        self.transition.values = self.actor_critic.evaluate(
-            self.transition.critic_observations).detach()
+        self.transition.values = self._compute_rollout_values(
+            self.transition.critic_observations, self.transition.observation_histories)
         return self.transition.actions
+
+    def _compute_rollout_values(self, critic_obs, obs_history):
+        """Value estimates stored with the rollout transition.
+
+        Split out of act() so role-aware variants (PPO_MOE_CTS) can replace the
+        value head instead of letting this implementation run first and throwing
+        its result away -- that cost a full privilege-encoder + critic forward
+        over every env, every rollout step.
+        """
+        return self.actor_critic.evaluate(critic_obs).detach()
 
     def update(self):
         mean_value_loss = 0

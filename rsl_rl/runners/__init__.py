@@ -37,6 +37,7 @@ from .ts_depth_runner import TSDepthRunner
 from .amp_runner import AMPRunner
 from .cts_amp_runner import CTS_AMP_Runner
 from .him_runner import HIMRunner
+from .moe_cts_runner import MoECTSRunner
 
 from rsl_rl.utils.runner_registry import runner_registry
 runner_registry.register("OnPolicyRunner", OnPolicyRunner)
@@ -48,3 +49,4 @@ runner_registry.register("TSDepthRunner", TSDepthRunner)
 runner_registry.register("AMPRunner", AMPRunner)
 runner_registry.register("CTS_AMP_Runner", CTS_AMP_Runner)
 runner_registry.register("HIMRunner", HIMRunner)
+runner_registry.register("MoECTSRunner", MoECTSRunner)

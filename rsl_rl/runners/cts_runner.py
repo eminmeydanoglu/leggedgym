@@ -38,8 +38,8 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 import torch
 
-from rsl_rl.algorithms import PPO_CTS
-from rsl_rl.modules import ActorCriticCTS
+from rsl_rl.algorithms import PPO_CTS, PPO_MOE_CTS  # PPO_MOE_CTS: eval() in _init_agent_and_algo
+from rsl_rl.modules import ActorCriticCTS, ActorCriticMoECTS  # ActorCriticMoECTS: eval() in _init_agent_and_algo
 from rsl_rl.env import VecEnv
 from .on_policy_runner import OnPolicyRunner
 

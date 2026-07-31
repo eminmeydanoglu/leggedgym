@@ -8,3 +8,4 @@ from .rollout_storage_cts import RolloutStorageCTS
 from .rollout_storage_dreamwaq import RolloutStorageDreamWaQ
 from .rollout_storage_ts_depth import RolloutStorageTSDepth
 from .rollout_storage_him import HIMRolloutStorage
+from .rollout_storage_moe_cts import RolloutStorageMoECTS, CriticMiniBatch

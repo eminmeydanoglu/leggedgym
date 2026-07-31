@@ -82,6 +82,12 @@ from legged_gym.envs.go2.go2_ts_depth.go2_ts_depth_config import Go2TSDepthCfg, 
 # go2_nav
 from legged_gym.envs.go2.go2_nav.go2_nav import GO2Nav
 from legged_gym.envs.go2.go2_nav.go2_nav_config import GO2NavCfg, GO2NavCfgPPO
+# go2_moects (go2_rl_gym MoE-CTS port: shared wty curriculum substrate,
+# MoE-CTS and HIM arms swappable by task name only)
+from legged_gym.envs.go2.go2_moects.go2_moects import Go2MoECTS
+from legged_gym.envs.go2.go2_moects.go2_moects_him import Go2MoECTSHIM
+from legged_gym.envs.go2.go2_moects.go2_moects_config import (
+    Go2MoECTSCfg, Go2MoECTSCfgPPO, Go2MoECTSHIMCfg, Go2MoECTSHIMCfgPPO)
 
 # tron1_pf
 from legged_gym.envs.tron1pf.tron1pf import TRON1PF
@@ -119,6 +125,8 @@ task_registry.register( "go2_dreamwaq", Go2Dreamwaq, Go2DreamwaqCfg(), Go2Dreamw
 task_registry.register( "go2_cat", Go2CaT, Go2CaTCfg(), Go2CaTCfgPPO())
 task_registry.register( "go2_ts_depth", Go2TSDepth, Go2TSDepthCfg(), Go2TSDepthCfgPPO()) # unvalidated
 task_registry.register( "go2_nav", GO2Nav, GO2NavCfg(), GO2NavCfgPPO())
+task_registry.register( "go2_moects", Go2MoECTS, Go2MoECTSCfg(), Go2MoECTSCfgPPO())
+task_registry.register( "go2_moects_him", Go2MoECTSHIM, Go2MoECTSHIMCfg(), Go2MoECTSHIMCfgPPO())
 task_registry.register( "tron1pf", TRON1PF, TRON1PFCfg(), TRON1PFCfgPPO())
 task_registry.register( "tron1pf_ee", TRON1PF_EE, TRON1PF_EECfg(), TRON1PF_EECfgPPO())
 task_registry.register( "tron1sf", TRON1SF, TRON1SFCfg(), TRON1SFCfgPPO())
