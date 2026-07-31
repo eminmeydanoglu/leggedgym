@@ -4,14 +4,14 @@
 
 ## OVERVIEW
 
-RL algorithms module with 8 PPO variants for legged robot locomotion.
+RL algorithms module with 9 PPO variants for legged robot locomotion.
 Specialized implementations for sim-to-real transfer, terrain awareness, and motion priors.
 
 ## STRUCTURE
 
 ```
 rsl_rl/
-├── algorithms/     # PPO implementations (8 variants)
+├── algorithms/     # PPO implementations (9 variants)
 ├── modules/        # Actor-critic networks per algorithm
 ├── runners/        # Training orchestration + registry
 ├── storage/        # Rollout buffers per algorithm
@@ -42,6 +42,8 @@ rsl_rl/
 | PPO_TSDepth | `algorithms/ppo_ts_depth.py` | TS with depth encoder |
 | PPO_AMP | `algorithms/ppo_amp.py` | Adversarial Motion Priors |
 | PPO_CTS_AMP | `algorithms/ppo_cts_amp.py` | Combined CTS + AMP |
+| PPO_HIM | `algorithms/ppo_him.py` | HIMLoco (hybrid internal model) |
+| PPO_MOE_CTS | `algorithms/ppo_moe_cts.py` | MoE Concurrent TS (go2_rl_gym port) |
 
 ## CODE MAP
 
@@ -141,3 +143,16 @@ checkpoint = -1           # Checkpoint ID (-1 = latest)
 **DreamWaQ (PPO_DreamWaQ)**:
 - `depth_encoder_dims`: Depth encoder network dimensions
 - `use_terrain_imagination`: Enable terrain imagination module
+
+**MoE-CTS (PPO_MOE_CTS, go2_rl_gym port)**:
+- Uses `MoECTSRunner` + `RolloutStorageMoECTS` (MoE-only subclasses; `CTSRunner`/`RolloutStorageCTS` unchanged); classes resolved via eval() in `cts_runner.py` namespace
+- Role-aware critic: `ActorCriticMoECTS.evaluate(critic_obs, obs_history=None, is_teacher=True)` — teacher envs `[0, num_teacher)` use the privilege latent, student envs the MoE history latent; critic input is `[latent.detach(), critic_obs]` in BOTH roles (reference parity), so the critic loss never trains either encoder
+- Role-aware bootstrap: `PPO_MOE_CTS.compute_returns(critic_obs, obs_history)`; rollout values also role-aware via `PPO_MOE_CTS.act()`
+- Storage contract: `RolloutStorageMoECTS.mini_batch_generator` yields `(teacher_batch, student_batch, teacher_critic, student_critic)`; critic batches are role-pure `CriticMiniBatch` namedtuples with sample-aligned `observation_histories`
+- `load_balance_coef`: Gating load-balance loss weight (default 0.01)
+- `encoder_lr`: Student MoE encoder learning rate (separate optimizer, as PPO_CTS); encoder trained ONLY by distillation + load-balance, never by RL/critic losses
+- Policy kwargs: `expert_num` (8), `student_encoder_hidden_dims` ([512,256,256]), `norm_type` ('l2norm'/'simnorm')
+- `ActorCriticMoECTS.history_encoder` is the MoE student encoder; gating weights come from `history_encoder.forward_with_weights(obs)`; plain `forward()` returns the latent only and is state-free so `PolicyExporterMoECTS` can `torch.jit.script` it
+- Actor input is `cat([latent, obs])` — latent FIRST, unlike the host `ActorCriticCTS`. This matches go2_rl_gym so its published deploy policies load; convert them with `legged_gym/scripts/import_go2_rl_gym_policy.py` (playback/eval only — they carry no teacher encoder or critic)
+- Deploy/eval contract: `MoECTSRunner.deploy_state_prefixes() == ("actor.", "history_encoder.")` and `get_eval_adapter()` returns `HistoryObsAdapter` over `act_student`
+- Telemetry (per update, TB + terminal): `Loss/latent_mse`, `Loss/load_balance`, `Loss/student_encoder_total`, `MoE/gating_entropy`, `MoE/effective_experts`, `MoE/expert_usage_{min,max,std}`, `MoE/expert_usage_{i}` per expert

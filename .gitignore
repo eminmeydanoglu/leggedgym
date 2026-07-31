@@ -65,6 +65,7 @@ Thumbs.db
 # logs
 logs
 runs
+/uhem_logs/
 
 # other
 *.egg-info

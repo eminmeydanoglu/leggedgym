@@ -52,6 +52,7 @@ task_registry.register("robot_name", RobotClass, Cfg, CfgPPO)
 4. **Genesis XML**: Must provide XML file path when using Genesis simulator
 5. **Terrain Flags**: Cannot use `curriculum=True` with `selected=True` simultaneously
 6. **IsaacLab Heightfield**: Heightfield terrain not implemented for IsaacLabSimulator
+7. **moe_grid Terrain**: With `terrain.moe_grid=True` (go2_moects tasks) keep `curriculum=False` — the builder wins the dispatch and `WtyCurriculumMixin` drives the env-side game curriculum explicitly
 
 ## PATTERNS
 

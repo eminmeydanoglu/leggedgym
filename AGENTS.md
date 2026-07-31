@@ -195,6 +195,8 @@ export SIMULATOR=isaaclab
 | go2_ts | Go2 | Teacher-Student | [2010.11251](https://arxiv.org/abs/2010.11251) |
 | go2_ee | Go2 | Explicit Estimator | [2202.05481](https://arxiv.org/abs/2202.05481) |
 | go2_cts | Go2 | Concurrent TS | [CTS](https://clearlab-sustech.github.io/concurrentTS/) |
+| go2_moects | Go2 | MoE-CTS (go2_rl_gym port) | [RSS 2026](https://github.com/wty-yy/go2_rl_gym) |
+| go2_moects_him | Go2 | HIM on go2_rl_gym substrate | [2312.11460](https://arxiv.org/abs/2312.11460) |
 | go2_dreamwaq | Go2 | DreamWaQ | [2301.10602](https://arxiv.org/abs/2301.10602) |
 | go2_cat | Go2 | Constraints as Terms | [CaT](https://constraints-as-terminations.github.io/) |
 | go2_nav | Go2 | Navigation | - |
@@ -260,5 +262,5 @@ Install [go2_deploy](https://github.com/lupinjia/go2_deploy) for MuJoCo sim2sim:
 
 - Multi-simulator support: Same code runs on Genesis/IsaacGym/IsaacLab via `SIMULATOR` env var
 - 24+ registered tasks across 5 robot types (GO2, G1, K1, TRON1PF, TRON1SF)
-- 8 PPO algorithm variants (TS, EE, CTS, AMP, DreamWaQ, etc.)
+- 9 PPO algorithm variants (TS, EE, CTS, MoE-CTS, AMP, DreamWaQ, HIM, etc.)
 - Reference: External docs at https://genesis-lr-doc.readthedocs.io/en/latest/
