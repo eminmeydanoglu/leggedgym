@@ -26,6 +26,14 @@ class TestTaskInference(unittest.TestCase):
                          "go2_bench_rma")
         self.assertEqual(pp.infer_task_from_run_name("Jul20_15-00-57_v4_him_fixed_genesis_seed1"),
                          "go2_v4_him_fixed")
+        self.assertEqual(pp.infer_task_from_run_name("Jul23_14-20-39_v5_lp_acrl_genesis_seed1"),
+                         "go2_v5_lpacrl")
+        self.assertEqual(
+            pp.infer_task_from_run_name("Jul29_13-42-14_v7_flat_lp_acrl_him_genesis_seed1"),
+            "go2_v7_flat_lpacrl_him",
+        )
+        self.assertEqual(pp.infer_task_from_run_name("wty_go2_moe_cts_137k"),
+                         "go2_moects")
         self.assertEqual(
             pp.infer_task_from_run_name(
                 "Jul28_14-12-45_v6_v4_frontier_oracle_genesis"
@@ -46,13 +54,19 @@ class TestTaskInference(unittest.TestCase):
         self.assertEqual(pp.prefer_checkpoint(["model_100.pt", "best_tracking.pt", "model_200.pt"]),
                          "best_tracking.pt")
 
-    def test_terrain_choices_include_v6(self):
-        self.assertIn("v6", pp.TERRAIN_CHOICES)
-        self.assertIn("v6_full", pp.TERRAIN_CHOICES)
-        self.assertIn("v6", pp.SHOWCASE_TERRAINS)
-        self.assertEqual(pp.default_num_envs_for_terrain("v6"), 1)
-        self.assertEqual(pp.default_num_envs_for_terrain("v6_full"), 1)
-        self.assertEqual(pp.default_num_envs_for_terrain("flat"), 2)
+    def test_terrain_choices_cover_play_py(self):
+        for t in ("moe", "taxonomy", "v6", "v6_full", "flat", "rough", "train"):
+            self.assertIn(t, pp.TERRAIN_CHOICES)
+
+    def test_num_envs_auto_by_default(self):
+        cfg = pp.PlayConfig(
+            task="go2_v4_mlp",
+            load_run="/abs/logs/go2_v4_terrain_curriculum/runA",
+            experiment="go2_v4_terrain_curriculum",
+            ckpt="best_tracking.pt",
+        )
+        self.assertIsNone(cfg.num_envs)
+        self.assertNotIn("--num_envs", pp.build_play_argv(cfg))
 
 
 class TestDiscovery(unittest.TestCase):
