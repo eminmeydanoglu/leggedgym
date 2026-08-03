@@ -53,6 +53,8 @@ task_registry.register("robot_name", RobotClass, Cfg, CfgPPO)
 5. **Terrain Flags**: Cannot use `curriculum=True` with `selected=True` simultaneously
 6. **IsaacLab Heightfield**: Heightfield terrain not implemented for IsaacLabSimulator
 7. **moe_grid Terrain**: With `terrain.moe_grid=True` (go2_moects tasks) keep `curriculum=False` — the builder wins the dispatch and `WtyCurriculumMixin` drives the env-side game curriculum explicitly
+8. **moects Termination**: `go2_moects`/`go2_moects_him` do NOT use the host termination (10 N + tilt + consecutive counter) — `WtyCurriculumMixin.check_termination` is a replacement override: same-step base-contact termination at `cfg.env.base_contact_terminate_threshold` (2.5 N; vendored go2_rl_gym uses 1.0), bodies `["base"]` only, no tilt check. Watch `Episode/termination_base_contact`
+9. **moects Friction**: Genesis MAX-combines link and ground friction, so `go2_moects`/`go2_moects_him` set `terrain.static_friction = 0.5` and `domain_rand.friction_range = [0.5, 1.5]` (per-env ratio x MJCF base 1.0 = absolute link friction) — effective friction = max(link, 0.5) = link in [0.5, 1.5], reproducing the vendored PhysX average-combine of U[0,2] with ground 1.0. Do not "fix" the range to [0, 2]: with max-combine that collapses to effective [1, 2]
 
 ## PATTERNS
 

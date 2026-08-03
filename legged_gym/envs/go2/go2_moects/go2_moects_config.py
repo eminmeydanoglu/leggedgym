@@ -22,9 +22,30 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
         # curriculum_rewards); the vendored repo hardcodes 24. Keep in sync
         # with CfgPPO.runner.num_steps_per_env.
         wty_steps_per_iteration = 24
+        # Planned total PPO iterations the ratio-based curricula resolve
+        # against (the vendored 1500/5000/20000/50000 thresholds are stored as
+        # their fractions of the vendored 150k budget). Overridden at learn()
+        # time by the runner with the effective max_iterations (incl. any
+        # --max_iterations CLI override) -- see set_wty_total_iterations.
+        # Default matches CfgPPO.runner.max_iterations below (30k).
+        curriculum_total_iterations = 30000
+        # --- termination (vendored parity; enforced by WtyCurriculumMixin.check_termination) ---
+        # Reference go2_rl_gym terminates the SAME step any termination body's
+        # contact-force norm exceeds 1.0 N (its tilt/projected-gravity check is
+        # commented out; no consecutive-failure counter). The host default is
+        # 10 N + tilt check + a fail_to_terminal_time_s (~5-step) counter.
+        # Chosen here: 2.5 N, same-step, contact-only. reference go2_rl_gym
+        # uses 1.0; threshold raised to 2.5, watch Episode/termination_base_contact.
+        base_contact_terminate_threshold = 2.5
 
     class init_state(Go2FlatCommonCfg.init_state):
         pos = [0.0, 0.0, 0.42]  # vendored; host uses 0.4
+        # Reference parity (go2_rl_gym legged_robot._reset_root_states):
+        # initial base yaw ~ U(-pi, pi) at every reset, roll/pitch exactly 0.
+        # Host consumes this scale in LeggedRobot._reset_root_states via
+        # quat_from_euler_xyz with independent per-axis uniform draws, so
+        # roll/pitch stay unrandomized (host scales remain 0.0).
+        yaw_random_scale = 3.14     # [rad]
         default_joint_angles = {  # vendored go2 (hips +-0.1, rear thighs 1.0)
             'FL_hip_joint': 0.1,   # [rad]
             'RL_hip_joint': 0.1,   # [rad]
@@ -42,8 +63,20 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
             'RR_calf_joint': -1.5,   # [rad]
         }
 
+    class asset(Go2FlatCommonCfg.asset):
+        # vendored go2_config.py terminate_after_contacts_on = ["base"]; the
+        # host Go2FlatCommonCfg default is ["base", "Head"]. Consumed by
+        # WtyCurriculumMixin.check_termination with the threshold above.
+        terminate_after_contacts_on = ["base"]
+
     class terrain(LeggedRobotCfg.terrain):
         mesh_type = 'heightfield'   # moe_grid is heightfield-only (Genesis handoff path)
+        # Ground friction 0.5 (host default 1.0). Genesis max-combines link and
+        # ground friction, so with per-env link friction U[0.5, 1.5] (see
+        # domain_rand.friction_range) the effective friction = max(link, 0.5)
+        # = link in [0.5, 1.5]. Global constant: the terrain is a single
+        # heightfield entity, per-env ground friction is not possible.
+        static_friction = 0.5
         moe_grid = True             # Phase-2 builder branch; wins over curriculum/selected
         curriculum = False          # grid layout comes from moe_grid; the env-side
                                     # game curriculum is driven by WtyCurriculumMixin
@@ -73,22 +106,27 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
         zero_cmd_prob = 0.0         # host legacy standstill draw off; the vendored
                                     # zero_command_curriculum runs inside the mixin
         # --- vendored dynamic-resample knobs (consumed by WtyCurriculumMixin) ---
+        # Iteration thresholds are RATIOS of the planned total budget
+        # (curriculum_total_iterations), not absolute iterations: the vendored
+        # values are written as their fraction of the vendored 150k budget, so
+        # shrinking the budget rescales every curriculum proportionally.
         # start training with zero commands and then gradually increase zero command probability
-        zero_command_curriculum = {'start_iter': 0, 'end_iter': 1500, 'start_value': 0.0, 'end_value': 0.1}
+        zero_command_curriculum = {'start_ratio': 0.0, 'end_ratio': 1500 / 150000,  # vendored end_iter 1500
+                                   'start_value': 0.0, 'end_value': 0.1}
         limit_ang_vel_at_zero_command_prob = 0.2  # probability of adding limiting angular velocity commands when zero command is sampled
         limit_vel_prob = 0.2        # probability of limiting linear velocity command
         limit_vel_invert_when_continuous = True  # invert the limit logic when using continuous sample limit velocity commands
         limit_vel = {"lin_vel_x": [-1, 1], "lin_vel_y": [-1, 1], "ang_vel_yaw": [-1, 0, 1]}  # sample from min/zero/max range only
         stop_heading_at_limit = True  # stop heading updates when vel is limited
         dynamic_resample_commands = True  # sample commands with low bounds
-        command_range_curriculum = [{  # command range updates at specific training iterations
-            'iter': 20000,
+        command_range_curriculum = [{  # command range updates at specific budget fractions
+            'ratio': 20000 / 150000,    # vendored iter 20000 of 150k
             'lin_vel_x': [-1.0, 1.0],   # min max [m/s]
             'lin_vel_y': [-1.0, 1.0],   # min max [m/s]
             'ang_vel_yaw': [-1.5, 1.5],  # min max [rad/s]
             'heading': [-1.57, 1.57],   # min max [rad]
         }, {
-            'iter': 50000,
+            'ratio': 50000 / 150000,    # vendored iter 50000 of 150k
             'lin_vel_x': [-2.0, 2.0],   # min max [m/s]
             'lin_vel_y': [-1.0, 1.0],   # min max [m/s]
             'ang_vel_yaw': [-2.0, 2.0],  # min max [rad/s]
@@ -122,9 +160,21 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
                                         # _reward_feet_contact_forces, not in scales)
         min_legs_distance = 0.1         # vendored parity (only used by
                                         # _reward_legs_distance, not in scales)
-        curriculum_rewards = [  # iteration-based reward scale ramping (WtyCurriculumMixin)
-            {'reward_name': 'lin_vel_z', 'start_iter': 0, 'end_iter': 1500, 'start_value': 1.0, 'end_value': 0.0},
-            {'reward_name': 'correct_base_height', 'start_iter': 0, 'end_iter': 5000, 'start_value': 1.0, 'end_value': 10.0},
+        # Per-link contact-force norm [N] above which _reward_collision counts
+        # a penalized-body (thigh/calf) hit (consumed by the WtyCurriculumMixin
+        # override; strict >). Reference go2_rl_gym (PhysX) = 0.1; host
+        # LeggedRobot hardcodes 10.0. Chosen = 0.1 (reference parity), justified
+        # by measurement on Genesis (tests/_measure_collision_force_noise.py,
+        # tmp/collision_force_stats.json): the contact-force noise floor on
+        # non-contacting links is exactly 0.0 N (p99.9 = 0.0 -- 6/8 penalized
+        # links never read nonzero in 512k samples; every nonzero rear-calf
+        # reading was traced via robot.get_contacts() to genuine ground contact
+        # with planeLink at z~0, see tmp/rear_calf_contact_probe.json), so the
+        # PhysX-era worry that 0.1 sits inside solver noise does not apply.
+        collision_force_threshold = 0.1
+        curriculum_rewards = [  # ratio-based reward scale ramping (WtyCurriculumMixin)
+            {'reward_name': 'lin_vel_z', 'start_ratio': 0.0, 'end_ratio': 1500 / 150000, 'start_value': 1.0, 'end_value': 0.0},
+            {'reward_name': 'correct_base_height', 'start_ratio': 0.0, 'end_ratio': 5000 / 150000, 'start_value': 1.0, 'end_value': 10.0},
         ]
         tracking_sigma = 0.25  # tracking reward = exp(-error^2/sigma)
         dynamic_sigma = {  # linear interpolation of sigma based on command velocity;
@@ -155,7 +205,20 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
 
     class domain_rand(LeggedRobotCfg.domain_rand):
         randomize_friction = True
-        friction_range = [0.0, 2.0]             # vendored
+        # Target EFFECTIVE friction: per-env U[0.5, 1.5], drawn once at startup.
+        # Reference go2_rl_gym (PhysX): absolute link friction U[0, 2],
+        # average-combined with the ground (1.0) -> effective ~[0.5, 1.5].
+        # Genesis instead max-combines link and ground friction
+        # (genesis/engine/solvers/rigid/collider/contact.py:
+        # contact_friction = max(link_base * link_ratio, ground, 1e-2)) and the
+        # host draws link_ratio ~ U[friction_range] per env (same ratio on all
+        # links) against the MJCF base friction (go2.xml = 1.0), i.e. the range
+        # below is the ABSOLUTE per-env link friction. With the terrain at 0.5
+        # (terrain.static_friction), effective = max(link, 0.5) = link, so
+        # [0.5, 1.5] reproduces the reference's effective distribution.
+        # (The vendored [0, 2] with ground 1.0 collapsed to effective [1, 2].)
+        # Flag off -> ratio stays at its 1.0 default -> effective friction 1.0.
+        friction_range = [0.5, 1.5]
         randomize_base_mass = True
         added_mass_range = [-1., 1.]            # vendored
         randomize_com_displacement = True       # vendored randomize_base_com
@@ -166,14 +229,45 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
         kp_range = [0.9, 1.1]
         kd_range = [0.9, 1.1]
         push_robots = True
+        # Vendored push semantics (go2_rl_gym legged_robot._push_robots): each
+        # env is pushed when its OWN episode step hits push_interval (200 steps
+        # = 4s at dt 0.02, no global lockstep), and the push OVERWRITES the
+        # world-frame xy lin vel U(+-0.4) and all ang vel U(+-0.6) instead of
+        # the host's additive xy-only push (WtyCurriculumMixin +
+        # GenesisSimulator.push_robots_overwrite).
         push_interval_s = 4                     # vendored
         max_push_vel_xy = 0.4                   # vendored
-        randomize_ctrl_delay = True             # vendored randomize_action_delay (0~20ms = 0-1 control steps)
-        ctrl_delay_step_range = [0, 1]
-        # Vendored DR without a host equivalent (kept off, documented for parity):
-        # randomize_link_mass x[0.9,1.1], randomize_motor_zero_offset +-0.035,
-        # randomize_motor_strength [0.8,1.2], max_push_ang_vel 0.6,
-        # randomize_restitution [0.0,0.5] (Genesis _randomize_restitution is a no-op).
+        max_push_ang_vel = 0.6                  # vendored
+        randomize_ctrl_delay = True             # vendored randomize_action_delay
+        # Reference-faithful delay model (go2_rl_gym legged_robot.step): the
+        # delay is re-drawn PER ENV EVERY CONTROL STEP, uniform over {0..4} SIM
+        # SUBSTEPS (sim dt 0.005 s x decimation 4 -> 0/5/10/15/20 ms), and the
+        # simulator blends the previous/current action targets within the
+        # control step (first k substeps keep the previous target, the
+        # remaining 4-k use the current one).  This fixes the earlier port's
+        # per-episode queue draw from {0,1} control steps: same ~10 ms mean,
+        # but the reference's history encoder sees per-step delay jitter while
+        # the old port saw a constant per-episode latency.  Genesis-only.
+        ctrl_delay_mode = "substep"
+        ctrl_delay_substep_range = [0, 4]
+        ctrl_delay_step_range = [0, 1]          # legacy queue units; unused in substep mode
+        randomize_motor_strength = True         # vendored
+        motor_strength_range = [0.8, 1.2]       # vendored
+        randomize_motor_zero_offset = True      # vendored
+        motor_zero_offset_range = [-0.035, 0.035]   # vendored [rad]
+        # Vendored DR deliberately NOT ported (conscious ablation, documented for parity):
+        # * randomize_link_mass x[0.9,1.1] (go2_rl_gym legged_robot.py:392-397):
+        #   IsaacGym asset props are SHARED across envs, so the reference's draw
+        #   has shape (1, num_bodies-1) -- one run-level static scaling seen
+        #   identically by every env, i.e. zero per-env entropy and nothing for
+        #   the MoE gate or the history encoder to identify. The per-env part of
+        #   the body-inertia axis is already covered by randomize_base_mass
+        #   (+-1 kg) and randomize_com_displacement (+-3 cm). Genesis could do a
+        #   true per-env version via set_mass_shift(envs_idx=...), but that would
+        #   be a deliberate DIVERGENCE from the reference (and would need the new
+        #   latent exposed to the oracle), so it belongs in a DR-widening
+        #   experiment, not in the parity port.
+        # * randomize_restitution [0.0, 0.5] (Genesis _randomize_restitution is a no-op).
 
     class normalization(LeggedRobotCfg.normalization):
         class obs_scales(LeggedRobotCfg.normalization.obs_scales):
@@ -223,6 +317,9 @@ class Go2MoECTSCfgPPO(LeggedRobotCTSCfgPPO):
 
     class algorithm(LeggedRobotCTSCfgPPO.algorithm):
         load_balance_coef = 0.01    # vendored (PPO_MOE_CTS gating load-balance loss)
+        teacher_env_ratio = 0.75    # vendored; MUST match Go2MoECTSCfg.env.teacher_env_ratio --
+                                    # PPO_MOE_CTS derives the interleaved teacher/student
+                                    # env split from it and asserts the two agree
         encoder_lr = 1.e-3          # vendored student_encoder_learning_rate
         num_encoder_epochs = 1
         # Remaining vendored PPO hyperparams match the host template defaults:
@@ -236,7 +333,9 @@ class Go2MoECTSCfgPPO(LeggedRobotCTSCfgPPO):
         num_steps_per_env = 24      # keep in sync with env.wty_steps_per_iteration
         experiment_name = 'go2_moects'
         run_name = 'moe_cts' + get_simulator_suffix()
-        max_iterations = 150000     # vendored
+        max_iterations = 30000      # budget decision (vendored 150k ~= 92 h on
+                                    # UHeM A100; curricula are ratio-based and
+                                    # rescale with this -- see env.curriculum_total_iterations)
         save_interval = 500         # vendored
 
 
@@ -276,5 +375,6 @@ class Go2MoECTSHIMCfgPPO(LeggedRobotHIMCfgPPO):
         experiment_name = 'go2_moects'
         run_name = 'him' + get_simulator_suffix()
         num_steps_per_env = 24      # keep in sync with env.wty_steps_per_iteration
-        max_iterations = 150000     # match the MoE-CTS arm (vendored budget)
+        max_iterations = 30000      # match the MoE-CTS arm budget decision
+                                    # (ratio-based curricula rescale with it)
         save_interval = 500

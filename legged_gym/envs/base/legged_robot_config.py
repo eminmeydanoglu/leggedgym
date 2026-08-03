@@ -220,6 +220,18 @@ class LeggedRobotCfg(BaseConfig):
         # apply random delay to the actions to simulate latency in the control loop
         randomize_ctrl_delay: bool = False
         ctrl_delay_step_range: List[int] = [0, 1] # number of control steps
+        # ctrl_delay_mode selects the delay model when randomize_ctrl_delay is on:
+        #   "queue"   - legacy host model: ONE delay per episode drawn from
+        #               ctrl_delay_step_range (control steps), applied via an
+        #               action queue. Default; unchanged for all existing tasks.
+        #   "substep" - reference go2_rl_gym model: per-env delay RE-DRAWN EVERY
+        #               control step, uniform over ctrl_delay_substep_range (SIM
+        #               SUBSTEP units); the simulator blends the previous and
+        #               current action targets inside the decimation loop
+        #               (first k substeps use the previous target, the remaining
+        #               decimation-k the current one). Genesis simulator only.
+        ctrl_delay_mode: str = "queue"
+        ctrl_delay_substep_range: List[int] = [0, 4] # sim substeps, inclusive; must satisfy 0 <= min <= max <= control.decimation
         # randomize PD gains by a scale factor
         randomize_pd_gain: bool = False
         # draw ONE gain scale per env and broadcast to all DOF (vs per-DOF draws),
@@ -228,6 +240,18 @@ class LeggedRobotCfg(BaseConfig):
         pd_gain_scalar: bool = False
         kp_range: List[float] = [0.8, 1.2]
         kd_range: List[float] = [0.8, 1.2]
+        # per-env, per-DOF motor strength multiplier, re-drawn at every reset and
+        # applied to the CLIPPED torque right before it is sent to the solver
+        # (go2_rl_gym legged_robot.py:198-203 draw, :79-81 apply). Off -> the
+        # multiplier stays at its nominal 1.0 and the torque path is unchanged.
+        randomize_motor_strength: bool = False
+        motor_strength_range: List[float] = [0.8, 1.2]
+        # per-env, per-DOF motor zero-calibration error [rad], re-drawn at every
+        # reset and added to the PD POSITION TARGET, not to the measured dof_pos
+        # (go2_rl_gym legged_robot.py:204-206 draw, :612 apply). Off -> the offset
+        # stays at 0.0 and the torque path is unchanged.
+        randomize_motor_zero_offset: bool = False
+        motor_zero_offset_range: List[float] = [-0.035, 0.035]
         # ! Randomizing joint armature/friction/damping in Genesis require batching dofs/links info, 
         # ! which will slow the simulation greatly.
         # ! It is recommended to keep them false. If needed, please use it in IsaacGym and IsaacLab.

@@ -1,11 +1,17 @@
 # Curriculum, command-resampling and reward machinery ported from go2_rl_gym
 # (wty-yy, vendored IsaacGym fork of unitree_rl_gym, RSS 2026 MoE locomotion
 # paper) onto the host LeggedRobot contract. Shared by both go2_moects arms
-# (MoE-CTS and HIM): the mixin never defines ``compute_observations``, so each
-# arm keeps its own observation contract.
+# (MoE-CTS and HIM): the mixin only WRAPS ``compute_observations`` (control-rate
+# last_dof_vel bookkeeping), so each arm keeps its own observation contract.
 #
 # Vendored sources (go2_rl_gym/legged_gym/envs/base/legged_robot.py unless
-# noted): _update_terrain_curriculum, _get_env_origins (round-robin part),
+# noted): check_termination (same-step contact termination; REPLACEMENT
+# override, see the method docstring), _reset_dofs (multiplicative
+# default*U(0.5,1.5); REPLACEMENT override), _reward_dof_acc +
+# _wty_last_dof_vel control-rate tracking (post_physics_step tail; the host
+# simulator's own last_dof_vel is per-SUBSTEP and feeds PD damping -- do not
+# touch it), _update_terrain_curriculum,
+# _get_env_origins (round-robin part),
 # _update_env_command_ranges, _resample_commands, update_reward_curriculum /
 # get_current_scale + compute_reward ramping, _get_dynamic_sigma +
 # _reward_tracking_{lin,ang}_vel, _get_base_height + _reward_correct_base_height
@@ -25,7 +31,7 @@ from itertools import product
 
 import torch
 
-from legged_gym.utils.math_utils import wrap_to_pi, quat_apply
+from legged_gym.utils.math_utils import wrap_to_pi, quat_apply, torch_rand_float
 
 
 def _sample_disjoint_intervals(env_ids, limit_bound, cfg_min, cfg_max, device):
@@ -60,8 +66,11 @@ def _sample_single_interval(env_ids, cfg_min, cfg_max, device):
 class WtyCurriculumMixin:
     """go2_rl_gym terrain-curriculum / command / reward machinery for host envs.
 
-    Cooperative overrides only (every method calls ``super()`` where a host
-    method of the same name exists). Place the mixin first in the MRO:
+    Cooperative overrides (every method calls ``super()`` where a host method
+    of the same name exists) with ONE exception: ``check_termination`` is a
+    replacement override (no super() call) that restores the vendored
+    same-step base-contact termination -- see its docstring. Place the mixin
+    first in the MRO:
 
         class Go2MoECTS(WtyCurriculumMixin, LeggedRobotCTS): ...
         class Go2MoECTSHIM(WtyCurriculumMixin, Go2BenchHIM): ...
@@ -91,15 +100,98 @@ class WtyCurriculumMixin:
         if hasattr(self, "num_teacher"):
             self.num_teacher = int(self.cfg.env.num_envs
                                    * getattr(self.cfg.env, "teacher_env_ratio", 0.75))
-        # [vendored _parse_cfg]: iteration-based command range curriculum,
+        # [vendored _parse_cfg]: budget-fraction command range curriculum,
         # sorted descending so reached entries can be popped from the back.
         command_range_curriculum = getattr(self.cfg.commands, "command_range_curriculum", None)
         if command_range_curriculum:
             self.cfg.commands.command_range_curriculum = sorted(
-                command_range_curriculum, key=lambda x: x["iter"], reverse=True)
+                command_range_curriculum, key=lambda x: x["ratio"], reverse=True)
+        # Planned total PPO iterations the ratio-based curricula
+        # (zero_command / command_range / curriculum_rewards) resolve against.
+        # The runner overrides this at learn() time with the effective
+        # max_iterations via set_wty_total_iterations.
+        self._wty_total_iterations = getattr(
+            self.cfg.env, "curriculum_total_iterations", 30000)
+        # Same-step base-contact termination threshold [N] (consumed by
+        # check_termination below). Vendored go2_rl_gym hardcodes 1.0; the
+        # moects cfgs set env.base_contact_terminate_threshold = 2.5 (see the
+        # config comment for the rationale and the watch metric).
+        self.base_contact_terminate_threshold = getattr(
+            self.cfg.env, "base_contact_terminate_threshold", 2.5)
+
+    def set_wty_total_iterations(self, total_iterations):
+        """Override the planned total PPO iterations the ratio-based
+        curricula (zero_command / command_range / curriculum_rewards) resolve
+        against. Called by the runner at learn() time with the effective
+        max_iterations (incl. any --max_iterations CLI override).
+
+        This is also the resync point for a resumed run: it runs after
+        runner.load() restored common_step_counter, and it is the first moment
+        the ratio-based curricula can be evaluated against the *effective*
+        budget, so the derived state is rebuilt here rather than at load time.
+        """
+        assert total_iterations and total_iterations > 0, (
+            f"total_iterations must be positive, got {total_iterations}")
+        self._wty_total_iterations = int(total_iterations)
+        self._wty_resync_curriculum()
+
+    def _wty_resync_curriculum(self):
+        """Rebuild every curriculum quantity derived from progress.
+
+        On a fresh run progress is 0 and this is a no-op restatement of the
+        initial values. On a resumed run common_step_counter has just been
+        restored to e.g. iteration 15000, and without this the command ranges
+        would stay at the narrowest band until each env's first resample and
+        the reward ramps would sit at start_value until the next
+        num_steps_per_iter boundary.
+        """
+        self._apply_command_range_curriculum()
+        self._update_reward_curriculum(force_update=True)
+        self.zero_command_proba = self._get_current_scale(
+            self.cfg.commands.zero_command_curriculum)
+
+    def _wty_progress(self):
+        """Training progress as a fraction of the planned budget: current
+        PPO iteration / planned total iterations (0..1+).
+        """
+        current_iter = self.common_step_counter // self.num_steps_per_iter
+        return current_iter / self._wty_total_iterations
 
     def _init_buffers(self):
         super()._init_buffers()
+        # --- termination telemetry state (check_termination / reset_idx) ---
+        # per-env flag for the reset reason of the current step; consumed by
+        # reset_idx for the Episode/termination_* metrics. Recomputed every
+        # check_termination call, so no manual clearing is needed.
+        self.terminated_by_base_contact = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        # --- training telemetry accumulators (Episode/tracking_*,
+        # Episode/torque_sat_*): per-env per-step sums / running max, emitted
+        # and zeroed per finished episode by _write_episode_telemetry
+        # (episode_sums-style window means). The terrain promote/demote counts
+        # are python counters filled by _update_terrain_curriculum and reset
+        # on each emit.
+        self._tele_lin_vel_err_sum = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self._tele_ang_vel_err_sum = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self._tele_torque_sat_sum = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self._tele_torque_sat_max = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self._tele_terrain_promotions = 0
+        self._tele_terrain_demotions = 0
+        # --- vendored control-rate dof_vel tracking (dof_acc reward + obs
+        # feature): go2_rl_gym updates last_dof_vel ONCE PER CONTROL STEP, at
+        # the very end of post_physics_step (ref legged_robot.py:145), so the
+        # vendored dof_acc spans a 20 ms window. The host simulator updates
+        # its own _last_dof_vel every SIM SUBSTEP (5 ms, see
+        # genesis_simulator.py:40) -- that buffer also feeds PD velocity
+        # damping and must not be touched, so the mixin keeps its own
+        # control-rate copy, refreshed in the compute_observations wrap below.
+        self._wty_last_dof_vel = torch.zeros(
+            self.num_envs, self.num_actions, dtype=torch.float,
+            device=self.device, requires_grad=False)
         # --- vendored command-resampling state (_init_buffers) ---
         self.commands_resampling_step = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
@@ -192,33 +284,138 @@ class WtyCurriculumMixin:
         self._update_env_command_ranges()
 
     # ------------------------------------------------------------------
+    # Resume support (runner save/load env-curriculum protocol)
+    # ------------------------------------------------------------------
+
+    WTY_CURRICULUM_STATE_VERSION = 1
+
+    def curriculum_state_dict(self):
+        """Env curriculum state the runner persists with the weights.
+
+        Only state that is NOT re-derivable from common_step_counter belongs
+        here: the per-env terrain levels, which the promote/demote curriculum
+        walks over training. Command ranges, reward ramp scales and the
+        zero-command probability are all pure functions of progress and are
+        rebuilt by _wty_resync_curriculum instead.
+
+        Returns None when the terrain curriculum is inactive (flat/plane
+        terrain, no moe_grid bookkeeping) so nothing is written for runs that
+        have no such state.
+        """
+        if not self._wty_curriculum_active:
+            return None
+        return {
+            "version": self.WTY_CURRICULUM_STATE_VERSION,
+            "num_envs": int(self.num_envs),
+            "num_cols": int(self.cfg.terrain.num_cols),
+            "terrain_levels": self.simulator.terrain_levels.detach().cpu().clone(),
+            "terrain_types": self.simulator.terrain_types.detach().cpu().clone(),
+        }
+
+    def load_curriculum_state_dict(self, state):
+        """Restore the per-env terrain levels saved by curriculum_state_dict.
+
+        Fails closed on a version or geometry mismatch: silently continuing
+        with fresh round-robin levels is exactly the regression this protocol
+        exists to prevent, and a level vector sized for a different env/terrain
+        layout cannot be index-mapped onto this one.
+        """
+        if not self._wty_curriculum_active:
+            print("[wty] terrain curriculum inactive; ignoring the checkpoint's "
+                  "env_curriculum_state")
+            return
+        version = state.get("version")
+        if version != self.WTY_CURRICULUM_STATE_VERSION:
+            raise ValueError(
+                f"env_curriculum_state version {version!r} != expected "
+                f"{self.WTY_CURRICULUM_STATE_VERSION}")
+        if int(state["num_envs"]) != int(self.num_envs) or \
+                int(state["num_cols"]) != int(self.cfg.terrain.num_cols):
+            raise ValueError(
+                "env_curriculum_state geometry mismatch: checkpoint "
+                f"num_envs={state['num_envs']} num_cols={state['num_cols']}, "
+                f"env num_envs={self.num_envs} num_cols={self.cfg.terrain.num_cols}")
+        # terrain_types is a deterministic function of (num_envs, num_cols), so
+        # a mismatch here means the round-robin assignment itself changed and
+        # the saved levels no longer describe the same envs.
+        saved_types = state["terrain_types"].to(self.simulator.terrain_types.device)
+        if not torch.equal(saved_types, self.simulator.terrain_types):
+            raise ValueError(
+                "env_curriculum_state terrain_types differ from this env's "
+                "round-robin assignment; refusing to map saved levels onto it")
+        levels = state["terrain_levels"].to(self.simulator._terrain_levels.device)
+        self.simulator._terrain_levels[:] = levels.to(self.simulator._terrain_levels.dtype)
+        # env origins are a lookup on (level, type); refresh so the next reset
+        # spawns on the restored levels rather than the round-robin ones.
+        self.simulator._env_origins[:] = self.simulator._terrain_origins[
+            self.simulator.terrain_levels, self.simulator.terrain_types]
+        print(f"[wty] restored terrain levels (mean "
+              f"{self.simulator.terrain_levels.float().mean():.2f})")
+
+    # ------------------------------------------------------------------
     # Per-step bookkeeping (vendored post_physics_step)
     # ------------------------------------------------------------------
 
     def _post_physics_step_callback(self):
-        """[vendored post_physics_step]: per-env command-resample countdown,
-        max-move-distance tracking, then resample; host push behavior kept.
+        """[vendored post_physics_step, EARLY part]: per-env command-resample
+        countdown + max-move-distance tracking only.
 
-        The host's fixed-period resample (episode_length % resampling_time) and
-        every-step heading recompute are intentionally replaced: the vendored
-        resampler owns per-env resampling and heading (stop_heading) logic.
+        The vendored resample/push CALLS no longer live here -- they run
+        further down the host post_physics_step chain to match the vendored
+        order (check_termination -> compute_reward -> RESAMPLE -> reset_idx
+        -> PUSH -> compute_observations): see _resample_commands_if_due /
+        _push_robots_if_due below. The host's fixed-period resample
+        (episode_length % resampling_time) and every-step heading recompute
+        are intentionally replaced: the vendored resampler owns per-env
+        resampling and heading (stop_heading) logic.
         """
         self.commands_resampling_step -= 1
         # max xy distance from the env origin over the episode (drives the
         # terrain curriculum instead of the instantaneous distance).
         self.max_move_distance = self.max_move_distance.maximum(torch.norm(
             self.simulator.base_pos[:, :2] - self.simulator.env_origins[:, :2], dim=1))
-        # resample commands after the episode's reward bookkeeping; the guard
-        # skips the last step of an episode (vendored).
+        if self.cfg.domain_rand.push_links and (self.common_step_counter % self.cfg.domain_rand.push_links_interval == 0):
+            self.simulator.push_links()
+        # --- telemetry accumulation (emitted per episode in reset_idx): raw
+        # tracking error against the UNSCALED command active during this step
+        # (command resampling runs later, inside compute_reward), and torque
+        # saturation |tau/tau_lim| (same buffers the privileged obs uses).
+        self._tele_lin_vel_err_sum += torch.norm(
+            self.commands[:, :2] - self.simulator.base_lin_vel[:, :2], dim=1)
+        self._tele_ang_vel_err_sum += torch.abs(
+            self.commands[:, 2] - self.simulator.base_ang_vel[:, 2])
+        torque_sat = torch.abs(self.simulator.torques / self.simulator.torque_limits)
+        self._tele_torque_sat_sum += torch.mean(torque_sat, dim=1)
+        self._tele_torque_sat_max = torch.maximum(
+            self._tele_torque_sat_max, torch.max(torque_sat, dim=1).values)
+
+    def _resample_commands_if_due(self):
+        """Vendored resample trigger (vendored post_physics_step: called AFTER
+        compute_reward, so a resample-step reward is still scored against the
+        OLD command); the guard skips the last step of an episode (vendored).
+        Invoked at the end of the mixin's compute_reward.
+        """
         resampling_env_ids = ((self.commands_resampling_step <= 0.0)
                               * (self.episode_length_buf < self.max_episode_length - 1)
                               ).nonzero(as_tuple=False).flatten()
         self._resample_commands(resampling_env_ids)
 
-        if self.cfg.domain_rand.push_robots and (self.common_step_counter % self.cfg.domain_rand.push_interval == 0):
-            self.simulator.push_robots()
-        if self.cfg.domain_rand.push_links and (self.common_step_counter % self.cfg.domain_rand.push_links_interval == 0):
-            self.simulator.push_links()
+    def _push_robots_if_due(self):
+        """Vendored per-env push trigger (vendored post_physics_step: called
+        AFTER reset_idx and BEFORE compute_observations -- envs reset this
+        step have episode_length_buf == 0 and therefore get their spawn
+        velocity overwritten, exactly like the vendored incidental push).
+        Invoked at the start of compute_observations (mixin wrap on the HIM
+        arm, inline on the MoE arm).
+        """
+        if self.cfg.domain_rand.push_robots:
+            # [vendored _push_robots]: per-env trigger on each env's own episode
+            # clock (no global lockstep), and OVERWRITE of world-frame xy lin
+            # vel U(+-max_push_vel_xy) + all ang vel U(+-max_push_ang_vel) in
+            # the simulator, replacing the host's additive xy-only push.
+            push_env_ids = (self.episode_length_buf % int(self.cfg.domain_rand.push_interval) == 0
+                            ).nonzero(as_tuple=False).flatten()
+            self.simulator.push_robots_overwrite(push_env_ids)
 
     # ------------------------------------------------------------------
     # Terrain curriculum (vendored _update_terrain_curriculum)
@@ -246,6 +443,10 @@ class WtyCurriculumMixin:
             # robots that walked less than half of their required distance go to simpler terrains
             move_down = (distance < torch.norm(
                 self.commands[env_ids, :2], dim=1) * self.max_episode_length_s * 0.5) * ~move_up
+        # telemetry counters (emitted as Episode/terrain_promotions /
+        # terrain_demotions by the next reset_idx, then reset)
+        self._tele_terrain_promotions += int(move_up.sum())
+        self._tele_terrain_demotions += int(move_down.sum())
         self.simulator.update_terrain_curriculum(env_ids, move_up, move_down)
         self.max_move_distance[env_ids] = 0.0
 
@@ -293,6 +494,45 @@ class WtyCurriculumMixin:
                     terrain_command_ranges["heading"][1],
                     self.command_ranges["heading"][1])
 
+    def _apply_command_range_curriculum(self):
+        """[vendored _resample_commands, curriculum head]: promote the global
+        command ranges to every stage whose ratio the current progress has
+        passed, popping the consumed entries.
+
+        Split out of _resample_commands so a resumed run can land on the
+        correct stage immediately (see _wty_resync_curriculum) instead of
+        walking the first envs through the narrowest band until they resample.
+
+        Crossed entries are applied in ASCENDING ratio order, unlike the
+        vendored backwards pop loop. Live training crosses one threshold at a
+        time, where the two orders agree; a resumed run can cross several at
+        once, and the vendored order would leave the EARLIEST (narrowest) band
+        in place because each later assignment overwrites the previous one.
+        """
+        curriculum = self.cfg.commands.command_range_curriculum
+        if not len(curriculum):
+            return
+        current_iter = self.common_step_counter // self.num_steps_per_iter
+        progress = self._wty_progress()
+        crossed = sorted(
+            (i for i, cmd_cfg in enumerate(curriculum) if progress >= cmd_cfg["ratio"]),
+            key=lambda i: curriculum[i]["ratio"])
+        for i in crossed:
+            cmd_cfg = curriculum[i]
+            self.command_ranges["lin_vel_x"] = cmd_cfg["lin_vel_x"]
+            self.command_ranges["lin_vel_y"] = cmd_cfg["lin_vel_y"]
+            self.command_ranges["ang_vel_yaw"] = cmd_cfg["ang_vel_yaw"]
+            self.command_ranges["heading"] = cmd_cfg["heading"]
+            self.max_lin_vel = max(
+                abs(self.command_ranges["lin_vel_x"][0]), abs(self.command_ranges["lin_vel_x"][1]),
+                abs(self.command_ranges["lin_vel_y"][0]), abs(self.command_ranges["lin_vel_y"][1]))
+            self._update_env_command_ranges()
+            print(f"Command range updated at iter {current_iter} "
+                  f"(progress {progress:.3f}): {self.command_ranges}")
+        # pop consumed entries after the pass (descending, so indices hold)
+        for i in sorted(crossed, reverse=True):
+            curriculum.pop(i)
+
     def _resample_commands(self, env_ids):
         """[vendored _resample_commands]: dynamic (traverse-guaranteeing)
         command resampling with per-terrain-type limits, limit-velocity draws,
@@ -305,23 +545,7 @@ class WtyCurriculumMixin:
         if len(env_ids) == 0:
             return
         self.stop_heading[env_ids] = False
-        # update command curriculum with train steps
-        if len(self.cfg.commands.command_range_curriculum):
-            current_iter = self.common_step_counter // self.num_steps_per_iter
-            # iterate backwards to be able to pop entries
-            for i in range(len(self.cfg.commands.command_range_curriculum) - 1, -1, -1):
-                cmd_cfg = self.cfg.commands.command_range_curriculum[i]
-                if current_iter >= cmd_cfg["iter"]:
-                    self.command_ranges["lin_vel_x"] = cmd_cfg["lin_vel_x"]
-                    self.command_ranges["lin_vel_y"] = cmd_cfg["lin_vel_y"]
-                    self.command_ranges["ang_vel_yaw"] = cmd_cfg["ang_vel_yaw"]
-                    self.command_ranges["heading"] = cmd_cfg["heading"]
-                    self.max_lin_vel = max(
-                        abs(self.command_ranges["lin_vel_x"][0]), abs(self.command_ranges["lin_vel_x"][1]),
-                        abs(self.command_ranges["lin_vel_y"][0]), abs(self.command_ranges["lin_vel_y"][1]))
-                    self.cfg.commands.command_range_curriculum.pop(i)
-                    self._update_env_command_ranges()
-                    print(f"Command range updated at iter {current_iter}: {self.command_ranges}")
+        self._apply_command_range_curriculum()
         remaining_dist = torch.clip(
             0.625 * self.cfg.terrain.terrain_length
             - torch.norm(self.commands_xy_accumulation[env_ids], dim=1) * self.cfg.commands.resampling_time,
@@ -476,14 +700,112 @@ class WtyCurriculumMixin:
                     self.env_command_ranges["ang_vel_yaw"][heading_env_ids, 1])
 
     # ------------------------------------------------------------------
-    # Reset lifecycle (vendored reset_idx)
+    # Termination (vendored check_termination; REPLACEMENT override)
     # ------------------------------------------------------------------
+
+    def compute_observations(self):
+        """Cooperative wrap (calls super): after the arm's own
+        compute_observations has consumed the PREVIOUS control-rate
+        last_dof_vel (dof_acc obs feature) and this step's reward is already
+        computed, refresh the tracker's copy -- mirroring the vendored
+        post_physics_step tail (ref legged_robot.py:143-145:
+        compute_observations, then last_dof_vel[:] = dof_vel[:]). The
+        observation contract itself is untouched (each arm keeps its own).
+
+        MRO note: this wrap only wins on the HIM arm (Go2MoECTSHIM defines no
+        compute_observations of its own). Go2MoECTS.compute_observations
+        shadows it, so the MoE arm performs the same refresh inline at the
+        end of its own method -- keep the two in sync.
+        """
+        # vendored post_physics_step order: push AFTER reward + reset_idx,
+        # BEFORE observations (ref legged_robot.py:138-143).
+        self._push_robots_if_due()
+        super().compute_observations()
+        self._wty_last_dof_vel[:] = self.simulator.dof_vel[:]
+
+    def _reward_dof_acc(self):
+        """[vendored _reward_dof_acc]: control-rate joint acceleration penalty.
+
+        go2_rl_gym/legged_gym/envs/base/legged_robot.py:1257-1259 computes
+        sum(((last_dof_vel - dof_vel) / dt)^2) with last_dof_vel spanning one
+        CONTROL step (20 ms). The host base class computes the same formula
+        but over the simulator's per-substep buffer (5 ms window), making the
+        penalty ~16x weaker. REPLACEMENT override (no super()) reading the
+        mixin's control-rate tracker instead.
+        """
+        return torch.sum(torch.square(
+            (self._wty_last_dof_vel - self.simulator.dof_vel) / self.dt), dim=1)
+
+    def check_termination(self):
+        """[vendored check_termination]: same-step base-contact termination.
+
+        go2_rl_gym/legged_gym/envs/base/legged_robot.py:179 terminates the
+        SAME step any termination body (go2: ["base"] only, via
+        cfg.asset.terminate_after_contacts_on) exceeds the contact-force
+        threshold; the vendored tilt/projected-gravity check is commented out
+        and there is no consecutive-failure counter. The host default
+        (LeggedRobot.check_termination: 10 N threshold, projected-gravity
+        tilt check, fail_to_terminal_time_s consecutive-step counter) is
+        intentionally replaced for the moects tasks; the time-out path is
+        unchanged. Threshold comes from
+        cfg.env.base_contact_terminate_threshold (2.5 N; vendored 1.0).
+
+        REPLACEMENT override (the mixin's only non-cooperative one): no
+        super() call -- the host fail-counter / tilt logic would be dead
+        weight. The shared force-norm buffers are re-populated exactly like
+        the host (the collision reward and the privileged-obs feet forces
+        consume them) and fail_buf degrades to a long-typed 0/1 same-step
+        flag; reset_buf / time_out_buf keep their usual semantics for
+        _reward_termination and the eval harness (reset_buf & ~time_out_buf).
+        """
+        # force-norm buffer population, identical to the host's (the 4D branch
+        # is the IsaacLab contact-sensor history layout)
+        if len(self.simulator.link_contact_forces.shape) == 4:
+            self.terminated_bodies_force_norm = torch.max(torch.norm(self.simulator.link_contact_forces[:, :, self.simulator.termination_contact_indices, :], dim=-1), dim=1)[0]
+            self.penalized_bodies_force_norm = torch.max(torch.norm(self.simulator.link_contact_forces[:, :, self.simulator.penalized_contact_indices, :], dim=-1), dim=1)[0]
+            self.feet_force_norm = torch.max(torch.norm(self.simulator.link_contact_forces[:, :, self.simulator.feet_contact_indices, :], dim=-1), dim=1)[0]
+            self.feet_max_force_z = torch.max(self.simulator.link_contact_forces[:, :, self.simulator.feet_contact_indices, 2], dim=1)[0]
+        else:
+            self.terminated_bodies_force_norm = torch.norm(self.simulator.link_contact_forces[:, self.simulator.termination_contact_indices, :], dim=-1)
+            self.penalized_bodies_force_norm = torch.norm(self.simulator.link_contact_forces[:, self.simulator.penalized_contact_indices, :], dim=-1)
+            self.feet_force_norm = torch.norm(self.simulator.link_contact_forces[:, self.simulator.feet_contact_indices, :], dim=-1)
+            self.feet_max_force_z = self.simulator.link_contact_forces[:, self.simulator.feet_contact_indices, 2]
+        # vendored: torch.any(torch.norm(contact_forces[termination_bodies]) > threshold, dim=1)
+        self.terminated_by_base_contact = torch.any(
+            self.terminated_bodies_force_norm > self.base_contact_terminate_threshold, dim=1)
+        self.fail_buf = self.terminated_by_base_contact.to(torch.long)  # 0/1, no consecutive counter
+        self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
+        self.reset_buf = self.terminated_by_base_contact | self.time_out_buf
+
+    # ------------------------------------------------------------------
+    # Reset lifecycle (vendored _reset_dofs / reset_idx)
+    # ------------------------------------------------------------------
+
+    def _reset_dofs(self, env_ids):
+        """[vendored _reset_dofs]: multiplicative reset joint positions.
+
+        go2_rl_gym/legged_gym/envs/base/legged_robot.py:629 samples
+        dof_pos = default_dof_pos * U(0.5, 1.5) and zeroes dof_vel; the host
+        base class (LeggedRobot._reset_dofs) uses the additive
+        default + U(-0.2, 0.2) instead. REPLACEMENT override scoped to the
+        moects tasks via this mixin (no super() call; dof_vel is zeroed in
+        both, so it is unchanged).
+        """
+        dof_pos = self.simulator.default_dof_pos * torch_rand_float(
+            0.5, 1.5, (len(env_ids), self.num_actions), self.device)
+        dof_vel = torch.zeros((len(env_ids), self.num_actions), dtype=torch.float,
+                              device=self.device, requires_grad=False)
+        self.simulator.reset_dofs(env_ids, dof_pos, dof_vel)
 
     def reset_idx(self, env_ids):
         """[vendored reset_idx]: run the terrain curriculum and clear the
         command accumulators around the host reset, then log the
         per-terrain-type curriculum metrics."""
         if len(env_ids) > 0:
+            # True episode lengths of the finishing episodes, captured BEFORE
+            # the zeroing below (and the host's inside super().reset_idx);
+            # _write_episode_telemetry divides per-episode means by them.
+            ep_lengths = self.episode_length_buf[env_ids].float().clone()
             # The host only calls _update_terrain_curriculum when
             # cfg.terrain.curriculum is set; moe_grid keeps that flag off (the
             # builder dispatch), so the mixin drives the vendored curriculum
@@ -505,7 +827,23 @@ class WtyCurriculumMixin:
             # to restore the vendored ordering; the host's own zeroing below is
             # then a no-op, and nothing between here and there reads the buffer.
             self.episode_length_buf[env_ids] = 0
+            # vendored reset_idx (ref legged_robot.py:224): zero the control-rate
+            # last_dof_vel for the fresh episode, same as the vendored
+            # last_dof_vel[env_ids] = 0 (and the simulator's own buffer, which
+            # genesis_simulator already zeroes on reset).
+            self._wty_last_dof_vel[env_ids] = 0.0
         super().reset_idx(env_ids)
+        # termination-reason telemetry: fraction of this reset batch that ended
+        # by base contact / by time-out (watch metric for the 2.5 N threshold).
+        # Both flags still hold the termination-step values here -- the host
+        # reset_idx does not clear them. The runner averages the per-batch
+        # fractions into Episode/* over the logging window, same as the rew_*
+        # episode sums.
+        if len(env_ids) > 0:
+            self.extras["episode"]["termination_base_contact"] = torch.mean(
+                self.terminated_by_base_contact[env_ids].float())
+            self.extras["episode"]["termination_timeout"] = torch.mean(
+                self.time_out_buf[env_ids].float())
         # per-terrain-type curriculum metrics (vendored reset_idx extras)
         if len(env_ids) > 0 and self._wty_curriculum_active:
             self.extras["episode"]["terrain_level_all"] = torch.mean(
@@ -514,6 +852,52 @@ class WtyCurriculumMixin:
                 self.extras["episode"]["terrain_level_" + name] = torch.mean(
                     self.simulator.terrain_levels[torch.isin(self.simulator.terrain_types, cols)].float())
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
+        # training telemetry (Group 2): curriculum state, physical tracking
+        # error, torque saturation, terrain promote/demote counters
+        if len(env_ids) > 0:
+            self._write_episode_telemetry(env_ids, ep_lengths)
+
+    def _write_episode_telemetry(self, env_ids, ep_lengths):
+        """Emit the mixin's Episode/* training telemetry into extras["episode"].
+
+        Called from reset_idx AFTER super().reset_idx rebuilt extras["episode"];
+        the runner averages the per-reset-batch values over the logging window,
+        exactly like the rew_* episode sums. ep_lengths must be captured by the
+        caller BEFORE this method runs: the mixin zeroes episode_length_buf
+        ahead of super().reset_idx (vendored ordering), so the per-episode
+        means below divide by the true episode length, not the nominal max.
+        """
+        ep = self.extras["episode"]
+        ep_len = torch.clamp(ep_lengths, min=1.0)
+        # Instantaneous curriculum state: makes the command-range pops
+        # (command_range_curriculum), the reward-scale ramps
+        # (curriculum_rewards) and the zero-command ramp visible in TB.
+        ep["zero_command_proba"] = float(self.zero_command_proba)
+        ep["cmd_range_lin_vel_x_max"] = float(self.command_ranges["lin_vel_x"][1])
+        ep["cmd_range_ang_vel_yaw_max"] = float(self.command_ranges["ang_vel_yaw"][1])
+        for name, scale in self.reward_curriculum_scales.items():
+            ep["rewscale_" + name] = float(scale)
+        # Physical tracking error, raw units (no reward sigma): per-episode
+        # mean per-step error, then the mean over this reset batch.
+        ep["tracking_lin_vel_err"] = torch.mean(self._tele_lin_vel_err_sum[env_ids] / ep_len)
+        ep["tracking_ang_vel_err"] = torch.mean(self._tele_ang_vel_err_sum[env_ids] / ep_len)
+        # Torque saturation |tau/tau_lim|: per-episode mean of the per-step
+        # joint mean, and the episode's worst single joint (running max).
+        ep["torque_sat_mean"] = torch.mean(self._tele_torque_sat_sum[env_ids] / ep_len)
+        ep["torque_sat_max"] = torch.mean(self._tele_torque_sat_max[env_ids])
+        self._tele_lin_vel_err_sum[env_ids] = 0.0
+        self._tele_ang_vel_err_sum[env_ids] = 0.0
+        self._tele_torque_sat_sum[env_ids] = 0.0
+        self._tele_torque_sat_max[env_ids] = 0.0
+        # Terrain curriculum: level max (the per-type means live in reset_idx)
+        # and promote/demote counts since the previous reset batch -- per-batch
+        # counts averaged over the window, the episode_sums emission pattern.
+        if self._wty_curriculum_active:
+            ep["terrain_level_max"] = torch.max(self.simulator.terrain_levels.float())
+        ep["terrain_promotions"] = float(self._tele_terrain_promotions)
+        ep["terrain_demotions"] = float(self._tele_terrain_demotions)
+        self._tele_terrain_promotions = 0
+        self._tele_terrain_demotions = 0
 
     # ------------------------------------------------------------------
     # Reward computation (vendored compute_reward + update_reward_curriculum)
@@ -542,6 +926,10 @@ class WtyCurriculumMixin:
         # host UED accounting tail, kept for contract parity (never active here)
         if self.ued_adapter is not None and getattr(self.cfg.env, "ued_enabled", False):
             self.ued_adapter.record_step(self.rew_buf)
+        # vendored post_physics_step order: resample commands AFTER the
+        # reward is computed (ref legged_robot.py:133-134), so the reward on
+        # a resample step is still scored against the old command.
+        self._resample_commands_if_due()
 
     def _update_reward_curriculum(self, force_update: bool = False):
         """[vendored update_reward_curriculum]: refresh ramped reward scales
@@ -552,13 +940,16 @@ class WtyCurriculumMixin:
                     self.reward_curriculum_scales[config["reward_name"]] = self._get_current_scale(config)
 
     def _get_current_scale(self, config):
-        """[vendored get_current_scale]: linear interpolation between
-        start_value and end_value over [start_iter, end_iter] PPO iterations.
+        """[vendored get_current_scale, ratio-based]: linear interpolation
+        between start_value and end_value over the budget fraction
+        [start_ratio, end_ratio] (the vendored absolute thresholds
+        1500/5000/20000/50000 are stored as their fractions of the vendored
+        150k budget, so the curricula rescale with the planned total).
 
-        config: {'start_iter': 0, 'end_iter': 1500, 'start_value': 1.0, 'end_value': 0.0}
+        config: {'start_ratio': 0.0, 'end_ratio': 0.01, 'start_value': 1.0, 'end_value': 0.0}
         """
-        current_iter = self.common_step_counter // self.num_steps_per_iter
-        percentage = (current_iter - config["start_iter"]) / (config["end_iter"] - config["start_iter"])
+        percentage = ((self._wty_progress() - config["start_ratio"])
+                      / (config["end_ratio"] - config["start_ratio"]))
         percentage = max(min(percentage, 1.0), 0.0)
         return (1.0 - percentage) * config["start_value"] + percentage * config["end_value"]
 
@@ -653,3 +1044,24 @@ class WtyCurriculumMixin:
         hip_pos = self.simulator.dof_pos[:, hip_dof_indices]
         default_hip_pos = self.simulator.default_dof_pos[:, hip_dof_indices]
         return torch.sum(torch.abs(hip_pos - default_hip_pos), dim=1)
+
+    # ------------------------------------------------------------------
+    # Collision reward (vendored formula, Genesis-calibrated threshold)
+    # ------------------------------------------------------------------
+
+    def _reward_collision(self):
+        """[vendored _reward_collision]: count penalized-body (thigh/calf)
+        links whose contact-force norm exceeds the threshold.
+
+        Same formula as the reference (go2_rl_gym legged_robot.py) and the
+        host LeggedRobot, but the threshold comes from
+        cfg.rewards.collision_force_threshold (0.1 N, reference parity)
+        instead of the host's hardcoded 10.0 N. Justified by Genesis
+        measurement: non-contacting penalized links read exactly 0.0 N (no
+        solver noise floor; every observed nonzero reading was a genuine
+        ground contact) -- see tmp/collision_force_stats.json and
+        tmp/rear_calf_contact_probe.json.
+        """
+        return torch.sum(
+            1. * (self.penalized_bodies_force_norm
+                  > self.cfg.rewards.collision_force_threshold), dim=1)

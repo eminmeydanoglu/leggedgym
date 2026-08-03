@@ -159,7 +159,12 @@ class TestUedResumeClock(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-negative integer"):
                 runner.load(str(path))
 
-    def test_non_ued_save_omits_clock_keys(self):
+    def test_non_ued_save_omits_teacher_but_keeps_clock(self):
+        """The teacher state is UED-only; the clock is not.
+
+        Non-UED envs (go2_moects) drive terrain/command/reward curricula off
+        common_step_counter too, so it must travel with every checkpoint.
+        """
         env = SimpleNamespace(
             cfg=SimpleNamespace(env=SimpleNamespace(ued_enabled=False)),
             episode_curriculum=None,
@@ -171,7 +176,7 @@ class TestUedResumeClock(unittest.TestCase):
             runner.save(str(path), iteration=1)
             payload = torch.load(path, map_location="cpu", weights_only=False)
         self.assertNotIn("episode_curriculum", payload)
-        self.assertNotIn("common_step_counter", payload)
+        self.assertEqual(payload["common_step_counter"], 999)
 
     def test_mid_stage0_resume_keeps_remaining_stage_length(self):
         """Silent BUG 2 case: partial stage sums + restored clock, not a full re-count."""

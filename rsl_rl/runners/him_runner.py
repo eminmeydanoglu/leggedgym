@@ -46,6 +46,11 @@ class HIMRunner(OnPolicyRunner):
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         self._pre_learn(init_at_random_ep_len)
+        # Sync the env's ratio-based curricula with the effective budget
+        # (incl. any --max_iterations CLI override); no-op for envs without
+        # the wty substrate (only go2_moects_him provides it today).
+        if hasattr(self.env, "set_wty_total_iterations"):
+            self.env.set_wty_total_iterations(num_learning_iterations)
         if self.training_seed is not None:
             print(f"[train] seed={self.training_seed} "
                   f"start_iter={self.current_learning_iteration}")

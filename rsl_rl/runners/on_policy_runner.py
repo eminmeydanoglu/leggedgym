@@ -683,7 +683,24 @@ class OnPolicyRunner:
         if getattr(getattr(env, "cfg", None), "env", None) is not None and \
                 getattr(env.cfg.env, "ued_enabled", False) and episode_curriculum is not None:
             save_dict["episode_curriculum"] = episode_curriculum.state_dict()
-            save_dict["common_step_counter"] = int(env.common_step_counter)
+        # The global control clock is NOT UED-specific: every ratio/iteration
+        # based env curriculum reads it (go2_moects drives terrain levels,
+        # command ranges and reward ramps off common_step_counter // steps per
+        # iter). _init_buffers zeroes it unconditionally, so a resumed job that
+        # does not restore it continues with 15k-iteration weights on an
+        # iteration-0 curriculum. Persist it for any env that has one.
+        counter = getattr(env, "common_step_counter", None)
+        if counter is not None:
+            save_dict["common_step_counter"] = int(counter)
+        # Generic env-side curriculum state (opt-in protocol): anything an env
+        # mutates during training that is not re-derivable from the clock --
+        # e.g. the go2_moects per-env terrain levels. Envs without the hook
+        # (base LeggedRobot, test doubles) simply store nothing.
+        curriculum_state_fn = getattr(env, "curriculum_state_dict", None)
+        if callable(curriculum_state_fn):
+            env_curriculum_state = curriculum_state_fn()
+            if env_curriculum_state is not None:
+                save_dict["env_curriculum_state"] = env_curriculum_state
         torch.save(save_dict, path)
 
     @staticmethod
@@ -751,8 +768,12 @@ class OnPolicyRunner:
         # via __new__.
         env = getattr(self, "env", None)
         episode_curriculum = getattr(env, "episode_curriculum", None)
-        if getattr(getattr(env, "cfg", None), "env", None) is not None and \
-                getattr(env.cfg.env, "ued_enabled", False) and episode_curriculum is not None:
+        ued_resume = (
+            getattr(getattr(env, "cfg", None), "env", None) is not None
+            and getattr(env.cfg.env, "ued_enabled", False)
+            and episode_curriculum is not None
+        )
+        if ued_resume:
             curriculum_state = loaded_dict.get("episode_curriculum")
             if curriculum_state is None:
                 raise ValueError(
@@ -764,14 +785,38 @@ class OnPolicyRunner:
                     "Resuming a UED-enabled run requires a 'common_step_counter' "
                     f"checkpoint entry (stage clock); none found in {path}"
                 )
-            counter = loaded_dict["common_step_counter"]
-            if isinstance(counter, bool) or not isinstance(counter, Integral) or int(counter) < 0:
-                raise ValueError(
-                    "checkpoint common_step_counter must be a non-negative integer, "
-                    f"got {counter!r}"
-                )
             episode_curriculum.load_state_dict(curriculum_state)
-            env.common_step_counter = int(counter)
+
+        # Global control clock, for UED and non-UED alike. Every ratio-based env
+        # curriculum is driven off it, and _init_buffers zeroed it when this env
+        # was built, so skipping the restore silently rewinds the whole
+        # curriculum to iteration 0 on resume. Pre-clock checkpoints (and
+        # playback/eval checkpoints) have no entry -> warn and leave the env at
+        # its fresh value; a UED run already hard-failed above.
+        if hasattr(env, "common_step_counter"):
+            if "common_step_counter" in loaded_dict:
+                counter = loaded_dict["common_step_counter"]
+                if isinstance(counter, bool) or not isinstance(counter, Integral) or int(counter) < 0:
+                    raise ValueError(
+                        "checkpoint common_step_counter must be a non-negative integer, "
+                        f"got {counter!r}"
+                    )
+                env.common_step_counter = int(counter)
+            else:
+                print(f"[load] {path}: no common_step_counter in checkpoint; env "
+                      "curricula restart from step 0 (legacy checkpoint)")
+
+        # Generic env-side curriculum state (terrain levels etc.). Same
+        # contract as save(): opt-in, skipped for envs without the hook.
+        load_curriculum_fn = getattr(env, "load_curriculum_state_dict", None)
+        if callable(load_curriculum_fn):
+            env_curriculum_state = loaded_dict.get("env_curriculum_state")
+            if env_curriculum_state is not None:
+                load_curriculum_fn(env_curriculum_state)
+            else:
+                print(f"[load] {path}: no env_curriculum_state in checkpoint; "
+                      "env curriculum state (e.g. terrain levels) stays at its "
+                      "fresh initial value (legacy checkpoint)")
 
         # Restore the full lexicographic selection state from the resumed model
         # or the sibling best_tracking checkpoint. Legacy best.pt has no V2 key;

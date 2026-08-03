@@ -12,6 +12,20 @@ from legged_gym.warp.warp_cam import WarpCam
 if SIMULATOR == "genesis":
     import genesis as gs
 
+
+def _validate_ctrl_delay_substep_range(delay_range, decimation):
+    """Validate the "substep"-mode action-delay range (SIM SUBSTEP units).
+
+    The range is inclusive and must fit inside one control step:
+    0 <= min <= max <= decimation. Raises ValueError otherwise.
+    """
+    lo, hi = delay_range
+    if not (0 <= lo <= hi <= decimation):
+        raise ValueError(
+            f"domain_rand.ctrl_delay_substep_range {list(delay_range)} must satisfy "
+            f"0 <= min <= max <= control.decimation ({decimation}); "
+            f"units are sim substeps, not control steps")
+
 """ ********** Genesis Simulator ********** """
 class GenesisSimulator(Simulator):
     def __init__(self, cfg, sim_params: dict, device, headless):
@@ -36,9 +50,28 @@ class GenesisSimulator(Simulator):
         self._last_base_ang_vel[:] = self._base_ang_vel[:]
         self._last_feet_vel[:] = self._feet_vel[:]
         actions = self._pre_simulator_step(actions)
-        for _ in range(self._cfg.control.decimation):
+        if self._ctrl_delay_substep_mode:
+            substep_delay = self._draw_substep_delay()
+        for i in range(self._cfg.control.decimation):
             self._last_dof_vel[:] = self._dof_vel[:]
-            self._torques = self._compute_torques(actions)
+            if self._ctrl_delay_substep_mode:
+                # go2_rl_gym blend: substeps before the drawn delay keep the
+                # previous control step's target, the rest use the current one
+                use_current = (i >= substep_delay).float()
+                step_actions = (1 - use_current) * self._prev_action_targets \
+                    + use_current * actions
+            else:
+                step_actions = actions
+            self._torques = self._compute_torques(step_actions)
+            if self._randomize_motor_strength:
+                # go2_rl_gym legged_robot.py:79-81 scales the torque AFTER
+                # _compute_torques' clip, so the multiplier also scales the
+                # effective torque limit. Genesis then re-clamps the applied
+                # force to the model's dof force_range in the solver
+                # (genesis/engine/solvers/rigid/abd/forward_dynamics.py:853-857),
+                # which mirrors PhysX clamping to the asset effort limit in the
+                # reference -- so no force_range widening is needed for parity.
+                self._torques = self._torques * self._motor_strengths
             self._robot.control_dofs_force(
                 self._torques, self._dof_indices)
             self._scene.step()
@@ -47,6 +80,10 @@ class GenesisSimulator(Simulator):
                 self._dof_indices)
             self._dof_vel[:] = self._robot.get_dofs_velocity(
                 self._dof_indices)
+        if self._ctrl_delay_substep_mode:
+            # the current target becomes the previous one for the next control
+            # step (reference updates last_actions in post_physics_step)
+            self._prev_action_targets[:] = actions[:]
 
     def post_physics_step(self):
         # prepare quantities
@@ -85,7 +122,13 @@ class GenesisSimulator(Simulator):
             self._randomize_joint_damping(env_ids)
         if self._cfg.domain_rand.randomize_pd_gain:
             self._randomize_pd_gain(env_ids)
-        
+        # motor DR trio (go2_rl_gym legged_robot.py:198-206): both are per-RESET,
+        # per-env, per-DOF draws, exactly like the reference's reset_idx block.
+        if self._randomize_motor_strength:
+            self._draw_motor_strengths(env_ids)
+        if self._randomize_motor_zero_offset:
+            self._draw_motor_zero_offsets(env_ids)
+
         self._last_dof_vel[env_ids] = 0.
         self._last_feet_vel[env_ids] = 0.
         self._last_base_lin_vel[env_ids] = 0.
@@ -93,13 +136,18 @@ class GenesisSimulator(Simulator):
         
         # reset action queue and delay
         if self._cfg.domain_rand.randomize_ctrl_delay:
-            self._action_queue[env_ids] *= 0.
-            self._action_queue[env_ids] = 0.
-            # Eval V2 needs a fixed delay over resets.  Keep the established
-            # randomization behaviour for every normal training configuration.
-            if not getattr(self._cfg.domain_rand, "eval_fixed_ctrl_delay", False):
-                self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
-                                                           self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
+            if self._ctrl_delay_substep_mode:
+                # reference zeroes last_actions at episode start, so the first
+                # substeps of a new episode fall back to a zero action target
+                self._prev_action_targets[env_ids] = 0.
+            else:
+                self._action_queue[env_ids] *= 0.
+                self._action_queue[env_ids] = 0.
+                # Eval V2 needs a fixed delay over resets.  Keep the established
+                # randomization behaviour for every normal training configuration.
+                if not getattr(self._cfg.domain_rand, "eval_fixed_ctrl_delay", False):
+                    self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
+                                                               self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
 
         # reset depth image tensors
         # find common ids between env_ids and camera env ids
@@ -189,7 +237,37 @@ class GenesisSimulator(Simulator):
         self._last_base_lin_vel[:] = self._base_lin_vel[:]
         self._base_lin_vel[:] = quat_rotate_inverse(
             self._base_quat, self._robot.get_vel())
-    
+
+    def push_robots_overwrite(self, env_ids):
+        """ go2_rl_gym-style push (vendored ``_push_robots``): OVERWRITE the base
+        velocity of the given envs instead of adding to it. Used by the moects
+        tasks; ``push_robots()`` above stays additive / xy-only / all-envs for
+        the other host tasks.
+
+        World-frame linear x/y <- U(+-max_push_vel_xy) and world-frame angular
+        x/y/z <- U(+-max_push_ang_vel), sampled independently per env per
+        component. Linear z and all joint DOF velocities are left untouched.
+        The per-env trigger (each env's own episode clock) lives in the caller.
+        """
+        if len(env_ids) == 0:
+            return
+        max_push_vel_xy = self._cfg.domain_rand.max_push_vel_xy
+        max_push_ang_vel = self._cfg.domain_rand.max_push_ang_vel
+        # in Genesis, base link also has DOF, it's 6DOF if not fixed:
+        # dofs_vel[:, 0:3] ~ world lin vel, dofs_vel[:, 3:6] ~ world ang vel
+        dofs_vel = self._robot.get_dofs_velocity()  # (num_envs, num_dof)
+        dofs_vel[env_ids, :2] = torch_rand_float(-max_push_vel_xy,
+                                                 max_push_vel_xy, (len(env_ids), 2), self._device)
+        dofs_vel[env_ids, 3:6] = torch_rand_float(-max_push_ang_vel,
+                                                  max_push_ang_vel, (len(env_ids), 3), self._device)
+        self._robot.set_dofs_velocity(dofs_vel)
+        self._last_base_lin_vel[:] = self._base_lin_vel[:]
+        self._last_base_ang_vel[:] = self._base_ang_vel[:]
+        self._base_lin_vel[:] = quat_rotate_inverse(
+            self._base_quat, self._robot.get_vel())
+        self._base_ang_vel[:] = quat_rotate_inverse(
+            self._base_quat, self._robot.get_ang())
+
     def push_links(self):
         max_force = self._cfg.domain_rand.max_push_force
         # apply random forces to the links of the robot
@@ -256,14 +334,27 @@ class GenesisSimulator(Simulator):
     
     #----- Protected methods -----#
     def _pre_simulator_step(self, actions):
-        # apply action delay by using an action queue
-        if self._cfg.domain_rand.randomize_ctrl_delay:
+        # apply action delay by using an action queue (legacy "queue" mode only;
+        # "substep" mode blends targets inside step()'s decimation loop instead)
+        if self._cfg.domain_rand.randomize_ctrl_delay and not self._ctrl_delay_substep_mode:
             self._action_queue[:, 1:] = self._action_queue[:, :-1].clone()
             self._action_queue[:, 0] = actions.clone()
             actions = self._action_queue[torch.arange(
                 self._num_envs), self._action_delay].clone()
             
         return actions
+    
+    def _draw_substep_delay(self):
+        """Draw the per-env action delay in SIM SUBSTEPS for this control step.
+
+        Reference go2_rl_gym (legged_robot.py step): torch.randint(0,
+        decimation+1, (num_envs, 1)) once per control step. The draw is exposed
+        in ``_action_delay`` (substep units) for debugging / privileged labels.
+        """
+        lo, hi = self._ctrl_delay_substep_range
+        delay = torch.randint(lo, hi + 1, (self._num_envs, 1), device=self._device)
+        self._action_delay[:] = delay.squeeze(1)
+        return delay
         
     def _parse_cfg(self):
         self._debug = self._cfg.env.debug
@@ -276,6 +367,18 @@ class GenesisSimulator(Simulator):
             # update counter for depth images
             self._depth_image_update_counter = 0
             self._depth_image_update_decimation = self._cfg.sensor.depth_camera_config.decimation
+        # reference go2_rl_gym action delay: per-env SIM-SUBSTEP delay re-drawn
+        # every control step, blended inside the decimation loop (see step()).
+        # Off by default ("queue" mode keeps the legacy per-episode delay).
+        self._ctrl_delay_substep_mode = (
+            self._cfg.domain_rand.randomize_ctrl_delay
+            and getattr(self._cfg.domain_rand, "ctrl_delay_mode", "queue") == "substep")
+        if self._ctrl_delay_substep_mode:
+            self._ctrl_delay_substep_range = getattr(
+                self._cfg.domain_rand, "ctrl_delay_substep_range",
+                [0, self._cfg.control.decimation])
+            _validate_ctrl_delay_substep_range(
+                self._ctrl_delay_substep_range, self._cfg.control.decimation)
     
     def _create_sim(self):
         # create scene
@@ -475,7 +578,15 @@ class GenesisSimulator(Simulator):
         # randomize pd gain
         if self._cfg.domain_rand.randomize_pd_gain:
             self._randomize_pd_gain(np.arange(self._num_envs))
-            
+        # motor strength / zero offset: drawn here too so the very first episode
+        # (before any reset_idx) already sees a randomized motor, matching the
+        # reference where reset_idx runs for all envs at startup.
+        if self._randomize_motor_strength:
+            self._draw_motor_strengths(np.arange(self._num_envs))
+        if self._randomize_motor_zero_offset:
+            self._draw_motor_zero_offsets(np.arange(self._num_envs))
+
+
     def _init_buffers(self):
         self._base_init_pos = torch.tensor(
             self._cfg.init_state.pos, device=self._device
@@ -579,11 +690,16 @@ class GenesisSimulator(Simulator):
         self._robot.set_dofs_kv(self._d_gains, self._dof_indices)
         
         # control delay
-        if self._cfg.domain_rand.randomize_ctrl_delay:
+        if self._cfg.domain_rand.randomize_ctrl_delay and not self._ctrl_delay_substep_mode:
             self._action_queue = torch.zeros(
                 self._num_envs, self._cfg.domain_rand.ctrl_delay_step_range[1]+1, self._num_actions, dtype=torch.float, device=self._device, requires_grad=False)
             self._action_delay = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
                                               self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (self._num_envs,), device=self._device, requires_grad=False)
+        if self._ctrl_delay_substep_mode:
+            # previous control step's (clipped) action target, blended with the
+            # current target inside step()'s decimation loop; zeroed at resets
+            self._prev_action_targets = torch.zeros(
+                self._num_envs, self._num_actions, dtype=torch.float, device=self._device, requires_grad=False)
 
         self._init_height_points()
         self._measured_heights = torch.zeros(self._num_envs, self._num_height_points, device=self._device, requires_grad=False)
@@ -746,9 +862,14 @@ class GenesisSimulator(Simulator):
         if self._p_gains.ndim == 1:
             self._p_gains = self._p_gains.unsqueeze(0).repeat(self._num_envs, 1)
             self._d_gains = self._d_gains.unsqueeze(0).repeat(self._num_envs, 1)
+        # go2_rl_gym legged_robot.py:612 adds the zero offset to the POSITION
+        # TARGET (not to the measured dof_pos), so it is a constant bias the
+        # policy has to integrate out; it is independent of control.action_scale
+        # because it enters as its own term. Buffer is 0.0 when the flag is off.
         torques = (
             self._kp_scale * self._p_gains * (actions_scaled +
-                                    self._default_dof_pos - self._dof_pos)
+                                    self._default_dof_pos - self._dof_pos
+                                    + self._motor_zero_offsets)
             - self._kd_scale * self._d_gains * self._dof_vel
         )
         # A real motor cannot exceed its stall torque, and IsaacGym-based legged_gym
@@ -782,6 +903,19 @@ class GenesisSimulator(Simulator):
         # to nominal 1.0 so dr_kp_scale is safe even when randomize_pd_gain is off.
         self._kp_scale_scalar = torch.ones(
             self._num_envs, 1, dtype=torch.float, device=self._device, requires_grad=False)
+        # motor DR trio (go2_rl_gym legged_robot.py:198-206). Both buffers are
+        # always allocated at their nominal value (1.0 / 0.0), so a task that
+        # leaves the flags off keeps a bit-identical torque path. The flags are
+        # cached because they are read inside the per-substep loop; getattr keeps
+        # domain_rand blocks that do not inherit LeggedRobotCfg.domain_rand safe.
+        self._randomize_motor_strength = getattr(
+            self._cfg.domain_rand, "randomize_motor_strength", False)
+        self._randomize_motor_zero_offset = getattr(
+            self._cfg.domain_rand, "randomize_motor_zero_offset", False)
+        self._motor_strengths = torch.ones(
+            self._num_envs, self._num_dof, dtype=torch.float, device=self._device, requires_grad=False)
+        self._motor_zero_offsets = torch.zeros(
+            self._num_envs, self._num_dof, dtype=torch.float, device=self._device, requires_grad=False)
         # always-present control-delay buffer (int steps). The build path re-inits
         # this when randomize_ctrl_delay is on; default 0 keeps dr_ctrl_delay safe
         # for tasks that never enable delay randomization.
@@ -897,7 +1031,20 @@ class GenesisSimulator(Simulator):
             self._kd_scale[env_ids] = torch_rand_float(
                     kd_lo, kd_hi, (n, self._num_actions), device=self._device)
             self._kp_scale_scalar[env_ids] = self._kp_scale[env_ids].mean(dim=1, keepdim=True)
-    
+
+    def _draw_motor_strengths(self, env_ids):
+        """Per-env, per-DOF motor strength multiplier (go2_rl_gym legged_robot.py:198-203)."""
+        lo, hi = self._cfg.domain_rand.motor_strength_range
+        self._motor_strengths[env_ids] = torch_rand_float(
+            lo, hi, (len(env_ids), self._num_dof), device=self._device)
+
+    def _draw_motor_zero_offsets(self, env_ids):
+        """Per-env, per-DOF motor zero-calibration error (go2_rl_gym legged_robot.py:204-206)."""
+        lo, hi = self._cfg.domain_rand.motor_zero_offset_range
+        self._motor_zero_offsets[env_ids] = torch_rand_float(
+            lo, hi, (len(env_ids), self._num_dof), device=self._device)
+
+
     def _update_depth_camera(self):
         """ Renders the depth camera and retrieves the depth images
         """

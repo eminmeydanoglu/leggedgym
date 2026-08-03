@@ -168,12 +168,14 @@ def heightfield_mesh_arrays(
         normalized = (heights - h_min) / (h_max - h_min)
     else:
         normalized = np.zeros_like(heights)
-    # Dark forest green with a slight height gradient; steep cells darken so
-    # stair rings stay readable even when normals are smoothed.
+    # Mid forest green with a slight height gradient; steep cells darken so
+    # stair rings stay readable even when normals are smoothed.  Brightness is
+    # tuned for the viewer's explicit-light setup (no IBL): roughly 2.5x the
+    # old dark-forest values so the ground reads as a lit lawn, not a cave.
     colors = np.zeros((len(heights), 4), dtype=np.uint8)
-    colors[:, 0] = (9 + 12 * normalized - 4 * edge_w).clip(0, 255).astype(np.uint8)
-    colors[:, 1] = (28 + 22 * (1 - normalized) - 10 * edge_w).clip(0, 255).astype(np.uint8)
-    colors[:, 2] = (14 + 9 * normalized - 4 * edge_w).clip(0, 255).astype(np.uint8)
+    colors[:, 0] = (24 + 28 * normalized - 9 * edge_w).clip(0, 255).astype(np.uint8)
+    colors[:, 1] = (72 + 52 * (1 - normalized) - 24 * edge_w).clip(0, 255).astype(np.uint8)
+    colors[:, 2] = (36 + 22 * normalized - 9 * edge_w).clip(0, 255).astype(np.uint8)
     colors[:, 3] = 255
 
     if hard_edges:
@@ -469,15 +471,19 @@ class MjcfKinematicModel:
             mesh.apply_transform(T_geom)
             
             if geom.rgba is not None:
-                # use a matte (non-metallic, fully rough) PBR material instead of
-                # vertex colors - otherwise the mesh picks up the environment map's
-                # default glossy reflectance and looks washed out / overexposed
+                # Dark charcoal finish, fully diffuse: metalness must stay 0
+                # because there is no environment map to reflect (metallic
+                # without IBL renders black).  The MJCF ships a light 0.55
+                # "metal" gray that reads as plasticky white under bright
+                # lights; scaling the albedo down makes the robot read like
+                # the real dark-charcoal machine.
                 base_color = np.clip(geom.rgba, 0, 1).astype(np.float64)
+                base_color[:3] *= 0.35
                 mesh.visual = trimesh.visual.TextureVisuals(
                     material=trimesh.visual.material.PBRMaterial(
                         baseColorFactor=tuple(base_color),
                         metallicFactor=0.0,
-                        roughnessFactor=1.0,
+                        roughnessFactor=0.85,
                     )
                 )
             
@@ -607,25 +613,35 @@ class ViserViewer:
         # intensity - disable them and light the scene explicitly instead
         self.server.scene.configure_default_lights(enabled=False)
 
-        # use the HDRI only for lighting (reflections/shading on the robot's
-        # materials) - background=False keeps the studio backdrop (walls, floor,
-        # light stands) from being rendered, so we get a plain black sky instead
-        self.server.scene.configure_environment_map(
-            hdri="studio",
-            background=False,
-            environment_intensity=0.35,
+        # No HDRI image-based lighting: the viser client presets are HDR
+        # gainmaps whose softbox peaks reach tens of linear units, so even
+        # "intensity 0.35" washes albedos out (and any non-zero metalness on
+        # the robot turns into a mirror of the bright softboxes).  Explicit
+        # lights only: a strong shadowed sun + fills keeps the scene bright
+        # while albedos keep their intended value.  (viser's own default is a
+        # city HDRI at 1.0 plus a 3.0 sun - pure blow-out.)
+        self.server.scene.configure_environment_map(hdri=None)
+        self.server.scene.set_background_image(
+            np.full((2, 2, 3), 232, dtype=np.uint8)
         )
-        self.server.scene.set_background_image(np.zeros((2, 2, 3), dtype=np.uint8))
-        # Dimmed sun: the terrain top faces are lit directly from above, so a
-        # bright sun washed the dark-green ground out to a pale green when viewed
-        # from the top.  1.0 keeps the robot readable while letting the terrain
-        # stay dark.
         self.server.scene.add_light_directional(
             "/sun",
             color=(255, 255, 255),
-            intensity=1.0,
+            intensity=2.2,
             cast_shadow=True,
             position=(3.0, -3.0, 5.0),
+        )
+        self.server.scene.add_light_directional(
+            "/fill",
+            color=(255, 255, 255),
+            intensity=0.5,
+            cast_shadow=False,
+            position=(-3.0, 3.0, 2.0),
+        )
+        self.server.scene.add_light_ambient(
+            "/ambient",
+            color=(255, 255, 255),
+            intensity=0.55,
         )
 
         self._setup_camera()
@@ -646,7 +662,10 @@ class ViserViewer:
 
     def _setup_camera_gui(self) -> None:
         """Add camera tracking and FOV controls."""
-        self._camera_tracking_enabled = False
+        # Default to tracking: in play mode the tracked robot can spawn meters
+        # from the world origin (terrain tiles), so a fixed origin-centered
+        # camera opens on empty ground.  Untick for free orbit.
+        self._camera_tracking_enabled = True
         self._camera_fov_degrees = 60.0
 
         with self.server.gui.add_folder("Camera"):

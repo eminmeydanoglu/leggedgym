@@ -29,6 +29,10 @@ class Go2MoECTS(WtyCurriculumMixin, LeggedRobotCTS):
     """
 
     def compute_observations(self):
+        # vendored post_physics_step order: push AFTER reward + reset_idx,
+        # BEFORE observations (ref legged_robot.py:138-143). The HIM arm runs
+        # the same call from the mixin's compute_observations wrap.
+        self._push_robots_if_due()
         # student obs (45), clean -- noise is added after the privileged obs
         # is built so privileged/critic obs stay clean (vendored ordering).
         self.obs_buf = torch.cat((
@@ -51,7 +55,7 @@ class Go2MoECTS(WtyCurriculumMixin, LeggedRobotCTS):
             self.obs_buf,                                                       # 45
             self.feet_force_norm * 1e-3,                                        # 4
             self.simulator.torques / self.simulator.torque_limits,              # 12
-            (self.simulator.last_dof_vel - self.simulator.dof_vel) / self.dt * 1e-4,  # 12
+            (self._wty_last_dof_vel - self.simulator.dof_vel) / self.dt * 1e-4,  # 12
             heights,                                                            # 187
         ), dim=-1)
         self.privileged_obs_buf = privileged_obs
@@ -75,6 +79,13 @@ class Go2MoECTS(WtyCurriculumMixin, LeggedRobotCTS):
                 for i in range(self.obs_history_deque.maxlen)],
             dim=-1,
         )
+
+        # Refresh the control-rate dof_vel tracker LAST, mirroring the vendored
+        # post_physics_step tail (ref legged_robot.py:143-145). This class's own
+        # compute_observations shadows the mixin's cooperative wrap in the MRO,
+        # so the MoE arm refreshes inline here; the HIM arm gets the same
+        # refresh from WtyCurriculumMixin.compute_observations.
+        self._wty_last_dof_vel[:] = self.simulator.dof_vel[:]
 
     def _get_noise_scale_vec(self):
         """Noise vector for the vendored 45-dim obs layout
