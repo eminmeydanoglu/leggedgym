@@ -319,7 +319,12 @@ class TestMoECTSGradientFlow(unittest.TestCase):
 
 
 class TestMoECTSBootstrap(unittest.TestCase):
-    """Role-aware bootstrap in compute_returns and rollout-time values in act."""
+    """Role-aware bootstrap in compute_returns and rollout-time values in act.
+
+    Roles are the reference's INTERLEAVED env ids (moe_cts.py:96-102): with
+    num_envs=8 / ratio 0.75 the students are {0, 4} and the teachers the rest;
+    tensors crossing the storage boundary stay in env order.
+    """
 
     def setUp(self):
         self.ac = _make_ac()
@@ -327,6 +332,9 @@ class TestMoECTSBootstrap(unittest.TestCase):
         self.alg = PPO_MOE_CTS(self.ac, device="cpu", num_teacher=self.num_teacher)
         self.storage = _FakeMoECTSStorage(self.num_envs, self.num_teacher, 4)
         self.alg.storage = self.storage
+        from rsl_rl.algorithms.ppo_moe_cts import compute_role_env_idxs
+        self.teacher_idxs, self.student_idxs = compute_role_env_idxs(
+            self.num_envs, self.alg.teacher_env_ratio, "cpu")
 
     def test_compute_returns_role_aware_calls(self):
         critic_obs = torch.randn(self.num_envs, NUM_CRITIC)
@@ -340,8 +348,10 @@ class TestMoECTSBootstrap(unittest.TestCase):
         self.assertIs(s_call.kwargs["is_teacher"], False)
         self.assertEqual(tuple(s_call.args[0].shape),
                          (self.num_envs - self.num_teacher, NUM_CRITIC))
-        # the student arm receives the student slice of the history
-        self.assertTrue(torch.equal(s_call.args[1], hist[self.num_teacher:]))
+        # the role arms receive the interleaved role gathers
+        self.assertTrue(torch.equal(t_call.args[0], critic_obs[self.teacher_idxs]))
+        self.assertTrue(torch.equal(s_call.args[0], critic_obs[self.student_idxs]))
+        self.assertTrue(torch.equal(s_call.args[1], hist[self.student_idxs]))
 
     def test_compute_returns_bootstrap_values_sentinel(self):
         n_student = self.num_envs - self.num_teacher
@@ -354,7 +364,10 @@ class TestMoECTSBootstrap(unittest.TestCase):
         with mock.patch.object(self.ac, "evaluate", side_effect=fake_evaluate):
             self.alg.compute_returns(torch.randn(self.num_envs, NUM_CRITIC),
                                      torch.randn(self.num_envs, NUM_HISTORY))
-        expected = torch.cat((sentinel_t, sentinel_s), dim=0)
+        # last_values cross the storage boundary in env order
+        expected = torch.empty(self.num_envs, 1)
+        expected[self.teacher_idxs] = sentinel_t
+        expected[self.student_idxs] = sentinel_s
         self.assertTrue(torch.allclose(self.storage.last_bootstrap_values, expected))
 
     def test_compute_returns_requires_history(self):
@@ -368,11 +381,13 @@ class TestMoECTSBootstrap(unittest.TestCase):
         critic = torch.randn(self.num_envs, NUM_CRITIC)
         actions = self.alg.act(obs, priv, hist, critic)
         self.assertEqual(tuple(actions.shape), (self.num_envs, NUM_ACTIONS))
-        expected = torch.cat((
-            self.ac.evaluate(critic[:self.num_teacher], is_teacher=True),
-            self.ac.evaluate(critic[self.num_teacher:], hist[self.num_teacher:],
-                             is_teacher=False),
-        ), dim=0).detach()
+        # transition.values are role-aware and in env order
+        with torch.no_grad():
+            expected = torch.empty(self.num_envs, 1)
+            expected[self.teacher_idxs] = self.ac.evaluate(
+                critic[self.teacher_idxs], is_teacher=True)
+            expected[self.student_idxs] = self.ac.evaluate(
+                critic[self.student_idxs], hist[self.student_idxs], is_teacher=False)
         self.assertTrue(torch.allclose(self.alg.transition.values, expected, atol=1e-6))
         # and they differ from the old teacher-latent-for-all-envs evaluation
         self.assertFalse(torch.allclose(self.alg.transition.values,
@@ -420,10 +435,10 @@ class TestMoECTSUpdateStats(unittest.TestCase):
         orig = self.alg._compute_encoder_losses
 
         def spy(hist_b, priv_b):
-            total, latent, lb, w = orig(hist_b, priv_b)
+            total, latent, lb, w, pred, target = orig(hist_b, priv_b)
             records.append((latent.item(), lb.item(), total.item(),
                             w.detach(), hist_b.shape[0]))
-            return total, latent, lb, w
+            return total, latent, lb, w, pred, target
 
         self.alg._compute_encoder_losses = spy
         stats = self.alg.update()[4]
@@ -592,6 +607,43 @@ class TestMoECTSRegistryAndConfig(unittest.TestCase):
                       "terrain_proportions", "measure_heights"):
             self.assertEqual(getattr(self.env_cfg.terrain, field),
                              getattr(self.env_cfg_him.terrain, field), field)
+
+
+class TestPPOMoECTSKLConcat(unittest.TestCase):
+    """Adaptive-LR KL is computed over the CONCATENATED teacher+student
+    batch (reference go2_rl_gym moe_cts.py:131-149 parity) -- the host
+    PPO_CTS computes it over the teacher arm only. Pinned here so the MoE
+    arm never silently falls back to teacher-only KL."""
+
+    def setUp(self):
+        self.ac = _make_ac()
+        self.num_envs, self.num_teacher, self.steps = 8, 6, 4
+        self.alg = PPO_MOE_CTS(self.ac, device="cpu", num_teacher=self.num_teacher)
+        self.alg.schedule = "adaptive"
+        self.alg.desired_kl = 0.01
+
+    def test_kl_inputs_are_concatenated_teacher_student(self):
+        alg = self.alg
+        alg.storage = _FakeMoECTSStorage(self.num_envs, self.num_teacher, self.steps)
+        t_n = self.num_teacher * self.steps // alg.num_mini_batches
+        s_n = (self.num_envs - self.num_teacher) * self.steps // alg.num_mini_batches
+
+        calls = []
+        alg._adjust_learning_rate = lambda *args: calls.append(args)
+        alg.update()
+
+        # one KL evaluation per RL minibatch per epoch
+        self.assertEqual(len(calls),
+                         alg.num_learning_epochs * alg.num_mini_batches)
+        for sigma, old_sigma, mu, old_mu in calls:
+            for tensor in (sigma, old_sigma, mu, old_mu):
+                self.assertEqual(tensor.shape[0], t_n + s_n,
+                                 "KL batch must span teacher+student samples")
+                self.assertEqual(tensor.shape[1], NUM_ACTIONS)
+            # sigma/old_sigma are std devs: positivity distinguishes them
+            # from the mu tensors and confirms argument order
+            self.assertTrue(torch.all(sigma > 0))
+            self.assertTrue(torch.all(old_sigma > 0))
 
 
 if __name__ == "__main__":

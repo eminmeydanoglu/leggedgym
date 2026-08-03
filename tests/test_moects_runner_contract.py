@@ -19,6 +19,7 @@ import contextlib
 import io
 import os
 import re
+import tempfile
 import unittest
 from collections import deque
 from unittest import mock
@@ -153,8 +154,14 @@ class TelemetryMappingTest(unittest.TestCase):
         # Existing CTS channels must survive unchanged (fed by the 5-tuple's
         # first four values).
         for name in ("Loss/value_function", "Loss/teacher_surrogate",
-                     "Loss/student_surrogate", "Loss/reconstruction"):
+                     "Loss/student_surrogate"):
             self.assertIn(name, scalars)
+        # 'Loss/reconstruction' is the one deliberate exception: on this arm it
+        # IS moe_stats['latent_mse'], so MoECTSRunner.log filters the duplicate
+        # tag (see _DropScalarTags and
+        # test_moects_telemetry.test_drop_scalar_tags_filters_reconstruction_only).
+        self.assertNotIn("Loss/reconstruction", scalars)
+        self.assertIn("Loss/latent_mse", scalars)
         # Pinned MoE telemetry names.
         expected = {
             "Loss/latent_mse", "Loss/load_balance", "Loss/student_encoder_total",
@@ -201,6 +208,111 @@ class TelemetryMappingTest(unittest.TestCase):
         self.assertIn("MoE student encoder total:", out)
         self.assertIn("MoE gating entropy:", out)
         self.assertIn("MoE effective experts:", out)
+
+
+class CheckpointIterationSemanticsTest(unittest.TestCase):
+    """Exercise MoECTSRunner.learn's real intermediate-save call site."""
+
+    class _Env:
+        num_envs = 1
+
+        def __init__(self):
+            self.observation_calls = 0
+
+        def get_observations(self):
+            self.observation_calls += 1
+            obs = torch.zeros(1, 1)
+            return obs.clone(), obs.clone(), obs.clone(), obs.clone()
+
+        def step(self, actions):
+            obs = torch.zeros(1, 1)
+            rewards = torch.zeros(1)
+            dones = torch.zeros(1)
+            return obs.clone(), obs.clone(), obs.clone(), obs.clone(), rewards, dones, {}
+
+    class _Alg:
+        def __init__(self):
+            self.actor_critic = torch.nn.Linear(1, 1)
+            self.optimizer = torch.optim.Adam(self.actor_critic.parameters(), lr=1e-3)
+            self.teacher_env_idxs = torch.tensor([0])
+
+        def act(self, obs, privileged_obs, obs_history, critic_obs):
+            return torch.zeros(1, 1)
+
+        def process_env_step(self, rewards, dones, infos):
+            pass
+
+        def compute_returns(self, critic_obs, obs_history):
+            pass
+
+        def update(self):
+            return 1.0, 2.0, 3.0, 4.0, {}
+
+    def _make_runner(self, log_dir, current_learning_iteration):
+        runner = MoECTSRunner.__new__(MoECTSRunner)
+        runner.env = self._Env()
+        runner.alg = self._Alg()
+        runner.device = torch.device("cpu")
+        runner.num_steps_per_env = 1
+        runner.save_interval = 1
+        runner.log_dir = log_dir
+        runner.writer = None
+        runner.tot_timesteps = 0
+        runner.tot_time = 0.0
+        runner.current_learning_iteration = current_learning_iteration
+        runner.training_seed = None
+        runner._active_schedule_start = None
+        runner._active_schedule_range = None
+        runner.best_eval_score = float("inf")
+        runner.best_tracking_key = None
+        runner.eval_interval = 0
+        runner._aux_optimizers = lambda: {}
+        runner._pre_learn = lambda *_args, **_kwargs: None
+        runner.log = lambda _locs: None
+        return runner
+
+    def test_fresh_and_resumed_intermediate_checkpoints_use_completed_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._make_runner(tmp, current_learning_iteration=0)
+            fresh.learn(num_learning_iterations=2)
+            self.assertEqual(fresh.current_learning_iteration, 2)
+
+            resumed = self._make_runner(tmp, current_learning_iteration=2)
+            resumed.learn(num_learning_iterations=2)
+            self.assertEqual(resumed.current_learning_iteration, 4)
+
+            checkpoint_names = sorted(
+                name for name in os.listdir(tmp) if name.startswith("model_")
+            )
+            self.assertEqual(
+                checkpoint_names,
+                ["model_1.pt", "model_2.pt", "model_3.pt", "model_4.pt"],
+            )
+            for completed_iteration in range(1, 5):
+                path = os.path.join(tmp, f"model_{completed_iteration}.pt")
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+                self.assertEqual(payload["iter"], completed_iteration)
+                self.assertEqual(payload["iteration_semantics"], "completed_updates_v2")
+
+    def test_eval_runs_after_each_saved_checkpoint_and_refreshes_moe_observations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self._make_runner(tmp, current_learning_iteration=0)
+            runner.eval_interval = 1
+            evaluated = []
+            runner._run_eval = lambda iteration: evaluated.append(iteration)
+            runner.learn(num_learning_iterations=2)
+            self.assertEqual(evaluated, [1, 2])
+
+    def test_isolated_eval_never_refreshes_training_rollout_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self._make_runner(tmp, current_learning_iteration=0)
+            runner.eval_interval = 1
+            runner.eval_env = object()
+            evaluated = []
+            runner._run_eval = lambda iteration: evaluated.append(iteration)
+            runner.learn(num_learning_iterations=2)
+            self.assertEqual(evaluated, [1, 2])
+            self.assertEqual(runner.env.observation_calls, 1)
 
 
 class ClassResolutionTest(unittest.TestCase):
@@ -268,6 +380,20 @@ class ClassResolutionTest(unittest.TestCase):
         self.assertIsInstance(runner.alg, PPO_MOE_CTS)
         self.assertIsInstance(runner.alg.actor_critic, ActorCriticMoECTS)
         self.assertIsInstance(runner.alg.storage, RolloutStorageMoECTS)
+
+    def test_interleaved_role_idxs_wired_through(self):
+        # env: 8 envs / 6 teachers (ratio 0.75) -> reference interleave
+        # (moe_cts.py:96-102): students {0, 4}, teachers the rest. The runner
+        # construction must wire the same mapping into alg AND storage.
+        from rsl_rl.algorithms.ppo_moe_cts import compute_role_env_idxs
+        runner = self._construct_moe_runner()
+        ti, si = compute_role_env_idxs(8, 0.75, "cpu")
+        self.assertEqual(si.tolist(), [0, 4])
+        self.assertEqual(ti.tolist(), [1, 2, 3, 5, 6, 7])
+        self.assertTrue(torch.equal(runner.alg.teacher_env_idxs, ti))
+        self.assertTrue(torch.equal(runner.alg.student_env_idxs, si))
+        self.assertTrue(torch.equal(runner.alg.storage.teacher_env_idxs, ti))
+        self.assertTrue(torch.equal(runner.alg.storage.student_env_idxs, si))
 
 
 if __name__ == "__main__":

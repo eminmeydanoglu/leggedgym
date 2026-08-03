@@ -402,7 +402,14 @@ class OnPolicyRunner:
                     sync_tensorboard=True,
                     config=self.all_cfg,
                 )
-            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            # When appending to the same run after a checkpoint resume,
+            # TensorBoard must discard stale scalar events from the interrupted
+            # process at and after this completed iteration.  ``purge_step``
+            # emits TensorBoard's standard restart marker while retaining the
+            # earlier checkpoint history in the same run directory.
+            purge_step = self.current_learning_iteration if self.current_learning_iteration > 0 else None
+            self.writer = SummaryWriter(
+                log_dir=self.log_dir, flush_secs=10, purge_step=purge_step)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
@@ -499,8 +506,15 @@ class OnPolicyRunner:
         )
 
         self.alg.actor_critic.eval()
+        # MoE-CTS can attach a dedicated scene so checkpoint evaluation never
+        # resets the PPO rollout environment.  Existing runners leave this
+        # unset and retain their legacy shared-env behavior.
+        eval_env = getattr(self, "eval_env", None) or self.env
+        reset_eval_state = getattr(self, "_reset_eval_env_state", None)
+        if eval_env is not self.env and callable(reset_eval_state):
+            reset_eval_state()
         metrics = run_indist_eval(
-            self.env,
+            eval_env,
             adapter=adapter if adapter is not None else self.get_eval_adapter(),
             steps=self.eval_steps,
             warmup=self.eval_warmup,

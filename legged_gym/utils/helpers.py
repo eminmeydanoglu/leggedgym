@@ -77,6 +77,26 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
     from legged_gym.scripts.eval.ckpt_utils import resolve_checkpoint_path
     return resolve_checkpoint_path(run_dir, checkpoint)
 
+
+# MoE-CTS interleaves one student environment every four environments.  A
+# one-environment debug run therefore has no teacher role at all and fails the
+# reference split's exact-count checks.  Keep the exception task-specific so
+# existing debug runs retain their one-environment behavior.
+_MOE_CTS_DEBUG_TASKS = frozenset(("go2_moects",))
+_MOE_CTS_DEBUG_NUM_ENVS = 4
+
+
+def debug_num_envs_for_task(task):
+    """Return the smallest debug batch that is valid for ``task``.
+
+    Most tasks intentionally keep the historical ``--debug`` behavior of one
+    environment.  MoE-CTS uses a 3:1 interleaved teacher/student split, so its
+    smallest exact batch is four environments (three teachers and one
+    student).
+    """
+    return _MOE_CTS_DEBUG_NUM_ENVS if task in _MOE_CTS_DEBUG_TASKS else 1
+
+
 def update_cfg_from_args(env_cfg, cfg_train, args):
     """Override some configuration parameters from command line arguments
        Called in task_registry.py/make_env()
@@ -166,6 +186,8 @@ def get_args():
     parser.add_argument('--dashboard_run_id', type=str, default=None,
                         help="optional persistent Curriculum Atlas run id")
     parser.add_argument('--load_run',       type=str, default=None, help="run to load, default: last run")
+    parser.add_argument('--continue_log_dir', type=str, default=None,
+                        help="append logs/checkpoints to an existing run directory (requires --resume)")
     parser.add_argument('--ckpt',           type=str, default='-1',
                         help="checkpoint: best_tracking, best, latest, or iteration (-1 = latest)")
     parser.add_argument('--use_joystick',   action='store_true', default=False, help="use joystick to provide commands")
@@ -257,17 +279,18 @@ class PolicyExporterTS(torch.nn.Module):
         return self.actor(x)
  
     def export(self, path, env_cfg, export_onnx=False, train_cfg=None):
-        os.makedirs(path, exist_ok=True)
+        export_dir = path
+        os.makedirs(export_dir, exist_ok=True)
         filename = train_cfg.runner.load_run + "_ite" + str(train_cfg.runner.checkpoint) + ".pt"
-        path = os.path.join(path, filename)
+        path_pt = os.path.join(export_dir, filename)
         self.to('cpu')
         traced_script_module = torch.jit.script(self)
-        traced_script_module.save(path)
+        traced_script_module.save(path_pt)
         
         # export onnx model if needed
         if export_onnx:
             filename = train_cfg.runner.load_run + "_ite" + str(train_cfg.runner.checkpoint) + ".onnx"
-            path_onnx = os.path.join(path, filename)
+            path_onnx = os.path.join(export_dir, filename)
             input_names = ["obs_input", "obs_history_input"]
             output_names = ["nn_output"]
             dummy_obs = torch.randn(1, env_cfg.env.num_observations)

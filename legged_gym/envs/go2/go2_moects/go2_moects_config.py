@@ -9,13 +9,66 @@ from legged_gym.envs.base.template_cfgs import LeggedRobotCTSCfgPPO, LeggedRobot
 from legged_gym.envs.base.common_cfgs import Go2FlatCommonCfg, get_simulator_suffix
 
 
+# --- fleet size and budget anchors ---------------------------------------
+# The vendored repo trains at 8192 envs.  The AWS L4 campaign uses the same
+# fleet size, so one PPO update carries the source-faithful sample count.
+VENDORED_NUM_ENVS = 8192
+NUM_ENVS = 8192
+# Planned total PPO iterations. The vendored 150k is a sentinel, not a tuned
+# budget: the vendored base default is 1500, the identical 150000 is repeated
+# verbatim across all eight arm configs, and the last real curriculum event
+# lands at vendored iteration 50000 -- the remaining 100k iterations change
+# nothing in the recipe. 30k here is a deliberate budget decision.
+VENDORED_MAX_ITERATIONS = 150000
+MAX_ITERATIONS = 30000
+
+# The vendored curricula use absolute iteration thresholds, and they mix two
+# different kinds of schedule. Rescaling both the same way is what compresses
+# the early phase 5x at a 30k budget, so they are anchored separately here:
+#
+#   * Early SHAPING ramps (zero_command end 1500, lin_vel_z ramp end 1500,
+#     correct_base_height ramp end 5000) track a learning-time constant -- how
+#     long basic gait takes to form. That does not shrink when the total
+#     budget shrinks: pulling the lin_vel_z shaping before the gait is stable
+#     fails in a way that reads as "not enough iterations" but is not. It does
+#     scale with iteration SIZE, so at 4096 envs the same sample count takes
+#     twice as many iterations. -> _shaping_ratio
+#
+#   * Late command_range steps (vendored 20000, 50000) are staged difficulty
+#     and are legitimately a fraction of the budget. They cannot be
+#     sample-corrected anyway -- 20000 * 2 / 30000 > 1.0 would mean the first
+#     widening never fires. Compression is tolerable here because the
+#     difficulty curriculum that actually matters, the terrain level, is
+#     performance-gated (_update_terrain_curriculum), not iteration-gated.
+#     -> _staged_ratio
+_SHAPING_ITER_SCALE = VENDORED_NUM_ENVS / NUM_ENVS   # 1.0 at 8192 envs
+
+
+def _shaping_ratio(vendored_iter):
+    """Vendored absolute iteration -> fraction of THIS run's budget, holding
+    the shaping phase's SAMPLE count constant rather than its budget share.
+    At 8192 envs / 30k iters: 1500 -> 0.05 (iter 1500), 5000 -> 1/6 (iter 5000).
+    """
+    return min(vendored_iter * _SHAPING_ITER_SCALE / MAX_ITERATIONS, 1.0)
+
+
+def _staged_ratio(vendored_iter):
+    """Vendored absolute iteration -> fraction of the vendored budget, i.e.
+    staged difficulty compresses proportionally when the budget shrinks.
+    At 30k iters: 20000 -> iter 4000, 50000 -> iter 10000.
+    """
+    return vendored_iter / VENDORED_MAX_ITERATIONS
+
+
 class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
     """Shared go2_rl_gym substrate. Host URDF/XML paths, control gains and
     asset block come from Go2FlatCommonCfg (identical values in the vendored
     repo); everything else follows the vendored go2_config.py."""
 
     class env(Go2FlatCommonCfg.env):
-        num_envs = 8192             # vendored; host default 4096
+        num_envs = NUM_ENVS         # 8192 this campaign (vendored); the
+                                    # shaping-ramp anchors above are derived
+                                    # from this -- keep them together
         episode_length_s = 25       # vendored
         # PPO iteration length assumed by the iteration-based curricula
         # (command_range_curriculum, zero_command_curriculum,
@@ -86,7 +139,17 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
         measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.,
                              0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]  # 1mx1.6m rectangle
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
-        max_init_terrain_level = 5  # vendored
+        # DEVIATION from vendored (5): start every env on row 0, the mildest
+        # rendering of its own terrain type -- 5 cm stairs, 5.7 deg slopes,
+        # 5 cm obstacles, +/-10 cm waves (see make_moe_terrain's difficulty
+        # table in utils/terrain.py). The terrain TYPE mix is fixed by the
+        # round-robin column assignment and cannot be ramped without
+        # reassigning terrain_types at runtime, so row 0 is the "near-flat"
+        # warmup this curriculum can express: envs only reach real stairs by
+        # earning promotions through _update_terrain_curriculum. The vendored
+        # 5 started every env at mean level 2.5, i.e. 16 cm stairs / 13 deg
+        # slopes from iteration 0.
+        max_init_terrain_level = 0
         terrain_length = 8.0
         terrain_width = 8.0
         num_rows = 10               # difficulty levels
@@ -337,6 +400,29 @@ class Go2MoECTSCfgPPO(LeggedRobotCTSCfgPPO):
                                     # UHeM A100; curricula are ratio-based and
                                     # rescale with this -- see env.curriculum_total_iterations)
         save_interval = 500         # vendored
+        # Short, fixed in-distribution student eval at every periodic checkpoint.
+        # 150 measured + 20 warm-up control steps costs about 12s on the L4,
+        # while fall/tracking trends remain directly comparable over the run.
+        eval_interval = 500
+        eval_steps = 150
+        eval_warmup = 20
+        eval_seed = 12345
+        eval_fall_guard = 0.25
+        # Built once and used only at checkpoints; keeps the 8192-env PPO
+        # scene untouched.  384 preserves the 3:1 MoE role split exactly.
+        eval_num_envs = 384
+        # Terrain-conditioned MoE gating telemetry (TELEMETRY ONLY, see
+        # MoECTSRunner._log_terrain_gate_stats): every Nth iteration, snapshot
+        # the student history-encoder gating weights on the current student
+        # envs' obs history and bucket by semantic terrain id, emitting the
+        # MoE/terrain_gate/<name>/expert_<i>, MoE/terrain_entropy/<name>,
+        # MoE/terrain_max_weight/<name> and MoE/terrain_specialization
+        # TensorBoard scalars. Runs under torch.no_grad() and touches no RNG
+        # stream or optimizer state, so it cannot affect training dynamics or
+        # resume. 0 disables it entirely; 10 costs one extra ~1.1M-param MLP
+        # forward over ~2048 student rows every 10 iterations (negligible
+        # next to the PPO update).
+        terrain_gate_log_interval = 10
 
 
 class Go2MoECTSHIMCfg(Go2MoECTSCommonCfg):

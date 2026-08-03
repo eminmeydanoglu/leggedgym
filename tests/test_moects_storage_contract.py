@@ -6,7 +6,9 @@ minibatch contract shared with the algorithm/runner ports:
     (teacher_batch, student_batch, teacher_critic, student_critic)
 
 with role-pure, sample-aligned CriticMiniBatch batches, and role tuples that
-are field-for-field identical to the host RolloutStorageCTS output.
+are field-for-field identical to the host RolloutStorageCTS output (host fed
+in role-grouped env order). Roles follow the reference's INTERLEAVED env
+mapping (moe_cts.py:96-102); the stored tensors stay in env order.
 
 Run:  .venv/bin/python -m unittest tests.test_moects_storage_contract -v
 (or:  .venv/bin/python -m unittest tests/test_moects_storage_contract.py -v)
@@ -16,10 +18,15 @@ import unittest
 
 import torch
 
+from rsl_rl.algorithms.ppo_moe_cts import compute_role_env_idxs
 from rsl_rl.storage import CriticMiniBatch, RolloutStorageCTS, RolloutStorageMoECTS
 
 NUM_ENVS = 8
-NUM_TEACHER = 4                      # teacher envs: indices [0, 4)
+NUM_TEACHER = 4
+TEACHER_RATIO = NUM_TEACHER / NUM_ENVS      # 0.5 -> every 2nd env is a student
+# Interleaved reference mapping (moe_cts.py:96-102): students {0,2,4,6},
+# teachers {1,3,5,7} -- NOT contiguous [0,4) / [4,8) blocks.
+TEACHER_IDXS, STUDENT_IDXS = compute_role_env_idxs(NUM_ENVS, TEACHER_RATIO, "cpu")
 NUM_STUDENT = NUM_ENVS - NUM_TEACHER
 T = 6                                # num_transitions_per_env
 NUM_OBS = 12
@@ -35,30 +42,46 @@ HIST_SHAPE = (NUM_HISTORY,)
 CRITIC_SHAPE = (NUM_CRITIC,)
 ACTION_SHAPE = (NUM_ACTIONS,)
 
+TEACHER_TIDS = torch.tensor([float(e * T + s) for e in TEACHER_IDXS.tolist() for s in range(T)])
+STUDENT_TIDS = torch.tensor([float(e * T + s) for e in STUDENT_IDXS.tolist() for s in range(T)])
+
+
+# Role-grouped env order: teacher envs first (in idx order), then students.
+# Feeding the HOST (contiguous) storage rows in this order makes its
+# contiguous [0, NUM_TEACHER) / [NUM_TEACHER, NUM_ENVS) split describe exactly
+# the MoE storage's interleaved role groups.
+GROUPED_ENVS = TEACHER_IDXS.tolist() + STUDENT_IDXS.tolist()
+
 
 def _tid(env, step):
-    """Unique transition id; doubles as role bit: tid < NUM_TEACHER*T <=> teacher."""
+    """Unique transition id; role membership follows TEACHER_IDXS/STUDENT_IDXS."""
     return float(env * T + step)
 
 
-def _make_storage(storage_cls):
+def _make_storage(storage_cls, **kwargs):
+    extra = {}
+    if storage_cls is RolloutStorageMoECTS:
+        extra = dict(teacher_env_idxs=TEACHER_IDXS, student_env_idxs=STUDENT_IDXS)
+    extra.update(kwargs)
     return storage_cls(
         NUM_ENVS, NUM_TEACHER, T, OBS_SHAPE, PRIV_SHAPE, HIST_SHAPE,
-        CRITIC_SHAPE, ACTION_SHAPE, device="cpu",
+        CRITIC_SHAPE, ACTION_SHAPE, device="cpu", **extra,
     )
 
 
-def _fill_with_sentinels(storage):
+def _fill_with_sentinels(storage, env_order=None):
     """Fill every stored field with the transition id (sentinel).
 
-    compute_returns is intentionally NOT called here: it rewrites returns /
-    teacher_advantages / student_advantages from rewards+values (GAE), which
-    would destroy the sentinels. Its semantics are inherited unchanged from
-    RolloutStorageCTS and covered by a separate smoke test below.
+    env_order: env id encoded at storage row e is env_order[e] (identity when
+    None). compute_returns is intentionally NOT called here: it rewrites
+    returns / teacher_advantages / student_advantages from rewards+values
+    (GAE), which would destroy the sentinels. Its recurrence matches
+    RolloutStorageCTS and is covered by a separate smoke test below.
     """
+    order = list(range(NUM_ENVS)) if env_order is None else env_order
     for step in range(T):
         tr = storage.Transition()
-        rows = torch.tensor([_tid(e, step) for e in range(NUM_ENVS)])
+        rows = torch.tensor([_tid(order[e], step) for e in range(NUM_ENVS)])
         tr.observations = rows.unsqueeze(1).expand(NUM_ENVS, NUM_OBS).clone()
         tr.privileged_observations = rows.unsqueeze(1).expand(NUM_ENVS, NUM_PRIVILEGED).clone()
         tr.observation_histories = rows.unsqueeze(1).expand(NUM_ENVS, NUM_HISTORY).clone()
@@ -71,14 +94,17 @@ def _fill_with_sentinels(storage):
         tr.action_mean = rows.unsqueeze(1).expand(NUM_ENVS, NUM_ACTIONS).clone()
         tr.action_sigma = rows.unsqueeze(1).expand(NUM_ENVS, NUM_ACTIONS).clone()
         storage.add_transitions(tr)
-    # GAE outputs, sentinel-encoded by hand (compute_returns not run).
+    # GAE outputs, sentinel-encoded by hand (compute_returns not run). The
+    # per-role advantage tensors are role-GROUPED: row e encodes
+    # GROUPED_ENVS[e] / GROUPED_ENVS[NUM_TEACHER + e] regardless of the env
+    # order the main buffers were filled with.
     for step in range(T):
         for e in range(NUM_ENVS):
-            storage.returns[step, e, 0] = _tid(e, step)
+            storage.returns[step, e, 0] = _tid(order[e], step)
         for e in range(NUM_TEACHER):
-            storage.teacher_advantages[step, e, 0] = _tid(e, step)
+            storage.teacher_advantages[step, e, 0] = _tid(GROUPED_ENVS[e], step)
         for e in range(NUM_STUDENT):
-            storage.student_advantages[step, e, 0] = _tid(NUM_TEACHER + e, step)
+            storage.student_advantages[step, e, 0] = _tid(GROUPED_ENVS[NUM_TEACHER + e], step)
 
 
 def _critic_tids(critic):
@@ -142,18 +168,17 @@ class TestCriticMiniBatchContract(unittest.TestCase):
         for teacher_batch, student_batch, teacher_critic, student_critic in gen:
             teacher_tids = teacher_critic.critic_observations[:, 0]
             student_tids = student_critic.critic_observations[:, 0]
-            self.assertTrue(bool((teacher_tids < NUM_TEACHER * T).all()))
-            self.assertTrue(bool((student_tids >= NUM_TEACHER * T).all()))
-            self.assertTrue(bool((student_tids < NUM_ENVS * T).all()))
+            self.assertTrue(bool(torch.isin(teacher_tids, TEACHER_TIDS).all()))
+            self.assertTrue(bool(torch.isin(student_tids, STUDENT_TIDS).all()))
             # teacher_batch / student_batch role purity as well (obs channel)
-            self.assertTrue(bool((teacher_batch[0][:, 0] < NUM_TEACHER * T).all()))
-            self.assertTrue(bool((student_batch[0][:, 0] >= NUM_TEACHER * T).all()))
+            self.assertTrue(bool(torch.isin(teacher_batch[0][:, 0], TEACHER_TIDS).all()))
+            self.assertTrue(bool(torch.isin(student_batch[0][:, 0], STUDENT_TIDS).all()))
 
     def test_coverage_exactly_once_per_epoch_per_role(self):
         num_mini_batches, num_epochs = 4, 2
         gen = self.storage.mini_batch_generator(num_mini_batches, num_epochs)
-        teacher_expected = sorted(float(t) for t in range(0, NUM_TEACHER * T))
-        student_expected = sorted(float(t) for t in range(NUM_TEACHER * T, NUM_ENVS * T))
+        teacher_expected = sorted(TEACHER_TIDS.tolist())
+        student_expected = sorted(STUDENT_TIDS.tolist())
         for epoch in range(num_epochs):
             seen = {k: [] for k in (
                 "teacher_batch", "student_batch", "teacher_critic", "student_critic")}
@@ -173,7 +198,10 @@ class TestCriticMiniBatchContract(unittest.TestCase):
 class TestRoleBatchesMatchHostCTS(unittest.TestCase):
     def test_teacher_student_tuples_identical_to_host(self):
         host = _make_storage(RolloutStorageCTS)
-        _fill_with_sentinels(host)
+        # Host env rows are filled in role-grouped order, so the host's
+        # contiguous role split describes the same role groups as the MoE
+        # storage's interleaved gather.
+        _fill_with_sentinels(host, env_order=GROUPED_ENVS)
         mine = _make_storage(RolloutStorageMoECTS)
         _fill_with_sentinels(mine)
 
@@ -205,8 +233,9 @@ class TestRoleBatchesMatchHostCTS(unittest.TestCase):
 
 
 class TestComputeReturnsIntegration(unittest.TestCase):
-    """compute_returns is inherited from RolloutStorageCTS (same signature and
-    semantics: caller supplies bootstrap values); smoke-test the full path."""
+    """compute_returns runs the base-class per-role GAE recurrence (same
+    signature: caller supplies bootstrap values, in env order) on the
+    interleaved role gathers; smoke-test the full path."""
 
     def test_compute_returns_then_generate(self):
         torch.manual_seed(7)

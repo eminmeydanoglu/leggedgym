@@ -110,7 +110,15 @@ class TaskRegistry():
         if seed is not None:
             run_name = f"{run_name}_seed{seed}"
 
-        if log_root=="default":
+        continue_log_dir = getattr(args, "continue_log_dir", None)
+        if continue_log_dir is not None:
+            if not train_cfg.runner.resume:
+                raise ValueError("--continue_log_dir requires --resume")
+            log_dir = os.path.abspath(os.path.expanduser(continue_log_dir))
+            # ``get_load_path`` probes its root even when --load_run is an
+            # absolute path, so keep it a real directory on continuation.
+            log_root = os.path.dirname(log_dir)
+        elif log_root=="default":
             log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
             log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + run_name)
         elif log_root is None:

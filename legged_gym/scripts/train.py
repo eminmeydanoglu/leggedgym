@@ -3,12 +3,14 @@ import sys
 import json
 import subprocess
 import hashlib
+import copy
 from pathlib import Path
 
 
 from legged_gym import *
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
+from legged_gym.utils.helpers import debug_num_envs_for_task, set_seed
 import shutil
 
 
@@ -299,6 +301,27 @@ def train(args):
             episode_curriculum, task_space = build_ued_teacher(env_cfg)
         env.enable_ued(episode_curriculum, task_space)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
+    # Keep checkpoint evaluation in a persistent, separate Genesis scene.  A
+    # shared scene reset perturbs PPO rollout and terrain-curriculum state.
+    eval_num_envs = int(ppo_runner.cfg.get("eval_num_envs", 0))
+    if eval_num_envs > 0:
+        # Registered configs are nested mutable objects.  Deep-copy before
+        # changing fleet size so the 384-env eval build cannot mutate the
+        # 8192-env training scene's configuration.
+        eval_cfg = copy.deepcopy(env_cfg)
+        eval_cfg.env.num_envs = eval_num_envs
+        eval_args = copy.copy(args)
+        eval_args.num_envs = eval_num_envs
+        eval_env, _ = task_registry.make_env(name=args.task, args=eval_args, env_cfg=eval_cfg)
+        attach_eval_env = getattr(ppo_runner, "attach_eval_env", None)
+        if not callable(attach_eval_env):
+            raise RuntimeError(
+                f"{train_cfg.runner_class_name} has eval_num_envs but no isolated-eval contract")
+        attach_eval_env(eval_env)
+        # Scene construction consumes global RNG; restore the training seed
+        # before the first rollout (eval calls preserve RNG thereafter).
+        set_seed(env_cfg.seed)
+        print(f"[eval] attached isolated persistent scene ({eval_num_envs} envs)")
     if getattr(args, "init_checkpoint", None):
         args._init_provenance = load_v7_flat_initialization(
             ppo_runner, args.task, args.init_checkpoint
@@ -415,7 +438,9 @@ def train(args):
     # Start training session.  ``close`` flushes the final stage frame without
     # changing error propagation from PPO training.
     try:
-        ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+        remaining_iterations = max(
+            0, train_cfg.runner.max_iterations - ppo_runner.current_learning_iteration)
+        ppo_runner.learn(num_learning_iterations=remaining_iterations, init_at_random_ep_len=True)
     finally:
         if dashboard_bridge is not None:
             dashboard_bridge.close()
@@ -423,5 +448,5 @@ def train(args):
 if __name__ == '__main__':
     args = get_args()
     if args.debug:
-        args.num_envs = 1
+        args.num_envs = debug_num_envs_for_task(args.task)
     train(args)

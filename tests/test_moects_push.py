@@ -149,6 +149,11 @@ class TestMoECTSPush(unittest.TestCase):
 
     def test_02_per_env_timing(self):
         env, sim = self.env, self.env.simulator
+        # test_01 deliberately writes high base velocities to every env while
+        # checking the direct overwrite path.  The class shares one Genesis
+        # env, so start this timing test from a fresh episode instead of
+        # letting that probe induce staggered contact resets.
+        env.reset()
         interval = int(env.cfg.domain_rand.push_interval)  # 200
         half = self.NUM_ENVS // 2
 
@@ -162,11 +167,15 @@ class TestMoECTSPush(unittest.TestCase):
         sim.push_robots_overwrite = spy
         try:
             for step in range(1, self.TIMING_STEPS + 1):
-                buf_before = env.episode_length_buf.clone()
                 env.step(self._zero_actions())
-                # host order: episode_length_buf += 1 at the start of
-                # post_physics_step, then the mixin's push callback
-                expected = ((buf_before + 1) % interval == 0).nonzero(
+                # The mixin evaluates the push trigger inside env.step (start
+                # of compute_observations), AFTER reset_idx has zeroed the
+                # buffers of envs that terminated this step. Fresh resets
+                # satisfy 0 % interval == 0 and are pushed too -- the vendored
+                # incidental push after reset (ref go2_rl_gym
+                # legged_robot.py:135-139,714). So the expected set must be
+                # read from the post-step buffer, not buf_before + 1.
+                expected = (env.episode_length_buf % interval == 0).nonzero(
                     as_tuple=False).flatten().cpu()
                 self.assertEqual(len(calls), step)
                 self.assertEqual(

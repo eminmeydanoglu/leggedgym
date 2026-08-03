@@ -461,6 +461,10 @@ class GenesisSimulator(Simulator):
                     file=os.path.join(asset_root, asset_file),
                     pos=np.array(self._cfg.init_state.pos),
                     quat=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
+                    # Locomotion tasks never call Genesis Jacobian / IK APIs;
+                    # avoiding their build-time data structures shortens scene
+                    # initialization without changing forward dynamics.
+                    requires_jac_and_IK=False,
                 )
             )
         else:

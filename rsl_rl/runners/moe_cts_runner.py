@@ -39,6 +39,7 @@ import torch
 
 from rsl_rl.algorithms import PPO_MOE_CTS  # noqa: F401  eval() in _init_agent_and_algo
 from rsl_rl.modules import ActorCriticMoECTS  # noqa: F401  eval() in _init_agent_and_algo
+from rsl_rl.utils.moe_terrain_gate import TERRAIN_NAMES, compute_terrain_gate_stats
 from .cts_runner import CTSRunner
 
 
@@ -66,6 +67,27 @@ class _DropScalarTags:
 
 class MoECTSRunner(CTSRunner):
     """CTSRunner variant for ActorCriticMoECTS + PPO_MOE_CTS."""
+
+    def attach_eval_env(self, eval_env):
+        """Attach one persistent, isolated scene for checkpoint evaluation."""
+        if eval_env is self.env:
+            raise ValueError("MoE-CTS eval_env must differ from the training env")
+        self.eval_env = eval_env
+        self._eval_env_common_step_counter = getattr(eval_env, "common_step_counter", None)
+        state_fn = getattr(eval_env, "curriculum_state_dict", None)
+        self._eval_env_curriculum_state = state_fn() if callable(state_fn) else None
+
+    def _reset_eval_env_state(self):
+        """Restore the fixed eval scene before every seeded rollout."""
+        eval_env = self.eval_env
+        if self._eval_env_common_step_counter is not None:
+            eval_env.common_step_counter = self._eval_env_common_step_counter
+        load_state = getattr(eval_env, "load_curriculum_state_dict", None)
+        if self._eval_env_curriculum_state is not None and callable(load_state):
+            load_state(self._eval_env_curriculum_state)
+        resync = getattr(eval_env, "_wty_resync_curriculum", None)
+        if callable(resync):
+            resync()
 
     def _init_storage(self):
         # Same shapes as CTSRunner; the MoE arm requires RolloutStorageMoECTS.
@@ -116,7 +138,11 @@ class MoECTSRunner(CTSRunner):
         # (incl. any --max_iterations CLI override); no-op for envs without
         # the wty substrate.
         if hasattr(self.env, "set_wty_total_iterations"):
-            self.env.set_wty_total_iterations(num_learning_iterations)
+            # ``num_learning_iterations`` is the remaining count on resume;
+            # curricula stay anchored to the configured full campaign budget.
+            full_budget = getattr(self, "cfg", {}).get(
+                "max_iterations", num_learning_iterations)
+            self.env.set_wty_total_iterations(full_budget)
         obs, privileged_obs, obs_history, critic_obs = self.env.get_observations()
         obs, privileged_obs, obs_history, critic_obs = obs.to(self.device), privileged_obs.to(self.device), \
             obs_history.to(self.device), critic_obs.to(self.device)
@@ -192,10 +218,30 @@ class MoECTSRunner(CTSRunner):
                 mean_student_surrogate_loss, mean_reconstruction_loss, moe_stats = self.alg.update()
             stop = time.time()
             learn_time = stop - start
+            completed_iteration = self.completed_iteration(it)
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            if completed_iteration % self.save_interval == 0:
+                self.save(
+                    os.path.join(self.log_dir, 'model_{}.pt'.format(completed_iteration)),
+                    iteration=completed_iteration,
+                )
+
+            # Periodic in-distribution eval -> Eval/* + best_tracking.pt.
+            # MoE-CTS normally attaches a dedicated small scene.  Keep the
+            # legacy refresh only for callers that deliberately share self.env.
+            if self.eval_interval > 0 and completed_iteration % self.eval_interval == 0:
+                with torch.inference_mode():
+                    self._run_eval(completed_iteration)
+                if getattr(self, "eval_env", self.env) is self.env:
+                    obs, privileged_obs, obs_history, critic_obs = self.env.get_observations()
+                    obs, privileged_obs, obs_history, critic_obs = (
+                        obs.to(self.device), privileged_obs.to(self.device),
+                        obs_history.to(self.device), critic_obs.to(self.device),
+                    )
+                    cur_reward_sum.zero_()
+                    cur_episode_length.zero_()
+                self.alg.actor_critic.train()
             ep_infos.clear()
 
         self.current_learning_iteration += num_learning_iterations
@@ -214,6 +260,7 @@ class MoECTSRunner(CTSRunner):
             self.writer = writer
         self._log_role_split_stats(locs, pad)
         self._log_moe_stats(locs.get('moe_stats') or {}, locs['it'], pad)
+        self._log_terrain_gate_stats(locs)
 
     def _log_role_split_stats(self, locs, pad=35):
         """Per-role Train/* telemetry (reference on_policy_runner_cts.py:245-254).
@@ -311,3 +358,74 @@ class MoECTSRunner(CTSRunner):
                  for key, label in term_keys if moe_stats.get(key) is not None]
         if lines:
             print('\n'.join(lines))
+
+    def _log_terrain_gate_stats(self, locs):
+        """Terrain-conditioned MoE gating snapshot: E[ g_i(x) | terrain_type ].
+
+        TELEMETRY ONLY: a single extra forward pass of the student history
+        encoder over the current student-env obs history (the same tensor
+        the rollout loop just produced, from locs['obs_history']), entirely
+        under torch.no_grad(). StudentMoEEncoder has no dropout/batchnorm/RNG draw
+        in its forward path (see rsl_rl/modules/moe_utils.py), so this cannot
+        perturb parameters, the optimizer, or any RNG stream -- a run with
+        the feature on vs off stays bit-identical modulo the extra TB
+        scalars. Nothing here is added to the checkpoint state dict, so
+        resume is unaffected.
+
+        Degrades to a silent no-op whenever any piece of the terrain/role
+        bookkeeping is missing (non-moe_grid terrain, curriculum inactive, a
+        bare/test runner instance, etc.) -- never raises into the training
+        loop.
+
+        Gated by cfg['terrain_gate_log_interval'] (iterations; 0/missing
+        disables it). Uses completed_iteration (1-based, same convention as
+        eval_interval/save_interval) so interval=10 fires at 10, 20, ...
+        """
+        cfg = getattr(self, 'cfg', None)
+        interval = cfg.get('terrain_gate_log_interval', 0) if cfg is not None else 0
+        if not interval or interval <= 0:
+            return
+        completed_iteration = locs.get('completed_iteration')
+        if completed_iteration is None or completed_iteration % interval != 0:
+            return
+
+        env = getattr(self, 'env', None)
+        terrain_ids = getattr(env, 'wty_terrain_ids', None)
+        if terrain_ids is None:
+            return  # non-moe_grid terrain / curriculum inactive: nothing to bucket by
+
+        student_idxs = getattr(getattr(self, 'alg', None), 'student_env_idxs', None)
+        if student_idxs is None:
+            return
+
+        obs_history = locs.get('obs_history')
+        if obs_history is None:
+            return
+
+        history_encoder = getattr(getattr(self.alg, 'actor_critic', None), 'history_encoder', None)
+        forward_with_weights = getattr(history_encoder, 'forward_with_weights', None)
+        if forward_with_weights is None:
+            return
+
+        try:
+            with torch.no_grad():
+                student_history = obs_history.index_select(0, student_idxs)
+                student_terrain_ids = terrain_ids.index_select(0, student_idxs)
+                _, weights = forward_with_weights(student_history)
+                stats = compute_terrain_gate_stats(weights, student_terrain_ids, TERRAIN_NAMES)
+        except Exception as exc:  # telemetry-only: never take down a live run
+            if not getattr(self, '_terrain_gate_warned', False):
+                print(f"[MoE terrain-gate telemetry] disabled after error: {exc!r}")
+                self._terrain_gate_warned = True
+            return
+
+        if stats is None:
+            return
+
+        it = locs['it']
+        for name, info in stats['per_terrain'].items():
+            for i, w in enumerate(info['mean_gate'].tolist()):
+                self.writer.add_scalar(f'MoE/terrain_gate/{name}/expert_{i}', w, it)
+            self.writer.add_scalar(f'MoE/terrain_entropy/{name}', info['entropy'], it)
+            self.writer.add_scalar(f'MoE/terrain_max_weight/{name}', info['max_weight'], it)
+        self.writer.add_scalar('MoE/terrain_specialization', stats['specialization'], it)
