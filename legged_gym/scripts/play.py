@@ -735,7 +735,12 @@ def play(args):
     actor_only_playback = args.task == 'go2_bench_oracle_id'
     if actor_only_playback:
         train_cfg.runner.resume = False
-    ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    # Play builds its own env (few envs, a user-chosen --terrain), so the
+    # checkpoint's per-env terrain levels describe a geometry that does not
+    # exist here; restoring them is impossible and the strict resume protocol
+    # would hard-fail. Playback uses the play terrain's own levels.
+    ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg,
+                                                          load_env_curriculum=False)
     if actor_only_playback:
         load_oracle_id_actor_for_playback(ppo_runner, train_cfg)
     policy = ppo_runner.get_inference_policy(device=env.device)

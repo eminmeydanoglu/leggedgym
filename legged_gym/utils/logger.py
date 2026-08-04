@@ -41,7 +41,9 @@ class Logger:
         # "dictionary changed size during iteration".
         for key, value in list(dict.items()):
             if 'rew' in key:
-                self.rew_log[key].append(value.item() * num_episodes)
+                # episode dicts mix 0-d tensors (episode_sums means) with plain
+                # python floats (e.g. the moects telemetry entries), so accept both.
+                self.rew_log[key].append(float(value) * num_episodes)
         self.num_episodes += num_episodes
 
     def reset(self):

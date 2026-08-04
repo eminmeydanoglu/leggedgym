@@ -68,7 +68,8 @@ class TaskRegistry():
                             headless=args.headless)
         return env, env_cfg
 
-    def make_alg_runner(self, env, name=None, args=None, train_cfg=None, log_root="default"):
+    def make_alg_runner(self, env, name=None, args=None, train_cfg=None, log_root="default",
+                        load_env_curriculum=True):
         """ Creates the training algorithm  either from a registered namme or from the provided config file.
 
         Args:
@@ -76,8 +77,11 @@ class TaskRegistry():
             name (string, optional): Name of a registered env. If None, the config file will be used instead. Defaults to None.
             args (Args, optional): Isaac Gym comand line arguments. If None get_args() will be called. Defaults to None.
             train_cfg (Dict, optional): Training config file. If None 'name' will be used to get the config file. Defaults to None.
-            log_root (str, optional): Logging directory for Tensorboard. Set to 'None' to avoid logging (at test time for example). 
+            log_root (str, optional): Logging directory for Tensorboard. Set to 'None' to avoid logging (at test time for example).
                                       Logs will be saved in <log_root>/<date_time>_<run_name>. Defaults to "default"=<path_to_LEGGED_GYM>/logs/<experiment_name>.
+            load_env_curriculum (bool, optional): Forwarded to runner.load(). Restoring the
+                                      checkpoint's per-env terrain levels only makes sense when this env
+                                      has the training geometry; play.py passes False.
 
         Raises:
             ValueError: Error if neither 'name' or 'train_cfg' are provided
@@ -140,7 +144,7 @@ class TaskRegistry():
             # load previously trained model
             resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
             print(f"Loading model from: {resume_path}")
-            runner.load(resume_path)
+            runner.load(resume_path, load_env_curriculum=load_env_curriculum)
         return runner, train_cfg
 
 # make global task registry

@@ -736,12 +736,20 @@ class OnPolicyRunner:
         self,
         path: str,
         load_optimizer: bool = True,
+        load_env_curriculum: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         """Load a model checkpoint from disk.
 
         Args:
             path: File path to load the checkpoint from.
             load_optimizer: Whether to load the optimizer state.
+            load_env_curriculum: Whether to restore env-side curriculum state
+                (per-env terrain levels). Only meaningful when the env has the
+                same geometry as the training run, i.e. on a training resume;
+                play/eval builds a different env (few envs, a play terrain) and
+                the saved per-env level vector cannot be mapped onto it. None
+                (default) means "follow load_optimizer", so the existing
+                playback call sites (load_optimizer=False) skip it.
 
         Returns:
             Optional infos dict stored in the checkpoint.
@@ -823,6 +831,12 @@ class OnPolicyRunner:
         # Generic env-side curriculum state (terrain levels etc.). Same
         # contract as save(): opt-in, skipped for envs without the hook.
         load_curriculum_fn = getattr(env, "load_curriculum_state_dict", None)
+        if load_env_curriculum is None:
+            load_env_curriculum = load_optimizer
+        if not load_env_curriculum:
+            load_curriculum_fn = None
+            print(f"[load] {path}: skipping env_curriculum_state (playback/eval "
+                  "env geometry differs from training)")
         if callable(load_curriculum_fn):
             env_curriculum_state = loaded_dict.get("env_curriculum_state")
             if env_curriculum_state is not None:
