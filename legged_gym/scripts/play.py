@@ -1,5 +1,7 @@
 import time
 
+from contextlib import contextmanager
+
 from legged_gym import *
 import os
 
@@ -33,9 +35,12 @@ from legged_gym.utils.terrain import (
 )
 from legged_gym.envs.go2.go2_moects.go2_moects_config import Go2MoECTSCommonCfg
 
+from legged_gym.utils.model_swap import CheckpointSwapper
+from legged_gym.utils.native_ui import NativeArenaUI
+from legged_gym.scripts.input_source import build_input_source
+
 import numpy as np
 import torch
-from legged_gym.scripts.joystick import Joystick
 
 
 # ``task_type`` is everything after the robot prefix:
@@ -210,10 +215,20 @@ def configure_play_terrain(
         env_cfg.terrain.measure_heights = False
         # Tasks other than go2_moects have no moe proportions of their own; use
         # the go2_moects bank so --terrain moe means the same thing everywhere.
+        # Keep the checkpoint's actual training bank.  Its zero-weight
+        # stepping_stones and gap bands are intentionally absent, leaving a
+        # smaller seven-column showcase made only of trained terrain types.
         env_cfg.terrain.terrain_proportions = list(
             Go2MoECTSCommonCfg.terrain.terrain_proportions)
         env_cfg.terrain.terrain_length = float(Go2MoECTSCommonCfg.terrain.terrain_length)
         env_cfg.terrain.terrain_width = float(Go2MoECTSCommonCfg.terrain.terrain_width)
+        # Play-only raster reduction: training remains at the original 0.1 m
+        # sample spacing, while the interactive showcase uses 0.15 m.  This
+        # cuts each 8 m tile from 80x80 to about 54x54 samples without changing
+        # tile dimensions, terrain amplitudes, or policy/control timing.
+        env_cfg.terrain.horizontal_scale = max(
+            float(getattr(env_cfg.terrain, "horizontal_scale", 0.1)), 0.15
+        )
         env_cfg.terrain.terrain_spacing = float(Go2MoECTSCommonCfg.terrain.terrain_spacing)
         levels = tuple(getattr(env_cfg.terrain, "moe_showcase_levels", MOE_SHOWCASE_LEVELS))
         if terrain_level is not None:
@@ -223,10 +238,13 @@ def configure_play_terrain(
         env_cfg.terrain.num_cols = moe_showcase_num_columns(
             env_cfg.terrain.terrain_proportions)
         env_cfg.terrain.border_size = 2.0
-        # One robot per (level, type) cell: the wty mixin assigns
-        # terrain_types = arange // (num_envs / num_cols) and
+        # Interactive play drives ONE robot (see override_configs); this line is
+        # what lets the optional full-grid exhibit still work.  The wty mixin
+        # assigns terrain_types = arange // (num_envs / num_cols) and
         # terrain_levels = arange % (max_init_terrain_level + 1), so with
-        # num_envs = num_rows * num_cols each column block walks every row.
+        # num_envs = num_rows * num_cols each column block walks every row, and
+        # with num_envs = 1 the single robot lands on (row 0, col 0), from which
+        # Tab / [ ] reach every other cell by teleport.
         env_cfg.terrain.max_init_terrain_level = env_cfg.terrain.num_rows - 1
         return
 
@@ -356,10 +374,18 @@ def override_configs(env_cfg, args, task_type):
     showcase_terrains = {
         "taxonomy", "showcase", "v6", "v6_frontier", "frontier", "v6_full",
     }
-    # The moe exhibit wants one robot per (level, type) cell, so it gets the
-    # camera framing below but not the "few robots" clamp the others use.
+    # The moe exhibit gets the camera framing below but not the "few robots"
+    # clamp the others use.
     moe_showcase = getattr(args, "terrain", None) == "moe"
-    default_num_envs = 1 if getattr(args, "terrain", None) in showcase_terrains else 2
+    # Every terrain -- exhibits and plain alike -- defaults to ONE robot.  The
+    # moe grid used to default to one robot per (level, type) cell (3 rows x 7
+    # columns = 21).  Each of those streams ~13 body meshes per frame, and that,
+    # not the terrain size, is what made play feel slow: the robot is a single
+    # batched Genesis entity and heightfield collision scales with contacts,
+    # not area.  Plain terrains kept a legacy default of 2, which buys nothing
+    # on screen but doubles the per-frame sim + viewer-stream cost on a laptop
+    # GPU.  The old full-grid exhibit is still one flag away: ``--num_envs 21``.
+    default_num_envs = 1
     env_cfg.env.num_envs = args.num_envs if getattr(args, "num_envs", None) else default_num_envs
     if task_type == "cts" or task_type == "cts_amp": # concurrent teacher-student specific
         env_cfg.env.num_teacher = 1
@@ -378,11 +404,13 @@ def override_configs(env_cfg, args, task_type):
         v6_tile_size=getattr(args, "v6_tile_size", "play"),
     )
 
-    if moe_showcase and not getattr(args, "num_envs", None):
-        # One robot per (level, type) cell -- see the max_init_terrain_level note
-        # in the `moe` branch of configure_play_terrain.
-        env_cfg.env.num_envs = env_cfg.terrain.num_rows * env_cfg.terrain.num_cols
-        env_cfg.viewer.rendered_envs_idx = list(range(env_cfg.env.num_envs))
+    if moe_showcase and env_cfg.env.num_envs == 1:
+        # With curriculum off and no fixed level, _get_env_origins draws the
+        # terrain row at random -- fine when 21 robots cover the grid, but with
+        # the single arena robot it means "which difficulty am I on?" changes
+        # every launch.  Pin row 0 (the easiest showcase level); Tab / [ ] move
+        # from there.
+        env_cfg.terrain.fixed_terrain_level = 0
 
     # Keep selected non-flat terrain compact and deterministic for interactive play.
     if env_cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
@@ -397,7 +425,28 @@ def override_configs(env_cfg, args, task_type):
         # the training ranges.
         _disable_play_domain_rand(env_cfg)
 
-    env_cfg.env.debug = True
+    # Debug geometry is extremely expensive in interactive Genesis playback:
+    # post_physics_step() clears and rebuilds debug objects every control step.
+    # It is not needed for driving or HUD input, so keep it opt-in for play.
+    env_cfg.env.debug = bool(getattr(args, "debug_vis", False))
+    # ``LeggedRobot._pre_sim_step`` historically owns a training-viewer follow
+    # camera whenever debug is off.  Play has its own explicit ``--follow_robot``
+    # path (and the native arena's T toggle).  Letting both paths write the
+    # camera in one control frame causes visible jumps, particularly when a
+    # showcase config has an elevated overview offset.  This flag changes only
+    # camera ownership; it leaves debug-draw, FPS and terrain configuration as
+    # configured above.
+    env_cfg.env.manual_viewer_camera = True
+    # Native play camera only: a wider view helps both robot-relative modes,
+    # and a world-up lock prevents a prior mouse-orbit roll from tilting the
+    # horizon the next time play writes a camera pose.
+    env_cfg.viewer.camera_fov = 55.0
+    env_cfg.viewer.lock_camera_world_up = True
+    # One policy step contains ``control.decimation`` physics substeps.  The
+    # native viewer only needs the final state of that control frame; sending
+    # all intermediate states costs render time without making playback more
+    # informative.  GenesisSimulator applies this flag only to play sessions.
+    env_cfg.viewer.update_visualizer_once_per_control_step = True
     # Play drives commands/terrain from the viewer (or fixed ranges), not from the
     # training UED teacher.  Same contract as ued_rollout: leave ued_enabled False
     # so reset_idx does not require an installed episode curriculum.
@@ -419,6 +468,13 @@ def override_configs(env_cfg, args, task_type):
     # mode would overwrite that value every physics step from commands[:, 3], so
     # disable it for both joystick and Viser control.
     env_cfg.commands.heading_command = False
+
+    # Preserve the task's normal relative follow view before showcase mode
+    # replaces ``viewer.pos`` with a large, fixed overview of the whole grid.
+    # The two camera modes have different coordinate contracts: overview is a
+    # world-space pose, while follow is an offset from the robot.
+    env_cfg.viewer.follow_robot_pos = list(env_cfg.viewer.pos)
+    env_cfg.viewer.follow_robot_lookat = list(env_cfg.viewer.lookat)
 
     # Elevated / oblique camera defaults for showcase exhibits so the full grid
     # is visible without --follow_robot.  Offsets scale with the larger grid
@@ -462,7 +518,8 @@ def print_debug_info(env, robot_index):
     # print(f"dr_ctrl_delay: {env.simulator.dr_ctrl_delay[robot_index].item()}")
     pass
 
-def interaction_loop(env, policy, args, task_type, viser_viewer=None):
+def interaction_loop(env, policy, args, task_type, viser_viewer=None,
+                     input_source=None, arena_ui=None):
     """Run interaction loop between environment and policy
 
     Args:
@@ -470,8 +527,12 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         policy : a policy that takes observations and outputs actions
         args: command line arguments
         viser_viewer: optional ViserViewer for web-based visualization
+        input_source: optional MergedSource (native viewer: keyboard + gamepad)
+        arena_ui: optional NativeArenaUI whose events are drained here, on the
+            sim thread -- Genesis keybind callbacks run on the viewer thread and
+            must not call env.reset_idx themselves.
     """
-    
+
     logger = Logger(env.dt)
     robot_index = 0 # which robot is used for logging
     stop_rew_log = env.max_episode_length + 1 # number of steps before print average episode rewards
@@ -488,10 +549,6 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
     else: # vanilla
         obs_buf = env.get_observations()
     
-    # Setup joystick if needed
-    if args.use_joystick:
-        joystick = Joystick(joystick_type=args.joystick_type)
-
     # go2_moects terrain bank exhibit: print the column legend so the grid is
     # readable at a glance (which column is which terrain type, which row is
     # which difficulty level).
@@ -542,13 +599,53 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
             if viser_viewer is not None and hasattr(viser_viewer, "set_taxonomy_labels"):
                 viser_viewer.set_taxonomy_labels(label_map)
     
-    frame_dt = 1 / 60.0 # 30Hz
+    # One env.step() advances a FULL control step -- sim dt x control.decimation
+    # -- so the real-time budget for a frame is exactly ``env.dt``.  This used
+    # to be a hard-coded 1/60 s, which asked the loop to produce 20 ms of
+    # simulated time every 16.7 ms: a 1.2x-real-time target that could never be
+    # met, so the sleep below never fired and playback always read as "behind".
+    # Deriving it from the env keeps it correct for any task/decimation.
+    frame_dt = float(getattr(env, "dt", 0.0)) or (1.0 / 50.0)
+    print(f"[play] real-time frame budget: {frame_dt * 1000:.1f} ms "
+          f"({1.0 / frame_dt:.1f} Hz control rate)")
     # interaction loop - runs indefinitely so the viewer stays up continuously
     # instead of the whole simulator being torn down and rebuilt every ~10 episodes
     i = 0
+    t_prev = time.perf_counter()
+    # Smoothed frame rate for the on-screen HUD.  EMA rather than an instant
+    # value so the number is readable instead of flickering.
+    fps_ema = None
+    realtime_ema = None
+    # Throttled console mirror of the HUD telemetry: the HUD does not exist in
+    # headless runs and is easy to miss on screen, while this line is also what
+    # makes scripted RTF measurement possible.  The guard is one
+    # time.monotonic() read per frame -- negligible -- and the timestamp is
+    # pushed forward at print time, so it can never double-print an iteration.
+    rtf_print_next = 0.0
     while True:
 
         t_start = time.perf_counter()
+        # Real elapsed time, so the keyboard ramp does not depend on how many
+        # frames the sim managed to run.  Capped so a hitch cannot teleport the
+        # command straight to its target.
+        input_dt = min(max(t_start - t_prev, 0.0), 0.1)
+        # Wall-clock rate of the previous frame, including the real-time sleep,
+        # so "1.00x real-time" on the HUD means exactly that.
+        if input_dt > 1e-6:
+            inst_fps = 1.0 / input_dt
+            inst_rt = frame_dt / input_dt
+            fps_ema = inst_fps if fps_ema is None else 0.9 * fps_ema + 0.1 * inst_fps
+            realtime_ema = inst_rt if realtime_ema is None else 0.9 * realtime_ema + 0.1 * inst_rt
+        t_prev = t_start
+        if fps_ema is not None and time.monotonic() >= rtf_print_next:
+            print(f"[play] {fps_ema:5.1f} FPS   {realtime_ema:.2f}x real-time")
+            rtf_print_next = time.monotonic() + 5.0
+
+        # Arena actions (tab / level / respawn / model swap) are queued by
+        # Genesis keybind callbacks on the viewer thread; execute them here.
+        if arena_ui is not None:
+            arena_ui.drain_and_apply()
+
         # Drain Viser GUI actions on the sim thread.  Teleport/Respawn buttons
         # only queue work; executing env.reset_idx on the GUI worker races
         # oracle history deques (RuntimeError: deque mutated during iteration).
@@ -568,36 +665,57 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
                         viser_viewer.report_taxonomy_spawn_result(level, type_idx, ok)
                     print(f"[play] taxonomy spawn → type={type_idx} L{level} (ok={ok})")
 
-        # update commands from joystick
-        if args.use_joystick:
-            joystick.update()
-            env.commands[:, 0] = -joystick.ly
-            env.commands[:, 1] = -joystick.lx
-            env.commands[:, 2] = -joystick.rx
-        # update commands from viser GUI sliders
+        # Native viewer: keyboard and gamepad coexist inside MergedSource (the
+        # pad wins only while a stick is off-centre), so there is no longer an
+        # exclusive if/elif between input backends.
+        if input_source is not None:
+            cmd = input_source.poll(input_dt)
+            env.commands[:, 0] = cmd[0]
+            env.commands[:, 1] = cmd[1]
+            env.commands[:, 2] = cmd[2]
+        # Viser stays the remote / headless path (Lightning.ai, UHeM) and keeps
+        # its own key handling unchanged.
         elif viser_viewer is not None:
             cmd = viser_viewer.get_command()
             env.commands[:, 0] = cmd[0]
             env.commands[:, 1] = cmd[1]
             env.commands[:, 2] = cmd[2]
-        
-        # set the viewer camera to follow the first environment by default
-        if args.follow_robot and viser_viewer is None:
-            pos = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.pos, dtype=np.float32)
-            lookat = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(env.cfg.viewer.lookat, dtype=np.float32)
+
+
+        # Camera.  After a native-arena T press, the arena is the only camera
+        # owner; its rear/front modes update after the full control step and
+        # its free mode leaves the Genesis trackball untouched.
+        arena_camera_override = (
+            arena_ui is not None and arena_ui.camera_override_active
+        )
+        if args.follow_robot and viser_viewer is None and not arena_camera_override:
+            pos = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(
+                getattr(env.cfg.viewer, "follow_robot_pos", env.cfg.viewer.pos),
+                dtype=np.float32,
+            )
+            lookat = env.simulator.base_pos[robot_index].cpu().numpy() + np.array(
+                getattr(env.cfg.viewer, "follow_robot_lookat", env.cfg.viewer.lookat),
+                dtype=np.float32,
+            )
             env.set_viewer_camera(pos, lookat)
         elif showcase_mode and not taxonomy_camera_set and viser_viewer is None:
-            # One-shot elevated oblique view of the full showcase grid.
-            # Headless / no native viewer: skip (scene.viewer is None).
-            try:
-                env.set_viewer_camera(
-                    np.array(env.cfg.viewer.pos, dtype=np.float32),
-                    np.array(env.cfg.viewer.lookat, dtype=np.float32),
-                )
-            except Exception:
+            # One-shot camera placement.  With the arena the interesting frame is
+            # the tile the robot actually stands on, not the whole grid.
+            if arena_ui is not None and arena_ui.frame_current_tile():
                 pass
+            else:
+                # Elevated oblique view of the full showcase grid.
+                # Headless / no native viewer: skip (scene.viewer is None).
+                try:
+                    env.set_viewer_camera(
+                        np.array(env.cfg.viewer.pos, dtype=np.float32),
+                        np.array(env.cfg.viewer.lookat, dtype=np.float32),
+                    )
+                except Exception:
+                    pass
             taxonomy_camera_set = True
-            
+
+
         # Step the environment according to task type
         if task_type == "ts_depth":
             actions = policy(obs_buf, depth_image)
@@ -620,6 +738,12 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
         else:
             actions = policy(obs_buf.detach())
             obs_buf, _, rews, dones, infos = env.step(actions.detach())
+
+        # Native follow is updated once per full control frame.  Genesis's
+        # built-in entity follow runs on every physics substep and visibly
+        # jitters on a decimated legged-robot simulation.
+        if arena_ui is not None and arena_ui.following:
+            arena_ui.update_follow_camera()
         
         if viser_viewer is not None:
             viser_viewer.update_from_simulator(env, [robot_index])
@@ -629,8 +753,22 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None):
                 env.commands[robot_index, :3].detach().cpu().numpy(),
             )
 
+        # Native on-screen HUD.  Cheap to call every frame -- NativeArenaUI
+        # throttles the string rebuild itself -- and a no-op when the viewer is
+        # headless or the caption layer is unavailable.  The command shown is
+        # the one actually applied to the env, so the envelope ramp is visible.
+        if arena_ui is not None and arena_ui.hud_due():
+            arena_ui.update_hud(
+                command=env.commands[robot_index, :3].detach().cpu().tolist(),
+                achieved=(env.simulator.base_lin_vel[robot_index, 0].item(),
+                          env.simulator.base_lin_vel[robot_index, 1].item(),
+                          env.simulator.base_ang_vel[robot_index, 2].item()),
+                fps=fps_ema,
+                realtime=realtime_ema,
+            )
+
         print_debug_info(env, robot_index)
-        
+
         if  0 < i < stop_rew_log:
             if infos["episode"]:
                 num_episodes = torch.sum(env.reset_buf).item()
@@ -679,6 +817,62 @@ def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
     print('Exported policy as jit script to: ', path)
     if args.export_onnx:
         print('Exported policy as onnx to: ', path)
+
+
+@contextmanager
+def skip_rollout_storage(train_cfg):
+    """Build the runner WITHOUT allocating PPO rollout storage.
+
+    Playback needs exactly two things from the runner: the loaded weights and
+    ``get_inference_policy()`` (which returns a bound method of
+    ``alg.actor_critic``).  The rollout storage is a pure *training* artifact --
+    ``num_steps_per_env x num_envs`` transition buffers that play never writes
+    and never reads -- so allocating it is wasted memory at best.
+
+    At worst it is fatal.  MoE-CTS splits the env batch into interleaved
+    teacher/student roles at ``init_storage`` time
+    (``rsl_rl/algorithms/ppo_moe_cts.py:compute_role_env_idxs``): every 4th env
+    is a student, the rest teachers.  That split has no solution for a SINGLE
+    env -- index 0 is always a student, so there are 0 teachers, while the
+    guard wants ``max(int(1 * 0.75), 1) = 1`` -- and ``WtyCurriculumMixin``
+    independently rescales ``num_teacher`` to ``int(1 * 0.75) = 0``.  num_envs=1
+    is in fact the *only* count that fails; 2 and up all resolve.  Since the
+    arena deliberately drives one robot, play would otherwise crash before the
+    viewer ever opened.  Rather than inflate the exhibit to two robots or
+    weaken a training-side contract, play simply does not build the training
+    buffer it has no use for.  Nothing about the policy, the observations or
+    the physics changes.
+
+    Scoped to the runner construction call and restored afterwards, so nothing
+    a training entry point does is affected.
+    """
+    from rsl_rl.utils.runner_registry import runner_registry
+
+    try:
+        runner_class = runner_registry.get_runner_class(train_cfg.runner_class_name)
+    except Exception as exc:
+        print(f"[play] rollout-storage skip unavailable ({exc}); allocating it")
+        yield
+        return
+    had_own = "_init_storage" in vars(runner_class)
+    original = vars(runner_class).get("_init_storage")
+    runner_class._init_storage = lambda self: None
+    try:
+        yield
+    finally:
+        if had_own:
+            runner_class._init_storage = original
+        else:
+            # It was inherited; drop the override so the MRO takes over again.
+            delattr(runner_class, "_init_storage")
+
+
+def _play_inference_policy(policy):
+    """Run deployment policy without constructing autograd graphs."""
+    def infer(*inputs, **kwargs):
+        with torch.inference_mode():
+            return policy(*inputs, **kwargs)
+    return infer
 
 
 def load_oracle_id_actor_for_playback(alg_runner, train_cfg):
@@ -739,11 +933,15 @@ def play(args):
     # checkpoint's per-env terrain levels describe a geometry that does not
     # exist here; restoring them is impossible and the strict resume protocol
     # would hard-fail. Playback uses the play terrain's own levels.
-    ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg,
-                                                          load_env_curriculum=False)
+    # Play never rolls out into PPO storage; skipping it also decouples the
+    # arena's one-robot default from the training-only env-count contracts
+    # (see skip_rollout_storage).
+    with skip_rollout_storage(train_cfg):
+        ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg,
+                                                              load_env_curriculum=False)
     if actor_only_playback:
         load_oracle_id_actor_for_playback(ppo_runner, train_cfg)
-    policy = ppo_runner.get_inference_policy(device=env.device)
+    policy = _play_inference_policy(ppo_runner.get_inference_policy(device=env.device))
     
     # export policy as a jit module (used to run it from C++ or python)
     path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 
@@ -751,6 +949,37 @@ def play(args):
     export_policy(ppo_runner, path, args, env_cfg, train_cfg, task_type)
     
     viser_viewer = None
+    input_source = None
+    arena_ui = None
+    if args.viewer == 'native':
+        # Native path: real key-down/key-up from Genesis + optional gamepad.
+        input_source = build_input_source()
+        # Hot-swap candidates are the sibling checkpoints of the one that was
+        # loaded -- same task, so a state-dict reload is enough (see model_swap).
+        swapper = None
+        try:
+            loaded_ckpt = get_load_path(
+                os.path.join(LEGGED_GYM_ROOT_DIR, 'logs',
+                             train_cfg.runner.experiment_name),
+                load_run=train_cfg.runner.load_run,
+                checkpoint=train_cfg.runner.checkpoint,
+            )
+            swapper = CheckpointSwapper(
+                ppo_runner, os.path.dirname(loaded_ckpt),
+                current=os.path.basename(loaded_ckpt),
+            )
+        except Exception as exc:
+            print(f"[play] checkpoint hot-swap disabled: {exc}")
+        arena_ui = NativeArenaUI(
+            env,
+            input_source,
+            robot_index=0,
+            model_swap_cb=(
+                swapper.step if (swapper is not None and swapper.available) else None
+            ),
+        )
+        arena_ui.print_legend()
+
     if args.viewer == 'viser':
         viser_viewer = create_viser_viewer(env, port=args.viser_port)
         robot_index = 0  # which robot the viewer tracks / respawns, matches interaction_loop
@@ -807,8 +1036,19 @@ def play(args):
                 )
         print(f"Viser web viewer started at http://localhost:{args.viser_port}")
     
-    interaction_loop(env, policy, args, task_type, viser_viewer=viser_viewer)
-    
+    try:
+        interaction_loop(
+            env, policy, args, task_type,
+            viser_viewer=viser_viewer,
+            input_source=input_source,
+            arena_ui=arena_ui,
+        )
+    finally:
+        if arena_ui is not None:
+            arena_ui.unregister()
+        if input_source is not None and input_source.gamepad is not None:
+            input_source.gamepad.close()
+
     if viser_viewer is not None:
         viser_viewer.stop()
     

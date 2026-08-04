@@ -74,7 +74,19 @@ class GenesisSimulator(Simulator):
                 self._torques = self._torques * self._motor_strengths
             self._robot.control_dofs_force(
                 self._torques, self._dof_indices)
-            self._scene.step()
+            # Play needs all physics substeps, but drawing the same control
+            # frame after each one is pure viewer overhead.  When explicitly
+            # requested by play.py, submit graphics only after the final
+            # substep; physics dt, decimation and control timing are unchanged.
+            update_visualizer = (
+                not getattr(
+                    self._cfg.viewer,
+                    "update_visualizer_once_per_control_step",
+                    False,
+                )
+                or i == self._cfg.control.decimation - 1
+            )
+            self._scene.step(update_visualizer=update_visualizer)
             # dof_pos and dof_vel use joint sequence of policy
             self._dof_pos[:] = self._robot.get_dofs_position(
                 self._dof_indices)
@@ -296,6 +308,12 @@ class GenesisSimulator(Simulator):
         viewer = getattr(self._scene, "viewer", None)
         if viewer is None:
             return
+        # Genesis reuses ``_camera_up`` from the prior trackball pose.  When a
+        # programmatic play camera is written after mouse orbiting, that stale
+        # vector can roll the entire horizon.  Play opts into a world-level
+        # camera; leave normal simulator/training behaviour untouched.
+        if getattr(self._cfg.viewer, "lock_camera_world_up", False):
+            viewer._camera_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         viewer.set_camera_pose(pos=eye, lookat=target)
         
     def calc_feet_near_edge(self):
@@ -387,10 +405,26 @@ class GenesisSimulator(Simulator):
                 dt=self._sim_params["dt"],
                 substeps=self._sim_params["substeps"]),
             viewer_options=gs.options.ViewerOptions(
-                # max_FPS=int(1 / self._control_dt * self._cfg.control.decimation),
+                # Genesis applies this limiter on every Scene.step(), not once
+                # per policy/control step.  Leaving the default at 60 therefore
+                # caps a decimation=4 task at 60 / 4 = 15 control FPS (0.3x for
+                # a 50 Hz policy).  Match the physics-step frequency here; the
+                # play loop separately paces control frames to real time.
+                # Pace viewer updates at the PHYSICS-step rate.  The Genesis
+                # default (60) is applied once per Scene.step(), so with
+                # decimation=4 it caps control playback at 15 FPS.  Leaving it
+                # unlimited fixes that cap but lets the sim thread repeatedly
+                # starve pyglet's mouse/event handling.  1/sim.dt preserves the
+                # 50 Hz control contract while giving the viewer thread a fair
+                # scheduling point on every 200 Hz physics step.
+                max_FPS=int(round(1.0 / self._sim_params["dt"])),
+                # Keep the native window at the established interactive size;
+                # terrain raster reduction is configured separately for the
+                # play-only MoE showcase.
+                res=(960, 540),
                 camera_pos=np.array(self._cfg.viewer.pos),
                 camera_lookat=np.array(self._cfg.viewer.lookat),
-                camera_fov=40,
+                camera_fov=float(getattr(self._cfg.viewer, "camera_fov", 40.0)),
             ),
             vis_options=gs.options.VisOptions(
                 rendered_envs_idx=self._cfg.viewer.rendered_envs_idx,

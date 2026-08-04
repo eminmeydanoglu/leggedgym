@@ -166,6 +166,8 @@ def get_args():
     parser.add_argument('--task',           type=str, default='go2', help="task name")
     parser.add_argument('--seed',           type=int, default=None, help="training seed; overrides train_cfg.seed and env_cfg.seed (single source)")
     parser.add_argument('--headless',       action='store_true', default=False, help="enable visualization by default")
+    parser.add_argument('--debug_vis',      action='store_true', default=False,
+                        help="enable expensive simulator debug geometry during play")
     parser.add_argument('--cpu',            action='store_true', default=False, help="use CPU instead of CUDA")
     parser.add_argument('--num_envs',       type=int, default=None, help="number of parallel environments")
     parser.add_argument('--max_iterations', type=int, default=None, help="max number of training iterations")

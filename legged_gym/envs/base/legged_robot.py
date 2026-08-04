@@ -614,8 +614,14 @@ class LeggedRobot(BaseTask):
         self.llast_actions[:] = self.last_actions[:]
         self.last_actions[:] = self.actions[:]
         self.actions[:] = actions[:]
-        # during training, the camera follows the first environment
-        if not self.debug and not self.headless:
+        # Training owns this default camera follow.  Interactive play can opt
+        # into a single, explicit camera writer (``play.py``) without enabling
+        # debug drawing merely to suppress this legacy path.
+        if (
+            not self.debug
+            and not self.headless
+            and not getattr(self.cfg.env, "manual_viewer_camera", False)
+        ):
             pos = self.simulator.base_pos[0].cpu().numpy() + np.array(self.cfg.viewer.pos)
             lookat = self.simulator.base_pos[0].cpu().numpy() + np.array(self.cfg.viewer.lookat)
             self.set_viewer_camera(pos, lookat)
