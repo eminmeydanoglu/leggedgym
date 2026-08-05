@@ -122,6 +122,7 @@ class TestBuildCommand(unittest.TestCase):
             num_envs=1,
         )
         argv = pp.build_play_argv(cfg)
+        self.assertEqual(argv[argv.index("--sim") + 1], "genesis")
         self.assertIn("--task", argv)
         self.assertIn("go2_v4_dreamwaq", argv)
         self.assertIn("--terrain", argv)
@@ -133,6 +134,19 @@ class TestBuildCommand(unittest.TestCase):
         self.assertEqual(argv[i + 1], "best_tracking")
         self.assertIn("--viewer", argv)
         self.assertIn("viser", argv)
+
+    def test_mujoco_backend_reaches_play_and_environment(self):
+        cfg = pp.PlayConfig(
+            task="go2_moects",
+            load_run="/abs/logs/go2_moects/runA",
+            experiment="go2_moects",
+            ckpt="7500",
+            simulator="mujoco",
+            terrain="moe",
+        )
+        argv = pp.build_play_argv(cfg)
+        self.assertEqual(argv[argv.index("--sim") + 1], "mujoco")
+        self.assertTrue(pp.format_command(cfg).startswith("SIMULATOR=mujoco "))
 
     def test_real_logs_if_present(self):
         """Smoke: discover at least one real run when logs exist in repo."""

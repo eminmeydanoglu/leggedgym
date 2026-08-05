@@ -200,6 +200,9 @@ def get_args():
     parser.add_argument('--follow_robot',   action='store_true', default=False, help="whether the camera follows the robot during play")
     parser.add_argument('--viewer',         type=str, default='native', choices=['native', 'viser'], 
                         help="viewer backend: 'native' for simulator viewer, 'viser' for web-based 3D viewer")
+    parser.add_argument('--sim',            type=str, default=None, choices=['genesis', 'mujoco'],
+                        help="physics backend for play; equivalent to setting the SIMULATOR env var. "
+                             "MuJoCo is the sim-to-sim path and runs on CPU.")
     parser.add_argument('--viser_port',     type=int, default=8080, help="port for viser web server (only used with --viewer viser)")
     parser.add_argument('--terrain',        type=str, default='flat',
                         choices=[

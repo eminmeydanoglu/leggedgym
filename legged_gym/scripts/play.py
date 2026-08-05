@@ -1,3 +1,26 @@
+import os
+import sys
+
+
+def _bootstrap_simulator_from_argv() -> None:
+    """Translate ``--sim <backend>`` into ``os.environ["SIMULATOR"]``.
+
+    ``legged_gym`` resolves SIMULATOR at import time, so by the time ``get_args()``
+    parses ``--sim`` the backend is already frozen. This has to run before the
+    first ``from legged_gym import ...`` below -- hence the hand-rolled argv scan
+    instead of argparse. Both ``--sim mujoco`` and ``--sim=mujoco`` are accepted.
+    """
+    for i, arg in enumerate(sys.argv):
+        if arg.startswith("--sim="):
+            os.environ["SIMULATOR"] = arg.split("=", 1)[1]
+            return
+        if arg == "--sim" and i + 1 < len(sys.argv):
+            os.environ["SIMULATOR"] = sys.argv[i + 1]
+            return
+
+
+_bootstrap_simulator_from_argv()
+
 import time
 
 from contextlib import contextmanager
@@ -16,6 +39,7 @@ from legged_gym.utils.terrain import (
     is_taxonomy_terrain_cfg,
     is_v6_showcase_terrain_cfg,
     teleport_env_to_taxonomy_tile,
+    respawn_env_for_play,
     TAXONOMY_LABEL_Z_OFFSET,
     TAXONOMY_NUM_LEVELS,
     TAXONOMY_NUM_TYPES,
@@ -28,8 +52,10 @@ from legged_gym.utils.terrain import (
     V6_TRAINING_NUM_COLS,
     V6_TRAINING_NUM_ROWS,
     MOE_SHOWCASE_LEVELS,
+    moe_showcase_center_cell,
     MOE_TRAINING_NUM_ROWS,
     moe_showcase_columns,
+    moe_showcase_levels_for_column,
     moe_showcase_num_columns,
     format_moe_showcase_console_map,
 )
@@ -60,13 +86,26 @@ DREAMWAQ_TASK_TYPES = frozenset({
 })
 
 
-def _disable_play_domain_rand(env_cfg):
-    """Put the env on nominal physics and clean observations.
+# Which backends consume ``Terrain.height_field_raw`` directly instead of the
+# triangle mesh built from it.  MuJoCo sits with Genesis here because
+# ``simulator/mujoco_scene.py`` maps that same raster onto an MJCF ``hfield``
+# asset, so the two see byte-identical terrain -- which is the whole point of a
+# sim-to-sim comparison.  Isaac* stay on the trimesh path they always used.
+HEIGHTFIELD_SIMULATORS = frozenset({"genesis", "mujoco"})
+# Every terrain mode that is "rough" resolves its mesh type through this, so the
+# backend split lives in exactly one place.
+PLAY_MESH_TYPE = "heightfield" if SIMULATOR in HEIGHTFIELD_SIMULATORS else "trimesh"
 
-    Clears every ``domain_rand.randomize_*`` switch plus the pushers, and turns
-    off observation noise.  Nominal values are whatever the cfg/asset already
-    carries (friction ratio stays at the simulator default of 1.0), so nothing
-    here invents numbers -- it only stops the per-env sampling.
+
+def _disable_play_domain_rand(env_cfg):
+    """Put the environment on nominal physics while retaining observation noise.
+
+    Clears every ``domain_rand.randomize_*`` switch plus the pushers.  Nominal
+    values are whatever the cfg/asset already carries (friction ratio stays at
+    the simulator default of 1.0), so nothing here invents numbers -- it only
+    stops the per-env physics sampling.  ``cfg.noise`` is intentionally left
+    unchanged: play policies receive the same configured observation noise as
+    training by default.
     """
     dr = env_cfg.domain_rand
     for name in dir(dr):
@@ -75,8 +114,6 @@ def _disable_play_domain_rand(env_cfg):
     for name in ("push_robots", "push_links"):
         if hasattr(dr, name):
             setattr(dr, name, False)
-    if hasattr(env_cfg, "noise"):
-        env_cfg.noise.add_noise = False
 
 
 def _drop_torch_default_device_mode():
@@ -130,6 +167,38 @@ def _disable_play_rewards(env):
             resample()
 
     env.compute_reward = compute_reward
+
+
+def _spawn_moe_showcase_robot_at_center(env):
+    """Place play's one default robot on the centre showcase tile.
+
+    The MoE play grid has three rows and seven columns, so its centre is a real
+    tile rather than a gap: row 1 / column 3, i.e. the L2 ascending-stairs
+    sample.  Do this after the environment's regular reset, then refresh the
+    MoE semantic id and root pose to keep physics, terrain bookkeeping and the
+    policy's terrain-conditioned path aligned.
+    """
+    sim = env.simulator
+    origins = getattr(sim, "_terrain_origins", None)
+    terrain = getattr(sim, "_terrain", None)
+    if origins is None or terrain is None or int(env.num_envs) < 1:
+        return None
+    row, col = moe_showcase_center_cell(origins.shape[0], origins.shape[1])
+    env_ids = torch.tensor([0], device=env.device, dtype=torch.long)
+    # The regular play respawn restores nominal joints, base orientation and
+    # zero velocity.  Its reset may update the curriculum origin, so assign the
+    # requested centre *afterwards* and write the root state once more.
+    respawn_env_for_play(env, 0, env_ids=env_ids)
+    sim.terrain_levels[env_ids] = row
+    sim.terrain_types[env_ids] = col
+    sim.env_origins[env_ids] = origins[row, col]
+    if hasattr(env, "wty_terrain_ids") and env.wty_terrain_ids is not None:
+        env.wty_terrain_ids[env_ids] = int(terrain.cols2id[col])
+    base_pos = sim.base_init_pos.reshape(1, -1) + sim.env_origins[env_ids]
+    base_quat = sim.base_init_quat.reshape(1, -1)
+    zero_velocity = torch.zeros((1, 3), device=env.device, dtype=base_pos.dtype)
+    sim.reset_root_states(env_ids, base_pos, base_quat, zero_velocity, zero_velocity)
+    return row, col
 
 
 def _pin_terrain_difficulty(env_cfg, terrain_level, default_level, max_level):
@@ -191,7 +260,7 @@ def configure_play_terrain(
         # policy regardless of what it trained on.  num_cols=5 gives one tile of
         # every terrain type (slope | random-uniform | stairs-up | stairs-down |
         # discrete); difficulty (num_rows) is the user's choice via --terrain_level.
-        env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+        env_cfg.terrain.mesh_type = PLAY_MESH_TYPE
         env_cfg.terrain.selected = False
         env_cfg.terrain.curriculum = True
         env_cfg.terrain.terrain_proportions = [0.2, 0.1, 0.25, 0.25, 0.2]
@@ -222,7 +291,7 @@ def configure_play_terrain(
     if terrain_mode in {"taxonomy", "showcase"}:
         # LP-ACRL paper taxonomy exhibit: 6 semantic types × 4 difficulty levels.
         # Static showcase — no curriculum promote/demote.
-        env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+        env_cfg.terrain.mesh_type = PLAY_MESH_TYPE
         env_cfg.terrain.curriculum = False
         env_cfg.terrain.selected = False
         env_cfg.terrain.terrain_kwargs = None
@@ -248,8 +317,9 @@ def configure_play_terrain(
         # type once (the training grid repeats them proportionally) x a few
         # spaced difficulty levels, generated by the same tile code with the
         # same `level / 10` difficulty the training grid would use.
-        if SIMULATOR != "genesis":
-            raise ValueError("--terrain moe is heightfield-only (Genesis); "
+        if SIMULATOR not in HEIGHTFIELD_SIMULATORS:
+            raise ValueError("--terrain moe is heightfield-only "
+                             f"({'/'.join(sorted(HEIGHTFIELD_SIMULATORS))}); "
                              f"SIMULATOR={SIMULATOR}")
         env_cfg.terrain.mesh_type = "heightfield"
         env_cfg.terrain.curriculum = False
@@ -313,7 +383,7 @@ def configure_play_terrain(
             raise ValueError(
                 f"Unsupported v6_tile_size {v6_tile_size!r}; expected 'play' or 'train'"
             )
-        env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+        env_cfg.terrain.mesh_type = PLAY_MESH_TYPE
         env_cfg.terrain.curriculum = False
         env_cfg.terrain.selected = False
         env_cfg.terrain.terrain_kwargs = None
@@ -370,7 +440,7 @@ def configure_play_terrain(
 
     # Genesis currently validates heightfields, while the other backends use the
     # same selected terrain through their trimesh path.
-    env_cfg.terrain.mesh_type = "heightfield" if SIMULATOR == "genesis" else "trimesh"
+    env_cfg.terrain.mesh_type = PLAY_MESH_TYPE
     env_cfg.terrain.num_rows = 1
     env_cfg.terrain.num_cols = 1
     env_cfg.terrain.terrain_length = 8.0
@@ -716,7 +786,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None,
         # oracle history deques (RuntimeError: deque mutated during iteration).
         if viser_viewer is not None:
             if hasattr(viser_viewer, "take_pending_respawn") and viser_viewer.take_pending_respawn():
-                env.reset_idx(torch.tensor([robot_index], device=env.device))
+                respawn_env_for_play(env, robot_index)
                 if hasattr(viser_viewer, "clear_drive_command"):
                     viser_viewer.clear_drive_command()
             if hasattr(viser_viewer, "take_pending_taxonomy_spawn"):
@@ -980,6 +1050,13 @@ def play(args):
         # Must come after gs.init: that is what installs the mode (see the
         # helper's docstring -- this is the single biggest play-time win).
         _drop_torch_default_device_mode()
+    elif SIMULATOR == "mujoco":
+        # MuJoCo steps on CPU, so keeping env tensors/policy on GPU would only buy
+        # a per-step host<->device round trip. task_registry.make_env and
+        # make_alg_runner both derive their device from args.cpu, so flipping this
+        # one flag is enough to place everything on the CPU.
+        args.cpu = True
+        print("MuJoCo backend runs on CPU; forcing --cpu so env tensors and the policy live on the CPU.")
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     splitted = args.task.split("_")
     # by default, the first part of the task name is robot name, and the second part is task type, e.g. go2_ts, go2_cat, go2_ee, go2_cts, go2_dreamwaq, go2_ts_depth
@@ -992,6 +1069,9 @@ def play(args):
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     if not getattr(args, "play_rewards", False):
         _disable_play_rewards(env)
+    moe_showcase_center = None
+    if getattr(env.cfg.terrain, "moe_showcase", False):
+        moe_showcase_center = _spawn_moe_showcase_robot_at_center(env)
     # load policy
     train_cfg.runner.resume = True
     # P5's selected July checkpoint has a 50-D critic whereas current code
@@ -1048,6 +1128,8 @@ def play(args):
                 swapper.step if (swapper is not None and swapper.available) else None
             ),
         )
+        if moe_showcase_center is not None:
+            arena_ui.level_index, arena_ui.tab_index = moe_showcase_center
         arena_ui.print_legend()
 
     if args.viewer == 'viser':
@@ -1077,7 +1159,10 @@ def play(args):
                     type_names = tuple(
                         name for name, _ in moe_showcase_columns(
                             env_cfg.terrain.terrain_proportions))
-                    level_names = tuple(f"L{lvl}" for lvl in levels)
+                    level_names = tuple(
+                        f"row {row}: L{lvl} / stairs L{moe_showcase_levels_for_column('stairs_up', levels)[row]}"
+                        for row, lvl in enumerate(levels)
+                    )
                     panel_title = "Spawn (moe terrain)"
                 elif is_v6_showcase_terrain_cfg(env_cfg.terrain) or getattr(
                     args, "terrain", None

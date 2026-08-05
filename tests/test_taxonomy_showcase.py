@@ -266,6 +266,21 @@ class TestTaxonomyPlayConfig(unittest.TestCase):
         self.assertEqual(env_cfg.terrain.border_size, 2.0)
         self.assertIn(env_cfg.terrain.mesh_type, ("heightfield", "trimesh"))
 
+    def test_nominal_play_keeps_configured_observation_noise(self):
+        from legged_gym.scripts import play as play_mod
+
+        env_cfg = self._make_env_cfg()
+        env_cfg.noise = SimpleNamespace(add_noise=True)
+        env_cfg.domain_rand.randomize_friction = True
+        env_cfg.domain_rand.randomize_base_mass = True
+
+        play_mod._disable_play_domain_rand(env_cfg)
+
+        self.assertFalse(env_cfg.domain_rand.randomize_friction)
+        self.assertFalse(env_cfg.domain_rand.randomize_base_mass)
+        self.assertFalse(env_cfg.domain_rand.push_robots)
+        self.assertTrue(env_cfg.noise.add_noise)
+
     def test_cli_accepts_taxonomy(self):
         from legged_gym.utils.helpers import get_args
         # get_args parses sys.argv; inject taxonomy choice

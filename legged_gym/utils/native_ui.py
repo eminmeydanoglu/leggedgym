@@ -7,6 +7,18 @@ teleport plus a camera reframe.  ``scene.build()`` is one-shot in Genesis --
 entities and terrain cannot change afterwards -- so a tab is deliberately never
 a rebuild.
 
+Backends
+--------
+Everything below the ingress -- drive, orbit rig, tabs/levels, HUD text, gamepad,
+checkpoint hot-swap -- is backend-agnostic and is written once.  Only five entry
+points know which window is open (``_find_viewer``, ``_register_keybinds``,
+``_install_look_handlers``, ``_install_hud``, ``_install_focus_guard``), and they
+dispatch on ``_viewer_backend`` in {"genesis", "mujoco", None}.  Detection is by
+attribute provenance, never ``isinstance``: play.py imports this module before it
+knows which simulator it will build, so it must import with neither package
+installed.  Anything a backend cannot offer prints one line and leaves the
+session running, exactly as a missing Genesis feature already does.
+
 Threading contract
 ------------------
 Genesis runs the pyglet viewer in a background thread on Linux.  Keybind
@@ -22,6 +34,11 @@ thread.  Callbacks here only ever mutate thread-safe state:
 ``interaction_loop`` drains the queue with :meth:`NativeArenaUI.drain_and_apply`
 on the sim thread, which is where ``env.reset_idx`` / ``teleport_...`` are legal
 to call.
+
+The MuJoCo viewer is pumped synchronously from the sim thread, so ITS callbacks
+already run where env state may be touched.  They deliberately follow the same
+latch-only discipline anyway: the locks stay load-bearing for Genesis, they are
+free uncontended, and one discipline keeps the two backends from diverging.
 
 The on-screen HUD follows the same contract from the other direction: it is a
 pyrender *plugin* (``_HudPlugin``) whose ``on_draw`` runs on the viewer thread,
@@ -43,6 +60,7 @@ from legged_gym.scripts.input_source import DriveEnvelope, MergedSource
 from legged_gym.utils.terrain import (
     MOE_SHOWCASE_LEVELS,
     moe_showcase_columns,
+    moe_showcase_levels_for_column,
     teleport_env_to_taxonomy_tile,
 )
 
@@ -331,9 +349,11 @@ def format_arena_legend(
     tab_index: int = 0,
     level_index: int = 0,
     gamepad: str = "",
+    backend: str = "genesis",
 ) -> str:
     """Console legend: tabs, levels and every keybinding."""
-    head = "Play arena — native Genesis viewer"
+    backend_name = "MuJoCo" if backend == "mujoco" else "Genesis"
+    head = f"Play arena — native {backend_name} viewer"
     lines = [head, "=" * len(head)]
     lines.append("  tabs (terrain type, Tab / Shift+Tab):")
     for j, name in enumerate(tabs):
@@ -351,8 +371,9 @@ def format_arena_legend(
     lines.append("    Space         hard stop")
     lines.append("  camera:")
     lines.append("    T                 mode: gta -> rear -> front -> free")
+    other_camera = "MuJoCo free camera" if backend == "mujoco" else "Genesis trackball"
     lines.append("    mouse drag        gta: orbit (azimuth / pitch); other modes: "
-                 "Genesis trackball")
+                 + other_camera)
     lines.append("    mouse wheel       gta: zoom (distance); other modes: trackball")
     lines.append("    G                 snap the camera behind the robot")
     lines.append("    (gta azimuth is a free world angle: it never auto-recenters, so")
@@ -364,12 +385,14 @@ def format_arena_legend(
     lines.append("    N                 hot-swap to the next checkpoint of this run")
     lines.append("    J                 toggle gamepad on/off (auto-rescans when on)")
     lines.append("    M                 reprint this legend")
-    lines.append("  (Genesis reserves I for its own help overlay; R/S/Z/A/H/F/V/W/L/D/O/C/P "
-                 "stay with the viewer's debug toggles.)")
+    if backend == "genesis":
+        lines.append("  (Genesis reserves I for its own help overlay; R/S/Z/A/H/F/V/W/L/D/O/C/P "
+                     "stay with the viewer's debug toggles.)")
     lines.append("  gamepad: auto-detected at startup, no launch flag needed; a")
     lines.append("    hot-plugged pad is picked up within ~2 s; J toggles it on/off")
     lines.append(f"    connected: {gamepad if gamepad else 'none'}")
-    lines.append("    left stick   vx / vy (body frame)   LB / RB  yaw left / right")
+    lines.append("    left stick   vx / vy (body frame)   LT + stick  turbo vx ±2.0 m/s")
+    lines.append("    LB / RB      yaw left / right")
     lines.append("    right stick  camera look            R3       snap camera behind")
     lines.append("    D-pad L/R  tab    D-pad U/D  level    A  respawn")
     lines.append("    Y  next camera mode  START  hard stop  BACK  legend")
@@ -630,6 +653,12 @@ class NativeArenaUI:
         self._hud_plugin: Optional[_HudPlugin] = None
         self._hud_lines: Optional[List[str]] = None
         self._hud_last = 0.0
+        # Which viewer backend the ingress points dispatch on; set by
+        # _find_viewer.  Pre-seeded to None so that a half-built arena (the unit
+        # tests wire a fake viewer in by hand, bypassing _find_viewer) still has
+        # the attribute, and so that "unknown" falls through to the Genesis
+        # bodies -- those are the ones that existed first and must not move.
+        self._viewer_backend: Optional[str] = None
 
         self.viewer = self._find_viewer()
         if self.viewer is not None:
@@ -637,11 +666,35 @@ class NativeArenaUI:
 
     # -- wiring --------------------------------------------------------------
     def _find_viewer(self):
+        """Locate the play window, whichever physics backend is running.
+
+        Genesis hangs its viewer off the built scene (``simulator._scene.viewer``);
+        the MuJoCo simulator owns its window directly (``simulator._viewer``,
+        None when headless).  Genesis wins when both somehow exist because it is
+        the backend every ingress body below was written against.
+
+        Provenance -- which ATTRIBUTE the object came out of -- is what selects
+        the backend, never ``isinstance``: this module has to stay importable
+        with neither genesis nor mujoco installed (play.py imports it before it
+        knows which simulator it will build), so it may not name either class.
+        """
         simulator = getattr(self.env, "simulator", None)
         scene = getattr(simulator, "_scene", None)
-        return getattr(scene, "viewer", None)
+        viewer = getattr(scene, "viewer", None)
+        if viewer is not None:
+            self._viewer_backend = "genesis"
+            return viewer
+        viewer = getattr(simulator, "_viewer", None)
+        if viewer is not None:
+            self._viewer_backend = "mujoco"
+            return viewer
+        self._viewer_backend = None
+        return None
 
     def _register_keybinds(self) -> None:
+        if self._viewer_backend == "mujoco":
+            self._register_keybinds_mujoco()
+            return
         try:
             from genesis.vis.keybindings import Key, KeyAction, Keybind
         except Exception as exc:  # pragma: no cover - depends on Genesis build
@@ -717,6 +770,73 @@ class NativeArenaUI:
         self._install_look_handlers()
         self._install_hud()
 
+    def _register_keybinds_mujoco(self) -> None:
+        """One key callback instead of ~30 Keybind objects.
+
+        ``MujocoViewer.set_key_callback(cb)`` delivers ``cb(key_name, pressed)``
+        for BOTH edges and suppresses auto-repeat, which is exactly the two
+        properties the Genesis path buys with a PRESS Keybind plus a RELEASE
+        Keybind per key.  The viewer's key names were deliberately chosen to be
+        the very strings in DRIVE_KEYMAP / ACTION_KEYMAP, so there is no
+        translation table here and nothing to keep in sync when a key is added.
+
+        THREADING -- this is the one real difference from Genesis.  Genesis runs
+        its pyglet viewer on a background thread, so its callbacks land on the
+        *viewer* thread and may only latch (see the module docstring).  The
+        MuJoCo viewer is pumped synchronously from the sim thread, so this
+        callback is already on the thread that is allowed to touch env state.
+        It still goes through the same latch-only path on purpose: the locks in
+        KeyboardSource and around ``_mouse_look`` must stay correct for Genesis,
+        they cost nothing uncontended, and one shared discipline means arena
+        behaviour cannot quietly diverge between the two backends.
+
+        Shift is still tracked by hand (see the Genesis body): the reason there
+        was pyglet's modifier bitmask, but the property that matters -- Shift+Tab
+        resolving inside ``_on_action_key`` rather than through a second bound
+        combination -- is what keeps Shift+Tab working identically on a backend
+        that reports no modifier state at all.
+        """
+        # Reverse lookups: key NAME -> what it does.  Built per install rather
+        # than at module scope so the keymap tables stay the single source of
+        # truth and no new module-level name appears.
+        drive_by_key = {key: action for key, action in DRIVE_KEYMAP.values()}
+        action_by_key = {key: event for key, event in ACTION_KEYMAP.values()}
+
+        def on_key(key_name: str, pressed: bool) -> None:
+            try:
+                if key_name in ("LSHIFT", "RSHIFT"):
+                    self._set_shift(pressed)
+                    return
+                action = drive_by_key.get(key_name)
+                if action is not None:
+                    if pressed:
+                        self.source.keyboard.press(action)
+                    else:
+                        self.source.keyboard.release(action)
+                    return
+                if not pressed:
+                    return  # arena actions fire once, on the press edge only
+                event = action_by_key.get(key_name)
+                if event is not None:
+                    # Resolves Shift+Tab -> tab_prev from the hand-tracked flag.
+                    self._on_action_key(event)
+            except Exception as exc:  # pragma: no cover - must never kill input
+                print(f"[arena] key {key_name!r} failed: {exc}")
+
+        try:
+            self.viewer.set_key_callback(on_key)
+        except Exception as exc:
+            print(f"[arena] keybinds unavailable ({exc}); keyboard drive is off")
+            self.viewer = None
+            return
+        # ``_registered`` stays empty: it exists to feed viewer.remove_keybind()
+        # in unregister(), and this backend has a single callback slot with no
+        # per-binding names to remove.
+        self._registered = []
+        self._install_focus_guard()
+        self._install_look_handlers()
+        self._install_hud()
+
     # -- HUD -----------------------------------------------------------------
     def _install_hud(self) -> None:
         """Attach the on-screen HUD plugin.  Silent no-op when unavailable.
@@ -728,7 +848,29 @@ class NativeArenaUI:
         viewer's ``viewer_flags["caption"]`` slot is deliberately never
         touched: the caption loop runs BEFORE plugin drawing, so caption text
         could never sit on top of a backplate anyway (see _HudPlugin).
+
+        On MuJoCo the viewer paints the overlay itself, so there is no plugin,
+        no font probe and no backplate math -- only the same shared list handed
+        over once.
         """
+        if self._viewer_backend == "mujoco":
+            # Same contract as the plugin, one indirection shorter: the viewer
+            # KEEPS THIS EXACT LIST OBJECT and reads it every frame it draws, so
+            # update_hud must keep swapping strings into it IN PLACE.  A
+            # reallocation here would leave the viewer painting the original
+            # (now orphaned) list forever -- the HUD would freeze on its startup
+            # text.  That is the same reason _HudPlugin never reallocates.
+            self._hud_lines = ["", "", "", ""]
+            try:
+                self.viewer.set_hud_lines(self._hud_lines)
+            except Exception as exc:
+                print(f"[arena] on-screen HUD unavailable ({exc}); terminal only")
+                self._hud_lines = None
+                return
+            # No pyrender window and no plugin on this path; _remove_hud's
+            # early-out covers exactly that shape, so teardown stays a no-op.
+            self.update_hud(force=True)
+            return
         window = getattr(self.viewer, "_pyrender_viewer", None)
         if window is None:
             return
@@ -816,8 +958,15 @@ class NativeArenaUI:
         self._hud_last = now
 
         try:
+            hud_levels = self.levels
+            terrain_cfg = getattr(getattr(self.env, "cfg", None), "terrain", None)
+            if getattr(terrain_cfg, "moe_showcase", False):
+                hud_levels = list(self.levels)
+                hud_levels[self.level_index] = self._display_level(
+                    self.tab_index, self.level_index
+                )
             new_lines = format_hud_lines(
-                self.tabs, self.levels, self.tab_index, self.level_index,
+                self.tabs, hud_levels, self.tab_index, self.level_index,
                 command=command, achieved=achieved, fps=fps, realtime=realtime,
                 device=self._device_label(),
                 following=self.following,
@@ -865,7 +1014,15 @@ class NativeArenaUI:
         the original so Genesis's bookkeeping still runs.  Only the lock-guarded
         pure-Python ``source.clear()`` is touched: this runs on the viewer
         thread and must not write ``env.commands`` (a device tensor).
+
+        No-op on MuJoCo: that viewer's contract exposes no focus/deactivate
+        hook to wrap.  Nothing to degrade gracefully *to*, so it stays silent
+        rather than printing a warning once per launch; the worst case is the
+        pre-existing stuck-key behaviour on alt-tab, which Space (hard stop)
+        clears.
         """
+        if self._viewer_backend == "mujoco":
+            return
         window = getattr(self.viewer, "_pyrender_viewer", None)
         if window is None or "on_deactivate" in vars(window):
             return  # nothing to wrap, or already wrapped
@@ -910,6 +1067,9 @@ class NativeArenaUI:
           also process the drag would silently accumulate a pose that jumps out
           at the user the moment they cycle to ``free``.
         """
+        if self._viewer_backend == "mujoco":
+            self._install_look_handlers_mujoco()
+            return
         window = getattr(self.viewer, "_pyrender_viewer", None)
         if window is None:
             return
@@ -949,9 +1109,67 @@ class NativeArenaUI:
             return
         self._look_window = window
 
+    def _install_look_handlers_mujoco(self) -> None:
+        """Same two accumulators, fed by the MuJoCo viewer's callbacks.
+
+        UNITS are the contract that keeps ``_advance_gta_rig`` untouched: the
+        drag callback delivers pixel deltas with pyglet's sign convention (+x
+        right, +y up) and the scroll callback wheel notches, which is exactly
+        what ``on_mouse_drag`` / ``on_mouse_scroll`` stash above.  So this is a
+        pass-through: no scaling, no negation, no per-backend constants.
+
+        OWNERSHIP is the mirror of the Genesis branch.  There the non-gta event
+        is chained to pyrender's trackball; here it is simply dropped, because
+        the MuJoCo viewer already runs its own camera on the same drag and
+        chaining is not ours to do -- the callback contract has no "handled"
+        return.  Accumulating outside gta would bank pixels nobody ever drains.
+
+        The lock is kept even though these fire on the sim thread (the viewer is
+        pumped synchronously): ``_take_mouse_look`` is shared with the Genesis
+        path, where the lock is load-bearing, and an uncontended acquire is free.
+        """
+        viewer = self.viewer
+
+        def on_drag(dx, dy) -> None:
+            if self.camera_mode != "gta":
+                return
+            try:
+                with self._look_lock:
+                    self._mouse_look[0] += float(dx)
+                    self._mouse_look[1] += float(dy)
+            except Exception:  # pragma: no cover - must never break the viewer
+                pass
+
+        def on_scroll(notches) -> None:
+            if self.camera_mode != "gta":
+                return
+            try:
+                with self._look_lock:
+                    self._mouse_scroll += float(notches)
+            except Exception:  # pragma: no cover
+                pass
+
+        try:
+            viewer.set_drag_callback(on_drag)
+            viewer.set_scroll_callback(on_scroll)
+        except Exception as exc:
+            print(f"[arena] mouse-look unavailable ({exc}); pad/keys still work")
+            return
+        # ``_look_window`` stays None: it exists only so unregister() can delete
+        # the shadowing pyglet instance attributes, and there are none here.
+
     def unregister(self) -> None:
         """Best-effort removal of every keybind this object registered."""
         self._remove_hud()
+        if self._viewer_backend == "mujoco":
+            # Nothing to unwind.  The MujocoViewer contract has setters but no
+            # removers, and handing back None could crash a viewer that invokes
+            # its stored callback unconditionally.  Leaving them attached is
+            # harmless: after _remove_hud the callbacks only latch into
+            # KeyboardSource and the look accumulators, which nothing drains any
+            # more, and the viewer is closed with the session anyway.
+            self._registered = []
+            return
         window = getattr(self, "_focus_guard_window", None)
         if window is not None:
             try:
@@ -1060,7 +1278,19 @@ class NativeArenaUI:
 
     @property
     def current(self) -> Tuple[str, int]:
-        return (self.tabs[self.tab_index], self.levels[self.level_index])
+        return (self.tabs[self.tab_index], self._display_level(
+            self.tab_index, self.level_index))
+
+    def _display_level(self, tab_index: int, level_index: int) -> int:
+        """Training-level label for a row in the selected showcase column."""
+        row = min(max(int(level_index), 0), len(self.levels) - 1)
+        terrain_cfg = getattr(getattr(self.env, "cfg", None), "terrain", None)
+        if getattr(terrain_cfg, "moe_showcase", False):
+            tab = min(max(int(tab_index), 0), len(self.tabs) - 1)
+            return moe_showcase_levels_for_column(
+                self.tabs[tab], self.levels
+            )[row]
+        return self.levels[row]
 
     # -- world actions -------------------------------------------------------
     def _zero_command(self) -> None:
@@ -1099,7 +1329,8 @@ class NativeArenaUI:
         # Reflect the switch on screen immediately instead of up to one HUD
         # refresh period later.
         self.update_hud(force=True)
-        name, level = self.tabs[tab_index], self.levels[level_index]
+        name = self.tabs[tab_index]
+        level = self._display_level(tab_index, level_index)
         if not self.quiet:
             tag = f"[arena/{announce}]" if announce else "[arena]"
             print(f"{tag} tab {tab_index} '{name}'  ·  level L{level} "
@@ -1436,5 +1667,12 @@ class NativeArenaUI:
         if self.source.gamepad is not None and self.source.gamepad.available:
             gamepad = self.source.gamepad.name
         print(format_arena_legend(
-            self.tabs, self.levels, self.tab_index, self.level_index, gamepad
+            self.tabs, self.levels, self.tab_index, self.level_index, gamepad,
+            backend=self._viewer_backend or "genesis",
         ))
+        terrain_cfg = getattr(getattr(self.env, "cfg", None), "terrain", None)
+        if getattr(terrain_cfg, "moe_showcase", False):
+            stairs = moe_showcase_levels_for_column("stairs_up", self.levels)
+            print("  MoE row mapping: other terrains "
+                  + "/".join(f"L{level}" for level in self.levels)
+                  + " | stairs " + "/".join(f"L{level}" for level in stairs))

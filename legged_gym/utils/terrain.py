@@ -531,8 +531,38 @@ def teleport_env_to_taxonomy_tile(env, env_index: int, level: int, type_idx: int
         level,
         type_idx,
     )
-    env.reset_idx(env_ids)
+    respawn_env_for_play(env, int(env_index), env_ids=env_ids)
     return True
+
+
+def respawn_env_for_play(env, env_index: int, env_ids=None) -> None:
+    """Reset one interactive-play robot upright and stationary.
+
+    The normal training reset intentionally randomizes joint pose, XY spawn and
+    base velocity. Those perturbations are useful during training but can make
+    a manually requested respawn immediately tumble again on rough terrain.
+    Keep the full reset lifecycle/DR draw, then overwrite only the physical
+    spawn state with the simulator's nominal pose and zero velocity.
+    """
+    import torch
+
+    sim = env.simulator
+    if env_ids is None:
+        env_ids = torch.tensor([int(env_index)], device=env.device, dtype=torch.long)
+    env.reset_idx(env_ids)
+
+    count = len(env_ids)
+    dof_pos = sim.default_dof_pos.reshape(1, -1).repeat(count, 1)
+    dof_vel = torch.zeros_like(dof_pos)
+    sim.reset_dofs(env_ids, dof_pos, dof_vel)
+
+    base_pos = sim.base_init_pos.reshape(1, -1).repeat(count, 1)
+    base_pos = base_pos + sim.env_origins[env_ids]
+    base_quat = sim.base_init_quat.reshape(1, -1).repeat(count, 1)
+    zero_velocity = torch.zeros((count, 3), device=env.device, dtype=base_pos.dtype)
+    sim.reset_root_states(
+        env_ids, base_pos, base_quat, zero_velocity, zero_velocity.clone()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,9 +573,36 @@ def teleport_env_to_taxonomy_tile(env, env_index: int, level: int, type_idx: int
 # Rows the go2_moects TRAINING grid uses; showcase difficulty is level / this,
 # i.e. exactly what moe_grid() passes for that level.
 MOE_TRAINING_NUM_ROWS = 10
-# Easy / medium / hardest — one robot per cell keeps the exhibit light enough
-# for laptop GPUs (the full 5-level grid was 40 envs and crawled even on a T4).
+# The three physical showcase rows remain common to every terrain type.  Their
+# *training level* is column-specific: ordinary terrain shows the broad
+# easy/medium/hard samples below, while stairs use the three adjacent early
+# curriculum levels in MOE_SHOWCASE_STAIR_LEVELS.
 MOE_SHOWCASE_LEVELS = (0, 4, 9)
+MOE_SHOWCASE_STAIR_LEVELS = (1, 2, 3)
+
+
+def moe_showcase_levels_for_column(name, levels=MOE_SHOWCASE_LEVELS):
+    """Training-level labels/geometry for one MoE showcase column.
+
+    ``levels`` is normally the three shared display rows.  An explicit
+    ``play.py --terrain_level`` creates a one-row, user-pinned exhibit; retain
+    that override for every column rather than fabricating a three-row stairs
+    bank with a mismatched grid shape.
+    """
+    levels = tuple(int(level) for level in levels)
+    if len(levels) == len(MOE_SHOWCASE_STAIR_LEVELS) and name in {
+        "stairs_up", "stairs_down"
+    }:
+        return MOE_SHOWCASE_STAIR_LEVELS
+    return levels
+
+
+def moe_showcase_center_cell(num_rows, num_cols):
+    """(row, column) of the middle tile in an odd-by-odd showcase grid."""
+    rows, cols = int(num_rows), int(num_cols)
+    if rows < 1 or cols < 1:
+        raise ValueError("MoE showcase grid must have at least one row and column")
+    return ((rows - 1) // 2, (cols - 1) // 2)
 
 
 def moe_showcase_columns(terrain_proportions):
@@ -585,8 +642,10 @@ def format_moe_showcase_console_map(columns, levels):
     """Readable ASCII legend for the --terrain moe exhibit."""
     head = ("MoE-CTS terrain showcase — columns (+Y) = distinct terrain types, "
             "rows (+X) = difficulty levels")
+    stairs_levels = moe_showcase_levels_for_column("stairs_up", levels)
     lines = [head, "=" * len(head),
-             f"  levels (X, near -> far): {', '.join('L%d' % l for l in levels)}",
+             f"  rows (X, near -> far): normal {', '.join('L%d' % l for l in levels)}"
+             f" | stairs {', '.join('L%d' % l for l in stairs_levels)}",
              "  columns (Y, left -> right):"]
     for j, (name, choice) in enumerate(columns):
         lines.append(f"    col {j:>2}  {name}")
@@ -779,13 +838,18 @@ class Terrain:
         self._moe_alloc_map()
         self.moe_showcase_labels = []
         for j, (name, choice) in enumerate(columns[:self.cfg.num_cols]):
-            for i, level in enumerate(levels[:self.cfg.num_rows]):
+            column_levels = moe_showcase_levels_for_column(name, levels)
+            if len(column_levels) != self.cfg.num_rows:
+                raise ValueError(
+                    f"MoE showcase column {name!r} has {len(column_levels)} levels, "
+                    f"but num_rows={self.cfg.num_rows}")
+            for i, level in enumerate(column_levels):
                 difficulty = level / MOE_TRAINING_NUM_ROWS
                 terrain = self.make_moe_terrain(choice, difficulty)
                 self.add_moe_terrain_to_map(terrain, i, j)
             self.name2cols[terrain.terrain_name].add(j)
             self.cols2id.append(terrain.terrain_id)
-            self.moe_showcase_labels.append((j, name, tuple(levels)))
+            self.moe_showcase_labels.append((j, name, tuple(column_levels)))
 
     def make_moe_terrain(self, choice, difficulty):
         """Sub-terrain table from go2_rl_gym (IS_HARD difficulty scaling).

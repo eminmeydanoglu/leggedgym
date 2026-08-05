@@ -123,7 +123,8 @@ class Go2MoECTSCommonCfg(Go2FlatCommonCfg):
         terminate_after_contacts_on = ["base"]
 
     class terrain(LeggedRobotCfg.terrain):
-        mesh_type = 'heightfield'   # moe_grid is heightfield-only (Genesis handoff path)
+        mesh_type = 'heightfield'   # moe_grid is heightfield-only; Genesis trains it,
+                                    # MuJoCo replays the same raster (mujoco_scene.py)
         # Ground friction 0.5 (host default 1.0). Genesis max-combines link and
         # ground friction, so with per-env link friction U[0.5, 1.5] (see
         # domain_rand.friction_range) the effective friction = max(link, 0.5)

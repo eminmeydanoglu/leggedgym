@@ -46,7 +46,8 @@ class FakeController:
         self.open_calls = 0
         for name in ("a", "b", "x", "y", "leftshoulder", "rightshoulder",
                      "leftstick", "rightstick", "dpup", "dpdown", "dpleft",
-                     "dpright", "start", "back"):
+                     "dpright", "start", "back", "lefttrigger", "left_trigger",
+                     "l2"):
             setattr(self, name, bool(buttons.get(name, False)))
 
     def open(self):
@@ -317,6 +318,25 @@ class TestGamepadSource(unittest.TestCase):
         self.assertAlmostEqual(vy, 0.7)
         self.assertLessEqual(yaw, 1.5)
         self.assertAlmostEqual(yaw, 1.5, places=3)
+
+    def test_left_trigger_expands_only_vx_to_two_meters_per_second(self):
+        pad, controller = make_pad(lefty=-1.0)
+        self.assertAlmostEqual(pad.poll()[0], 1.5)  # normal forward limit
+        controller.lefttrigger = True
+        vx, vy, yaw = pad.poll()
+        self.assertAlmostEqual(vx, 2.0)
+        self.assertAlmostEqual(vy, 0.0)
+        self.assertAlmostEqual(yaw, 0.0)
+
+        controller.lefty = 1.0
+        self.assertAlmostEqual(pad.poll()[0], -2.0)
+
+    def test_analog_left_trigger_uses_a_hold_threshold(self):
+        pad, controller = make_pad(lefty=-1.0)
+        controller.lefttrigger = 0.49
+        self.assertAlmostEqual(pad.poll()[0], 1.5)
+        controller.lefttrigger = 0.5
+        self.assertAlmostEqual(pad.poll()[0], 2.0)
 
     def test_no_controller_is_safe(self):
         pad = GamepadSource(controller=None, auto_open=False)

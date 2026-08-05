@@ -21,10 +21,40 @@ from legged_gym.utils.terrain import (
     apply_taxonomy_tile_assignment,
     clamp_taxonomy_spawn,
     taxonomy_tile_label,
+    respawn_env_for_play,
 )
 
 
 class TestTaxonomySpawn(unittest.TestCase):
+    def test_play_respawn_overwrites_training_randomization(self):
+        import torch
+
+        sim = SimpleNamespace(
+            default_dof_pos=torch.arange(12, dtype=torch.float32).reshape(1, 12),
+            base_init_pos=torch.tensor([0.0, 0.0, 0.42]),
+            base_init_quat=torch.tensor([0.0, 0.0, 0.0, 1.0]),
+            env_origins=torch.tensor([[4.0, 8.0, 0.3]]),
+            reset_dofs=MagicMock(),
+            reset_root_states=MagicMock(),
+        )
+        env = SimpleNamespace(
+            simulator=sim,
+            device=torch.device("cpu"),
+            reset_idx=MagicMock(),
+        )
+
+        respawn_env_for_play(env, 0)
+
+        env.reset_idx.assert_called_once()
+        dof_args = sim.reset_dofs.call_args.args
+        torch.testing.assert_close(dof_args[1], sim.default_dof_pos)
+        torch.testing.assert_close(dof_args[2], torch.zeros_like(sim.default_dof_pos))
+        root_args = sim.reset_root_states.call_args.args
+        torch.testing.assert_close(root_args[1], torch.tensor([[4.0, 8.0, 0.72]]))
+        torch.testing.assert_close(root_args[2], sim.base_init_quat.reshape(1, 4))
+        torch.testing.assert_close(root_args[3], torch.zeros((1, 3)))
+        torch.testing.assert_close(root_args[4], torch.zeros((1, 3)))
+
     def test_clamp(self):
         self.assertEqual(clamp_taxonomy_spawn(-1, 99), (0, TAXONOMY_NUM_TYPES - 1))
         self.assertEqual(clamp_taxonomy_spawn(3, 5), (3, 5))

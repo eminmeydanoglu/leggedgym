@@ -1,5 +1,5 @@
 import torch
-from legged_gym.simulator import GenesisSimulator, IsaacGymSimulator, IsaacLabSimulator
+from legged_gym.simulator import GenesisSimulator, IsaacGymSimulator, IsaacLabSimulator, MujocoSimulator
 from legged_gym import SIMULATOR
 from typing import Any, Dict, Optional, Tuple, Protocol
 
@@ -77,6 +77,16 @@ class BaseTask:
             self.simulator = IsaacGymSimulator(cfg, sim_params, sim_device, self.headless)
         elif SIMULATOR == "isaaclab":
             self.simulator = IsaacLabSimulator(cfg, sim_params, sim_device, self.headless)
+        elif SIMULATOR == "mujoco":
+            # The package-level import degrades to None when the optional mujoco
+            # dependency is missing, so catch that here rather than letting it
+            # surface as an opaque "NoneType is not callable".
+            if MujocoSimulator is None:
+                raise RuntimeError(
+                    "SIMULATOR=mujoco was requested but the MuJoCo backend could not be imported. "
+                    "Install it with `pip install mujoco`."
+                )
+            self.simulator = MujocoSimulator(cfg, sim_params, sim_device, self.headless)
         else:
             raise ValueError(f"Unknown simulator: {SIMULATOR}")
 

@@ -14,8 +14,10 @@ if sys.version_info[1] >= 10: # >=3.10 for genesis and isaacsim
         SIMULATOR = "genesis"
     elif simulator_type == "isaaclab":
         SIMULATOR = "isaaclab"
+    elif simulator_type == "mujoco":
+        SIMULATOR = "mujoco"
     else:
-        raise ValueError("Unsupported SIMULATOR type. Please set the SIMULATOR environment variable to 'genesis' or 'isaaclab'.")
+        raise ValueError("Unsupported SIMULATOR type. Please set the SIMULATOR environment variable to 'genesis', 'isaaclab' or 'mujoco'.")
 elif sys.version_info[1] <= 8 and sys.version_info[1] >= 6: # >=3.6 and <3.9 for isaacgym
     SIMULATOR = "isaacgym"
 
@@ -36,4 +38,10 @@ elif SIMULATOR == "isaaclab":
         import isaaclab
     except ImportError as e:
         print("Failed to import Isaac Lab. Please ensure that the Isaac Lab is properly installed and configured.")
+        raise e
+elif SIMULATOR == "mujoco":
+    try:
+        import mujoco
+    except ImportError as e:
+        print("Failed to import MuJoCo. Please ensure that MuJoCo is properly installed (pip install mujoco).")
         raise e

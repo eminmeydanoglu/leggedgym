@@ -55,6 +55,11 @@ class DriveEnvelope:
     backward: float = 1.0
     lateral: float = 0.7
     yaw: float = 1.5
+    # Playback-only high-speed envelope.  It is selected by a held gamepad
+    # trigger, never written to the environment cfg, so training/resume command
+    # ranges keep their original contract.
+    turbo_forward: float = 2.0
+    turbo_backward: float = 2.0
 
     def clamp(self, vx: float, vy: float, yaw: float) -> Command:
         """Clamp a command into the envelope (forward/backward are asymmetric)."""
@@ -63,11 +68,18 @@ class DriveEnvelope:
         yaw = min(max(float(yaw), -abs(self.yaw)), abs(self.yaw))
         return (vx, vy, yaw)
 
-    def scale(self, ax: float, ay: float, ayaw: float) -> Command:
+    def scale(self, ax: float, ay: float, ayaw: float, *, turbo: bool = False) -> Command:
         """Map unit-square axes in [-1, 1] onto the envelope, then clamp."""
         ax = float(ax)
-        vx = ax * (self.forward if ax >= 0.0 else self.backward)
-        return self.clamp(vx, float(ay) * self.lateral, float(ayaw) * self.yaw)
+        forward = self.turbo_forward if turbo else self.forward
+        backward = self.turbo_backward if turbo else self.backward
+        vx = ax * (forward if ax >= 0.0 else backward)
+        # ``clamp`` deliberately retains the normal limits, so apply the
+        # turbo vx limit here while all lateral/yaw limits remain unchanged.
+        vx = min(max(vx, -abs(backward)), abs(forward))
+        vy = min(max(float(ay) * self.lateral, -abs(self.lateral)), abs(self.lateral))
+        yaw = min(max(float(ayaw) * self.yaw, -abs(self.yaw)), abs(self.yaw))
+        return (vx, vy, yaw)
 
     def as_dict(self) -> Dict[str, float]:
         return {
@@ -75,6 +87,8 @@ class DriveEnvelope:
             "back": self.backward,
             "lat": self.lateral,
             "yaw": self.yaw,
+            "turbo_fwd": self.turbo_forward,
+            "turbo_back": self.turbo_backward,
         }
 
 
@@ -261,6 +275,12 @@ DEFAULT_BUTTON_EVENTS: Dict[str, str] = {
 
 #: (yaw-left button, yaw-right button).  Read as an axis, never as an event.
 YAW_BUTTONS: Tuple[str, str] = ("leftshoulder", "rightshoulder")
+
+# Pyglet's standard controller mapping calls this ``lefttrigger``.  The two
+# fallbacks cover common Linux mappings without making a controller-specific
+# layout part of play.py.
+TURBO_TRIGGER_NAMES: Tuple[str, ...] = ("lefttrigger", "left_trigger", "l2")
+TURBO_TRIGGER_THRESHOLD = 0.5
 
 
 class GamepadSource:
@@ -461,6 +481,30 @@ class GamepadSource:
     def _shape(self, raw: float) -> float:
         return apply_expo(apply_deadzone(raw, self.deadzone), self.expo)
 
+    @staticmethod
+    def _turbo_held(controller) -> bool:
+        """Whether LT is held enough to select the ±2 m/s playback envelope.
+
+        Mapped trigger values are normally in ``[0, 1]``.  Bool mappings are
+        accepted too, which is useful for controllers whose Linux driver
+        exposes LT as a button rather than an axis.
+        """
+        for name in TURBO_TRIGGER_NAMES:
+            try:
+                value = getattr(controller, name, None)
+            except Exception:  # pragma: no cover - device vanished mid-read
+                continue
+            if isinstance(value, bool):
+                if value:
+                    return True
+                continue
+            try:
+                if float(value) >= TURBO_TRIGGER_THRESHOLD:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
     @property
     def look(self) -> Tuple[float, float]:
         """Shaped right-stick position ``(x, y)`` for the camera rig.
@@ -506,6 +550,7 @@ class GamepadSource:
         # Same signs as the old pygame mapping in play.py.
         ax = self._shape(-ly)
         ay = self._shape(-lx)
+        turbo = self._turbo_held(controller)
         # LB/RB are a +-1 axis target, then ramped.  Both held cancel out, like
         # the opposing keyboard keys do.
         yaw_target = (1.0 if yaw_left else 0.0) - (1.0 if yaw_right else 0.0)
@@ -524,11 +569,12 @@ class GamepadSource:
         self.stick_active = (
             abs(ax) > 0.0
             or abs(ay) > 0.0
+            or turbo
             or yaw_target != 0.0
             or abs(self._yaw_axis) > 1e-4
         )
         self._scan_buttons(controller)
-        return self.envelope.scale(ax, ay, self._yaw_axis)
+        return self.envelope.scale(ax, ay, self._yaw_axis, turbo=turbo)
 
     def _idle(self, dt: float) -> None:
         """No controller this frame: coast the yaw ramp down, zero the look.
