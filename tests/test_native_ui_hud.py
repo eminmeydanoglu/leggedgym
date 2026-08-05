@@ -27,6 +27,7 @@ runtime, on the *viewer* thread, inside Genesis's draw loop:
 import contextlib
 import io
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -47,9 +48,21 @@ class FakePyrenderViewer:
     def __init__(self):
         self.viewer_flags = {"caption": None}
         self.plugins = []
+        self.trackball_drags = []
+        self.trackball_scrolls = []
 
     def on_deactivate(self):
         self.deactivated = True
+
+    # Genesis's trackball handlers; the arena shadows these as instance
+    # attributes and must chain to them in every mode except gta.
+    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+        self.trackball_drags.append((dx, dy))
+        return "chained"
+
+    def on_mouse_scroll(self, x, y, dx, dy):
+        self.trackball_scrolls.append(dy)
+        return "chained"
 
 
 class FakeViewer:
@@ -111,6 +124,7 @@ def make_arena(with_pyrender=True, tabs=None, levels=None):
     # NativeArenaUI._find_viewer returned None (no scene), so wire the fake in
     # and run only the HUD half of the registration path.
     arena.viewer = FakeViewer(with_pyrender=with_pyrender)
+    arena._install_look_handlers()
     arena._install_hud()
     return arena
 
@@ -151,11 +165,38 @@ class TestFormatHudLines(unittest.TestCase):
         self.assertIn("cam front", status)
 
 
+class FakeLookPad:
+    """Minimal GamepadSource surface MergedSource.look reads."""
+
+    available = True
+    name = "Fake F310"
+
+    def __init__(self, look=(0.0, 0.0)):
+        self.look = look
+        self.stick_active = False
+
+    def poll(self, dt=0.0):
+        return (0.0, 0.0, 0.0)
+
+    def drain_events(self):
+        return []
+
+
+def gta_arena(look=(0.0, 0.0)):
+    """An arena parked in gta mode with a scripted right-stick position."""
+    arena = make_arena()
+    arena.source.gamepad = FakeLookPad(look)
+    return arena
+
+
 class TestCameraModes(unittest.TestCase):
-    def test_t_cycle_is_rear_front_then_free(self):
+    def test_t_cycle_is_gta_rear_front_then_free(self):
         arena = make_arena()
-        self.assertEqual(arena.camera_mode, "free")
-        self.assertFalse(arena.camera_override_active)
+        # gta is the startup default, and because it writes a pose from frame
+        # one the arena owns the camera immediately (play.py's --follow_robot
+        # must not also write one).
+        self.assertEqual(arena.camera_mode, "gta")
+        self.assertTrue(arena.camera_override_active)
 
         self.assertEqual(arena.next_camera_mode(), "rear")
         self.assertTrue(arena.camera_override_active)
@@ -171,6 +212,8 @@ class TestCameraModes(unittest.TestCase):
 
         self.assertEqual(arena.next_camera_mode(), "free")
         self.assertFalse(arena.following)
+        self.assertEqual(arena.next_camera_mode(), "gta")  # wraps back round
+        self.assertTrue(arena.following)                   # gta writes poses
 
     def test_follow_camera_heavily_filters_vertical_body_bounce(self):
         arena = make_arena()
@@ -178,11 +221,224 @@ class TestCameraModes(unittest.TestCase):
         arena.env.simulator.base_pos[0, 2] = 1.5
         self.assertTrue(arena.update_follow_camera())
         eye, lookat = arena.env.camera_poses[-1]
-        # A one-metre instantaneous body bounce moves the camera anchor only
-        # 3.5 cm, while preserving the fixed third-person offsets.
-        np.testing.assert_allclose(eye, [5.5, 20.0, 2.085])
-        np.testing.assert_allclose(lookat, [10.7, 20.0, 0.915])
+        # A one-metre instantaneous body bounce leaves the world-level camera
+        # rig untouched; the robot moves inside the frame instead.
+        np.testing.assert_allclose(eye, [5.5, 20.0, 2.05])
+        np.testing.assert_allclose(lookat, [10.7, 20.0, 0.88])
 
+    def test_follow_camera_stride_skips_only_non_forced_updates(self):
+        arena = make_arena()
+        arena._follow_camera_stride = 2
+        arena.next_camera_mode()  # immediate forced rear pose
+        poses_after_switch = len(arena.env.camera_poses)
+
+        self.assertFalse(arena.update_follow_camera())
+        self.assertEqual(len(arena.env.camera_poses), poses_after_switch)
+        self.assertTrue(arena.update_follow_camera())
+        self.assertEqual(len(arena.env.camera_poses), poses_after_switch + 1)
+
+    def test_follow_camera_ignores_tiny_yaw_jitter_then_turns_slowly(self):
+        arena = make_arena()
+        arena.next_camera_mode()
+        initial_eye, _ = arena.env.camera_poses[-1]
+
+        arena.env.simulator.base_euler[0, 2] = 0.01
+        self.assertTrue(arena.update_follow_camera())
+        tiny_jitter_eye, _ = arena.env.camera_poses[-1]
+        np.testing.assert_allclose(tiny_jitter_eye, initial_eye)
+
+        arena.env.simulator.base_euler[0, 2] = 0.4
+        self.assertTrue(arena.update_follow_camera())
+        turning_eye, _ = arena.env.camera_poses[-1]
+        # The camera follows the real turn, but it has accepted only 5% of it.
+        self.assertLess(turning_eye[1], 20.0)
+        self.assertGreater(turning_eye[1], 19.85)
+
+    def test_gta_snaps_behind_the_robot_on_the_first_update(self):
+        arena = gta_arena()
+        self.assertTrue(arena.update_follow_camera(dt=0.0))
+        eye, lookat = arena.env.camera_poses[-1]
+        # Robot at (10, 20, 0.5) facing +x, so the eye sits at -x from it, one
+        # default distance away, lifted by the default pitch.
+        horizontal = native_ui.GTA_DISTANCE * np.cos(native_ui.GTA_PITCH)
+        np.testing.assert_allclose(
+            eye,
+            [10.0 - horizontal, 20.0,
+             0.5 + native_ui.GTA_DISTANCE * np.sin(native_ui.GTA_PITCH)],
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            lookat, [10.0, 20.0, 0.5 + native_ui.GTA_LOOKAT_HEIGHT], atol=1e-6)
+
+    def test_gta_azimuth_is_absolute_and_never_follows_the_robot(self):
+        """The whole point of the mode: orbit round and see the robot's front."""
+        arena = gta_arena()
+        arena.update_follow_camera(dt=0.0)
+        eye_before, _ = arena.env.camera_poses[-1]
+
+        # The robot turns a full quarter turn; the camera must not swing with
+        # it (rear mode would).
+        for yaw in (0.4, 0.9, 1.57):
+            arena.env.simulator.base_euler[0, 2] = yaw
+            arena.update_follow_camera(dt=1 / 60.0)
+        eye_after, _ = arena.env.camera_poses[-1]
+        np.testing.assert_allclose(eye_after, eye_before, atol=1e-6)
+
+    def test_right_stick_x_orbits_at_the_documented_rate(self):
+        arena = gta_arena(look=(1.0, 0.0))
+        arena.update_follow_camera(dt=0.0)   # snap; look is ignored this frame
+        start = arena._camera_azimuth
+        arena.update_follow_camera(dt=0.1)
+        # Stick right orbits the view right, i.e. the eye bearing decreases.
+        self.assertAlmostEqual(
+            arena._camera_azimuth, start - native_ui.GTA_AZIMUTH_RATE * 0.1,
+            places=6)
+
+    def test_right_stick_y_pitches_and_clamps_at_both_ends(self):
+        arena = gta_arena(look=(0.0, -1.0))  # stick up
+        arena.update_follow_camera(dt=0.0)
+        for _ in range(200):
+            arena.update_follow_camera(dt=0.05)
+        self.assertAlmostEqual(arena._camera_pitch, native_ui.GTA_PITCH_LIMITS[1])
+        arena.source.gamepad.look = (0.0, 1.0)  # stick down
+        for _ in range(200):
+            arena.update_follow_camera(dt=0.05)
+        self.assertAlmostEqual(arena._camera_pitch, native_ui.GTA_PITCH_LIMITS[0])
+
+    def test_look_dt_is_clamped_so_a_stall_cannot_whip_the_camera(self):
+        arena = gta_arena(look=(1.0, 0.0))
+        arena.update_follow_camera(dt=0.0)
+        start = arena._camera_azimuth
+        arena.update_follow_camera(dt=5.0)  # a five-second hitch
+        self.assertAlmostEqual(
+            arena._camera_azimuth,
+            start - native_ui.GTA_AZIMUTH_RATE * native_ui.GTA_MAX_LOOK_DT,
+            places=6)
+
+    def test_snap_recentres_behind_the_robot_on_demand(self):
+        arena = gta_arena(look=(1.0, 0.0))
+        arena.update_follow_camera(dt=0.0)
+        for _ in range(20):
+            arena.update_follow_camera(dt=0.05)
+        arena.env.simulator.base_euler[0, 2] = 1.0
+        self.assertNotAlmostEqual(arena._camera_azimuth, 1.0 + np.pi, places=3)
+
+        arena.apply("camera_snap")
+        arena.update_follow_camera(dt=0.05)
+        self.assertAlmostEqual(arena._camera_azimuth, 1.0 - np.pi, places=6)
+
+    def test_snap_is_a_noop_outside_gta(self):
+        arena = make_arena()
+        arena.next_camera_mode()  # rear
+        self.assertFalse(arena.snap_camera_behind())
+
+    def test_teleport_recentres_but_driving_does_not(self):
+        arena = gta_arena()
+        arena.update_follow_camera(dt=0.0)
+        arena._camera_azimuth = 0.25
+
+        # Driving is not a teleport: nothing recentres.
+        arena.env.simulator.base_pos[0, :2] += 0.2
+        arena.update_follow_camera(dt=1 / 60.0)
+        self.assertAlmostEqual(arena._camera_azimuth, 0.25)
+
+        with mock.patch.object(native_ui, "teleport_env_to_taxonomy_tile",
+                               return_value=True):
+            arena._goto(0, 0)
+        # A teleport is the one place recentring is wanted: the user asked to
+        # be put somewhere else and needs to see which way the robot faces.
+        self.assertAlmostEqual(arena._camera_azimuth, np.pi)
+
+
+class TestGtaMouseLook(unittest.TestCase):
+    """Viewer-thread callbacks may only stash deltas; the rig moves on poll."""
+
+    def test_drag_in_gta_is_swallowed_and_applied_on_the_sim_thread(self):
+        arena = gta_arena()
+        arena.update_follow_camera(dt=0.0)
+        start_azimuth = arena._camera_azimuth
+        window = arena.viewer._pyrender_viewer
+
+        self.assertIs(window.on_mouse_drag(0, 0, 30.0, 10.0, 1, 0), True)
+        self.assertEqual(window.trackball_drags, [])   # trackball not chained
+        # Nothing has moved yet: the callback only accumulated pixels.
+        self.assertEqual(arena._camera_azimuth, start_azimuth)
+
+        arena.update_follow_camera(dt=1 / 60.0)
+        self.assertAlmostEqual(
+            arena._camera_azimuth,
+            start_azimuth - 30.0 * native_ui.GTA_MOUSE_AZIMUTH_PER_PX,
+            places=6)
+        self.assertAlmostEqual(
+            arena._camera_pitch,
+            native_ui.GTA_PITCH + 10.0 * native_ui.GTA_MOUSE_PITCH_PER_PX,
+            places=6)
+
+    def test_drag_outside_gta_chains_to_the_genesis_trackball(self):
+        arena = make_arena()
+        arena.next_camera_mode()  # rear
+        window = arena.viewer._pyrender_viewer
+        self.assertEqual(window.on_mouse_drag(0, 0, 5.0, 5.0, 1, 0), "chained")
+        self.assertEqual(window.trackball_drags, [(5.0, 5.0)])
+        self.assertEqual(window.on_mouse_scroll(0, 0, 0.0, 1.0), "chained")
+        self.assertEqual(window.trackball_scrolls, [1.0])
+
+    def test_scroll_zooms_and_clamps(self):
+        arena = gta_arena()
+        arena.update_follow_camera(dt=0.0)
+        window = arena.viewer._pyrender_viewer
+
+        self.assertIs(window.on_mouse_scroll(0, 0, 0.0, 1.0), True)
+        arena.update_follow_camera(dt=1 / 60.0)
+        self.assertAlmostEqual(
+            arena._camera_distance,
+            native_ui.GTA_DISTANCE * (1.0 - native_ui.GTA_SCROLL_STEP),
+            places=6)
+
+        for _ in range(200):
+            window.on_mouse_scroll(0, 0, 0.0, 1.0)
+            arena.update_follow_camera(dt=1 / 60.0)
+        self.assertAlmostEqual(arena._camera_distance,
+                               native_ui.GTA_DISTANCE_LIMITS[0])
+        for _ in range(200):
+            window.on_mouse_scroll(0, 0, 0.0, -1.0)
+            arena.update_follow_camera(dt=1 / 60.0)
+        self.assertAlmostEqual(arena._camera_distance,
+                               native_ui.GTA_DISTANCE_LIMITS[1])
+
+    def test_unregister_restores_the_original_handlers(self):
+        arena = gta_arena()
+        window = arena.viewer._pyrender_viewer
+        self.assertIn("on_mouse_drag", vars(window))
+        arena.unregister()
+        self.assertNotIn("on_mouse_drag", vars(window))
+        self.assertNotIn("on_mouse_scroll", vars(window))
+        self.assertEqual(window.on_mouse_drag(0, 0, 1.0, 1.0, 1, 0), "chained")
+
+    def test_install_is_a_noop_without_a_pyrender_window(self):
+        arena = make_arena(with_pyrender=False)
+        arena._install_look_handlers()  # must not raise
+        self.assertIsNone(arena._look_window)
+
+
+class TestHudCameraDetail(unittest.TestCase):
+    def test_gta_status_reports_the_orbit_distance(self):
+        arena = gta_arena()
+        self.assertEqual(arena.camera_detail(), "d4.5")
+        status = format_hud_lines(["a"], [0], 0, 0, camera_mode="gta",
+                                  camera_detail=arena.camera_detail())[0]
+        self.assertIn("cam gta d4.5", status)
+        self.assertTrue(all(32 <= ord(c) < 127 for c in status))
+
+    def test_other_modes_have_no_detail(self):
+        arena = make_arena()
+        arena.next_camera_mode()  # rear
+        self.assertEqual(arena.camera_detail(), "")
+        status = format_hud_lines(["a"], [0], 0, 0, camera_mode="rear")[0]
+        self.assertIn("cam rear", status)
+
+
+class TestMoreHudLines(unittest.TestCase):
     def test_command_is_signed_and_device_shown(self):
         _, telem, _, _ = format_hud_lines(
             ["a"], [0], 0, 0, command=(-1.0, 0.25, -0.5), device="pad F310")

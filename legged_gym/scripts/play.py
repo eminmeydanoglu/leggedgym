@@ -79,6 +79,59 @@ def _disable_play_domain_rand(env_cfg):
         env_cfg.noise.add_noise = False
 
 
+def _drop_torch_default_device_mode():
+    """Undo the global ``torch.set_default_device`` that ``gs.init`` installs.
+
+    ``genesis/__init__.py`` calls ``torch.set_default_device(device)`` "just in
+    case" when the backend comes up.  That does not merely record a preference:
+    it pushes a global ``TorchFunctionMode``, so from then on EVERY torch call
+    in the process detours into Python (``torch/utils/_device.py``
+    ``__torch_function__``), tests whether it is a tensor constructor, and
+    re-dispatches.  Measured on this box that is ~1.9 us per op -- invisible in
+    training, where one op covers 4096 envs, but decisive in interactive play,
+    where a single robot runs hundreds of tiny ops per control step at 50 Hz.
+    py-spy attributes 58%% of play's main-thread samples to that one frame, and
+    dropping the mode alone moves a go2_moects play session from 0.65x to 1.0x
+    real time on an RTX 3050 laptop.
+
+    Safe here because nothing in this stack relies on the implicit default:
+    legged_gym and Genesis both pass ``device=`` explicitly at every tensor
+    construction (``gs.device`` / ``self.device``).  The default *dtype* that
+    ``gs.init`` also sets is deliberately left alone -- it costs nothing and
+    Genesis's float width really is a global contract.
+    """
+    torch.set_default_device(None)
+
+
+def _disable_play_rewards(env):
+    """Stop computing rewards during play; keep the command-resample tail.
+
+    Play never reads ``rew_buf``: ``auto_reset`` is off (see override_configs),
+    so ``reset_idx`` -- the only place that fills ``infos["episode"]`` from
+    ``episode_sums`` -- does not run on its own, and the Logger below therefore
+    has nothing to print.  Meanwhile the reward loop evaluates every term and
+    accumulates ``episode_sums`` on every one of the 50 control steps a second,
+    which profiles at ~18%% of the frame.
+
+    The one side effect that must survive is the tail of
+    ``WtyCurriculumMixin.compute_reward``: it calls
+    ``_resample_commands_if_due()`` after scoring, deliberately, so a resample
+    cannot change the command a reward was scored against.  Play pins
+    ``resampling_time`` to 1e9 so it never fires, but the call is kept anyway
+    rather than silently dropping a contract that lives in another module.
+
+    Instance attribute, not a class patch: it shadows the bound method for this
+    env only and cannot leak into a training process that imports this module.
+    """
+    resample = getattr(env, "_resample_commands_if_due", None)
+
+    def compute_reward():
+        if resample is not None:
+            resample()
+
+    env.compute_reward = compute_reward
+
+
 def _pin_terrain_difficulty(env_cfg, terrain_level, default_level, max_level):
     """Pin the curriculum difficulty to a user-chosen level, fully decoupled from
     the checkpoint.  ``curriculum()`` picks difficulty from the terrain row, and
@@ -442,11 +495,23 @@ def override_configs(env_cfg, args, task_type):
     # horizon the next time play writes a camera pose.
     env_cfg.viewer.camera_fov = 55.0
     env_cfg.viewer.lock_camera_world_up = True
-    # One policy step contains ``control.decimation`` physics substeps.  The
-    # native viewer only needs the final state of that control frame; sending
-    # all intermediate states costs render time without making playback more
-    # informative.  GenesisSimulator applies this flag only to play sessions.
-    env_cfg.viewer.update_visualizer_once_per_control_step = True
+    # Visual smoothness, in two halves (see GenesisSimulator for the full rate
+    # table).  The window is redrawn at ``render_refresh_rate`` Hz by the
+    # viewer thread, while the POSE it draws only changes when the simulator
+    # publishes one.  Publishing once per control step (the old setting here)
+    # meant 50 new poses a second under a 60 Hz window: every sixth frame was a
+    # duplicate, which looks like judder however fast the window redraws.
+    # Publishing every 2nd substep gives 100 Hz of fresh poses -- above the
+    # window rate, so every drawn frame is new -- for one extra graphics
+    # submission per control step.  This costs sim-thread time and is only
+    # affordable because play no longer burns ~30%% of its frame on the torch
+    # default-device mode and the unused reward loop.
+    env_cfg.viewer.render_refresh_rate = 60
+    env_cfg.viewer.visualizer_update_stride = 2
+    # Camera smoothing runs every control frame.  Sampling it less frequently
+    # made the view visibly step at 25 Hz without moving the measured RTF, so
+    # do not trade visual quality for a non-existent throughput gain.
+    env_cfg.viewer.follow_camera_stride = 1
     # Play drives commands/terrain from the viewer (or fixed ranges), not from the
     # training UED teacher.  Same contract as ued_rollout: leave ued_enabled False
     # so reset_idx does not require an installed episode curriculum.
@@ -912,6 +977,9 @@ def play(args):
             backend=gs.cpu if args.cpu else gs.gpu,
             logging_level='warning',
         )
+        # Must come after gs.init: that is what installs the mode (see the
+        # helper's docstring -- this is the single biggest play-time win).
+        _drop_torch_default_device_mode()
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     splitted = args.task.split("_")
     # by default, the first part of the task name is robot name, and the second part is task type, e.g. go2_ts, go2_cat, go2_ee, go2_cts, go2_dreamwaq, go2_ts_depth
@@ -922,6 +990,8 @@ def play(args):
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+    if not getattr(args, "play_rewards", False):
+        _disable_play_rewards(env)
     # load policy
     train_cfg.runner.resume = True
     # P5's selected July checkpoint has a 50-D critic whereas current code

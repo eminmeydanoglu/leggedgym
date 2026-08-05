@@ -74,18 +74,35 @@ class GenesisSimulator(Simulator):
                 self._torques = self._torques * self._motor_strengths
             self._robot.control_dofs_force(
                 self._torques, self._dof_indices)
-            # Play needs all physics substeps, but drawing the same control
-            # frame after each one is pure viewer overhead.  When explicitly
-            # requested by play.py, submit graphics only after the final
-            # substep; physics dt, decimation and control timing are unchanged.
-            update_visualizer = (
-                not getattr(
-                    self._cfg.viewer,
-                    "update_visualizer_once_per_control_step",
-                    False,
+            # How often the simulator hands a fresh pose to the visualizer.
+            # This is what the window has to draw: at 50 Hz control the viewer
+            # thread redrawing at 60 Hz would show the SAME pose twice on some
+            # frames and once on others, which reads as judder no matter how
+            # high the refresh rate goes.  ``visualizer_update_stride`` counts
+            # BACK from the last substep, so the final substep of a control
+            # step always publishes (the state the policy actually acted on)
+            # and stride k gives decimation/k updates per control step --
+            # k=2 at decimation=4 is 100 Hz, comfortably above a 60 Hz window
+            # and still under the 200 Hz ``max_FPS`` cap that Genesis enforces
+            # by sleeping inside viewer.update() on THIS thread.
+            # Physics dt, decimation and control timing are untouched either
+            # way; only the number of graphics submissions changes.
+            stride = int(getattr(self._cfg.viewer, "visualizer_update_stride", 0) or 0)
+            if stride > 0:
+                update_visualizer = (
+                    (self._cfg.control.decimation - 1 - i) % stride == 0
                 )
-                or i == self._cfg.control.decimation - 1
-            )
+            else:
+                # Legacy switch: publish once per control step, or every
+                # substep when neither option is set (training default).
+                update_visualizer = (
+                    not getattr(
+                        self._cfg.viewer,
+                        "update_visualizer_once_per_control_step",
+                        False,
+                    )
+                    or i == self._cfg.control.decimation - 1
+                )
             self._scene.step(update_visualizer=update_visualizer)
             # dof_pos and dof_vel use joint sequence of policy
             self._dof_pos[:] = self._robot.get_dofs_position(
@@ -418,6 +435,17 @@ class GenesisSimulator(Simulator):
                 # 50 Hz control contract while giving the viewer thread a fair
                 # scheduling point on every 200 Hz physics step.
                 max_FPS=int(round(1.0 / self._sim_params["dt"])),
+                # How often the pyrender viewer THREAD redraws the window --
+                # a different quantity from every rate above it, and the only
+                # one that decides how smooth the picture looks.  Genesis's own
+                # default is 60 Hz; it is surfaced here so play can raise it
+                # without reaching into viewer internals after the fact (the
+                # draw loop is a pyglet clock interval scheduled once at viewer
+                # start, so a post-build flag write would not take effect).
+                # Note this is only half of "smooth": a 60 Hz draw of a pose
+                # that only changes 50 times a second still judders, which is
+                # what viewer.visualizer_update_stride below is for.
+                refresh_rate=int(getattr(self._cfg.viewer, "render_refresh_rate", 60)),
                 # Keep the native window at the established interactive size;
                 # terrain raster reduction is configured separately for the
                 # play-only MoE showcase.

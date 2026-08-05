@@ -239,16 +239,28 @@ class KeyboardSource:
 
 #: Gamepad button -> arena event.  Consumed by ``NativeArenaUI`` / play.py, so
 #: the pad can switch tabs and respawn without touching the keyboard.
+#:
+#: LB/RB are deliberately NOT in this table: they are the yaw axis now (see
+#: ``YAW_BUTTONS`` and ``GamepadSource.poll``), which frees the right stick for
+#: camera look.  Tabs and levels therefore moved onto the d-pad, which pyglet's
+#: ``Controller`` exposes as the boolean ``dpup``/``dpdown``/``dpleft``/
+#: ``dpright`` attributes -- same shape as any other button, so ``_scan_buttons``
+#: needs no special case.  X/B are left unbound on purpose: the d-pad owns
+#: levels now and a second, redundant binding only makes the legend lie.
 DEFAULT_BUTTON_EVENTS: Dict[str, str] = {
-    "leftshoulder": "tab_prev",
-    "rightshoulder": "tab_next",
-    "x": "level_prev",
-    "b": "level_next",
+    "dpleft": "tab_prev",
+    "dpright": "tab_next",
+    "dpdown": "level_prev",
+    "dpup": "level_next",
     "a": "respawn",
-    "y": "follow_toggle",
+    "y": "camera_next",
+    "rightstick": "camera_snap",
     "start": "stop",
     "back": "legend",
 }
+
+#: (yaw-left button, yaw-right button).  Read as an axis, never as an event.
+YAW_BUTTONS: Tuple[str, str] = ("leftshoulder", "rightshoulder")
 
 
 class GamepadSource:
@@ -258,9 +270,23 @@ class GamepadSource:
     subsystem, which can fight the viewer's own pyglet window, and pyglet is
     already a hard dependency of the Genesis viewer.
 
-    Sign convention is deliberately identical to the mapping play.py used with
-    the old pygame ``Joystick`` (``vx = -ly``, ``vy = -lx``, ``yaw = -rx``) so
-    swapping the backend cannot silently flip the controls.
+    Layout ("GTA-style", since the right stick became a camera):
+
+    * left stick   -> vx / vy, unchanged: ``vx = -lefty``, ``vy = -leftx``,
+      exactly the signs play.py used with the old pygame ``Joystick``, so
+      swapping the backend cannot silently flip the drive controls.
+      The command stays in the ROBOT BODY frame; it is deliberately *not*
+      rotated into the camera frame, so what the left stick means does not
+      depend on where the camera happens to be pointing.
+    * LB / RB      -> yaw left / right.  These are digital, so a raw press
+      would be a step input into a velocity-tracking policy; they are run
+      through the same first-order ramp the keyboard uses (``ramp_towards``
+      with ``tau_accel`` / ``tau_decel``) and shaped in *axis* space so the
+      envelope clamp stays the single source of truth for the top yaw rate.
+    * right stick  -> camera look (``look``), NOT part of the command.  It is
+      exposed as a separate value on purpose: ``poll`` must keep returning the
+      3-tuple ``Command`` that the Viser path and every caller expect, so the
+      camera cannot be smuggled through the velocity contract.
     """
 
     def __init__(
@@ -271,16 +297,26 @@ class GamepadSource:
         controller=None,
         button_events: Optional[Dict[str, str]] = None,
         auto_open: bool = True,
+        tau_accel: float = DEFAULT_TAU_ACCEL,
+        tau_decel: float = DEFAULT_TAU_DECEL,
     ) -> None:
         self.envelope = envelope or DEFAULT_ENVELOPE
         self.deadzone = float(deadzone)
         self.expo = float(expo)
+        self.tau_accel = float(tau_accel)
+        self.tau_decel = float(tau_decel)
         self.button_events = dict(
             DEFAULT_BUTTON_EVENTS if button_events is None else button_events
         )
         self.controller = controller
         self.name: str = ""
         self.stick_active = False
+        #: Ramped yaw in unit-axis space ([-1, 1]); scaled by the envelope in
+        #: ``poll``.  Ramping the axis rather than the m/s value keeps the
+        #: envelope the only place the top rate is defined.
+        self._yaw_axis = 0.0
+        #: Last shaped right-stick position, (x, y), read by the camera rig.
+        self._look: Tuple[float, float] = (0.0, 0.0)
         self._prev_buttons: Dict[str, bool] = {}
         self._events: List[str] = []
         self._owns_pump = False
@@ -425,34 +461,88 @@ class GamepadSource:
     def _shape(self, raw: float) -> float:
         return apply_expo(apply_deadzone(raw, self.deadzone), self.expo)
 
+    @property
+    def look(self) -> Tuple[float, float]:
+        """Shaped right-stick position ``(x, y)`` for the camera rig.
+
+        Deliberately outside the ``Command`` tuple: the velocity contract is
+        3 numbers and several consumers (Viser, the unit tests, play.py's
+        ``env.commands[:, 0:3]`` write) depend on that.  Sign convention is the
+        raw pad convention -- ``x > 0`` is stick right, ``y < 0`` is stick up
+        (an SDL-style pad reports -1 at the top, the same reason ``vx = -lefty``)
+        -- and the camera layer, not this module, decides what "up" should do.
+        Zero whenever no pad is connected, so a caller never has to check.
+        """
+        return self._look
+
     def poll(self, dt: float = 0.0) -> Command:
-        """Return the stick command and latch button edges as events."""
-        del dt  # analog sticks need no ramp
+        """Return the stick/shoulder command and latch button edges as events.
+
+        ``dt`` is no longer unused: the yaw axis now comes from the digital
+        LB/RB buttons and needs the same first-order ramp the keyboard uses,
+        or every turn would be a step command into the policy.
+        """
         controller = self.controller
         if controller is None:
-            self.stick_active = False
-            return (0.0, 0.0, 0.0)
+            self._idle(dt)
+            return self.envelope.scale(0.0, 0.0, self._yaw_axis)
         self.pump()
         controller = self.controller
         if controller is None:
-            self.stick_active = False
-            return (0.0, 0.0, 0.0)
+            self._idle(dt)
+            return self.envelope.scale(0.0, 0.0, self._yaw_axis)
 
         try:
             lx = float(getattr(controller, "leftx", 0.0) or 0.0)
             ly = float(getattr(controller, "lefty", 0.0) or 0.0)
             rx = float(getattr(controller, "rightx", 0.0) or 0.0)
+            ry = float(getattr(controller, "righty", 0.0) or 0.0)
+            yaw_left = bool(getattr(controller, YAW_BUTTONS[0], False))
+            yaw_right = bool(getattr(controller, YAW_BUTTONS[1], False))
         except Exception:  # pragma: no cover - disconnect mid-read
-            self.stick_active = False
-            return (0.0, 0.0, 0.0)
+            self._idle(dt)
+            return self.envelope.scale(0.0, 0.0, self._yaw_axis)
 
         # Same signs as the old pygame mapping in play.py.
         ax = self._shape(-ly)
         ay = self._shape(-lx)
-        ayaw = self._shape(-rx)
-        self.stick_active = (abs(ax) > 0.0) or (abs(ay) > 0.0) or (abs(ayaw) > 0.0)
+        # LB/RB are a +-1 axis target, then ramped.  Both held cancel out, like
+        # the opposing keyboard keys do.
+        yaw_target = (1.0 if yaw_left else 0.0) - (1.0 if yaw_right else 0.0)
+        self._yaw_axis = ramp_towards(
+            self._yaw_axis, yaw_target, dt, self.tau_accel, self.tau_decel
+        )
+        self._look = (self._shape(rx), self._shape(ry))
+        # Ownership rule (MergedSource.poll): the pad only wins the frame while
+        # this is True.  It must therefore include the shoulder yaw -- holding
+        # only LB would otherwise hand the command straight back to the
+        # keyboard, which is zero, and the robot would not turn.  It also stays
+        # True while the released ramp coasts down (same rule as
+        # KeyboardSource.active), so letting go of LB decays instead of
+        # snapping to whatever the keyboard happens to hold.  The look stick is
+        # NOT included: moving the camera must not seize the drive command.
+        self.stick_active = (
+            abs(ax) > 0.0
+            or abs(ay) > 0.0
+            or yaw_target != 0.0
+            or abs(self._yaw_axis) > 1e-4
+        )
         self._scan_buttons(controller)
-        return self.envelope.scale(ax, ay, ayaw)
+        return self.envelope.scale(ax, ay, self._yaw_axis)
+
+    def _idle(self, dt: float) -> None:
+        """No controller this frame: coast the yaw ramp down, zero the look.
+
+        The ramp is still advanced so a pad that disconnects mid-turn decays
+        the same way a released button does instead of freezing at its last
+        value; ``stick_active`` follows it down and then hands the command back
+        to the keyboard.
+        """
+        self._yaw_axis = ramp_towards(
+            self._yaw_axis, 0.0, dt, self.tau_accel, self.tau_decel
+        )
+        self._look = (0.0, 0.0)
+        self.stick_active = abs(self._yaw_axis) > 1e-4
 
     def _scan_buttons(self, controller) -> None:
         for button, event in self.button_events.items():
@@ -476,10 +566,13 @@ class GamepadSource:
 class MergedSource:
     """Gamepad and keyboard coexisting.
 
-    Priority is per-frame and value-based, not modal: while any stick is outside
-    its deadzone the gamepad owns the command, otherwise the keyboard does.  So
-    letting go of the sticks hands control straight back to the keys with no
-    mode switch to remember.
+    Priority is per-frame and value-based, not modal: while the pad is
+    *driving* -- left stick outside its deadzone, or LB/RB held (or their ramp
+    still coasting down) -- the gamepad owns the command, otherwise the
+    keyboard does.  So letting go hands control straight back to the keys with
+    no mode switch to remember.  The right stick is explicitly excluded from
+    that test: it only moves the camera, and looking around must never take the
+    drive command away from the keyboard.
 
     The pad is enabled by default (``gamepad_enabled``) and hot-pluggable:
     while it is enabled but absent, ``poll`` retries enumeration throttled to
@@ -521,6 +614,22 @@ class MergedSource:
     @property
     def last_command(self) -> Command:
         return self._last
+
+    @property
+    def look(self) -> Tuple[float, float]:
+        """Right-stick camera look, or ``(0.0, 0.0)`` when no pad owns it.
+
+        A pure pass-through so the camera layer has exactly one thing to read
+        and never has to know whether a pad exists, is enabled, or was
+        hot-plugged.  Disabled-by-J is reported as centred: the J toggle means
+        "the pad drives nothing", camera included.
+        """
+        if not self._gamepad_enabled:
+            return (0.0, 0.0)
+        gamepad = self.gamepad
+        if gamepad is None or not getattr(gamepad, "available", False):
+            return (0.0, 0.0)
+        return tuple(getattr(gamepad, "look", (0.0, 0.0)))  # type: ignore[return-value]
 
     @property
     def gamepad_enabled(self) -> bool:

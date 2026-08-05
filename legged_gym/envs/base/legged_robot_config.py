@@ -306,6 +306,8 @@ class LeggedRobotCfg(BaseConfig):
         pos: List[float] = [2.0, 2.0, 1.0]       # [m], relative to the robot position
         lookat: List[float] = [0.0, 0.0, 0.0]  # [m], relative to the robot position
         rendered_envs_idx: List[int] = [i for i in range(5)]  # [Genesis] number of environments to be rendered, if not headless
+        render_refresh_rate: int = 60   # [Genesis] window redraw rate in Hz (viewer thread only)
+        visualizer_update_stride: int = 0  # [Genesis] publish a pose every k-th substep counting back from the last; 0 = legacy behaviour
     
     # sensor configuration:
     class sensor:

@@ -13,8 +13,11 @@ Genesis runs the pyglet viewer in a background thread on Linux.  Keybind
 callbacks therefore fire on the *viewer* thread while the sim steps on the main
 thread.  Callbacks here only ever mutate thread-safe state:
 
-* drive keys go straight into ``KeyboardSource`` (lock-protected), and
-* arena actions (tab / level / respawn / ...) are *queued* as events.
+* drive keys go straight into ``KeyboardSource`` (lock-protected),
+* arena actions (tab / level / respawn / ...) are *queued* as events, and
+* mouse-look drag/scroll only *accumulates* deltas under ``_look_lock``; the
+  orbit camera is integrated and written from ``update_follow_camera`` on the
+  sim thread (see ``_install_look_handlers``).
 
 ``interaction_loop`` drains the queue with :meth:`NativeArenaUI.drain_and_apply`
 on the sim thread, which is where ``env.reset_idx`` / ``teleport_...`` are legal
@@ -29,6 +32,7 @@ touches env state and never lets an exception escape into the draw loop.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -74,9 +78,10 @@ ACTION_KEYMAP: Dict[str, Tuple[str, str]] = {
     "arena_follow": ("T", "camera_next"),
     "arena_legend": ("M", "legend"),
     "arena_model_next": ("N", "model_next"),
-    # J is free: the Genesis-owned set above stops at F11/I and no default
-    # plugin binds it.
+    # J and G are free: the Genesis-owned set above stops at F11/I and no
+    # default plugin binds either of them.
     "arena_gamepad_toggle": ("J", "gamepad_toggle"),
+    "arena_camera_snap": ("G", "camera_snap"),
 }
 
 ARENA_EVENTS = (
@@ -87,11 +92,49 @@ ARENA_EVENTS = (
     "stop",
     "respawn",
     "camera_next",
+    "camera_snap",
     "legend",
     "model_next",
     "model_prev",
     "gamepad_toggle",
 )
+
+
+# ---------------------------------------------------------------------------
+# GTA-style orbit camera
+# ---------------------------------------------------------------------------
+#
+# ``gta`` is a spherical rig -- (azimuth, pitch, distance) -- around the SAME
+# smoothed body anchor the rear/front modes use, so it inherits the anti-bob
+# filtering (fixed world Z, rate-limited XY) for free.
+#
+# The one thing that is deliberately NOT inherited is heading: the azimuth is an
+# ABSOLUTE WORLD ANGLE and never tracks the robot's yaw.  Auto-recentring behind
+# the robot is exactly what makes it impossible to look at the robot's front,
+# which is the whole reason this mode exists.  Recentring happens only on
+# explicit request (R3 / G / a teleport).
+#
+# Convention: ``azimuth`` is the world-frame bearing FROM the robot TO the eye,
+# so "behind the robot" is ``base_yaw + pi``; ``pitch`` is the eye's elevation
+# above the anchor (positive = camera above, looking down).
+CAMERA_MODES = ("gta", "rear", "front", "free")
+#: Modes that write a robot-relative camera pose every control frame.
+FOLLOW_CAMERA_MODES = frozenset({"gta", "rear", "front"})
+
+GTA_DISTANCE = 4.5                     # m, default orbit radius
+GTA_DISTANCE_LIMITS = (1.5, 12.0)      # m, scroll-wheel clamp
+GTA_PITCH = math.radians(16.0)         # default elevation: slightly above
+GTA_PITCH_LIMITS = (math.radians(-25.0), math.radians(70.0))
+GTA_AZIMUTH_RATE = 2.5                 # rad/s at full right-stick deflection
+GTA_PITCH_RATE = 1.5                   # rad/s at full right-stick deflection
+GTA_MOUSE_AZIMUTH_PER_PX = 0.006       # rad per pixel of drag
+GTA_MOUSE_PITCH_PER_PX = 0.005         # rad per pixel of drag
+GTA_SCROLL_STEP = 0.12                 # fraction of distance per wheel notch
+GTA_LOOKAT_HEIGHT = 0.35               # m above the anchor the camera aims at
+#: Upper bound on the dt used to integrate look rates.  ``update_follow_camera``
+#: measures its own dt from the wall clock, and a stall (checkpoint hot-swap, a
+#: long teleport) would otherwise turn one frame into a huge camera whip.
+GTA_MAX_LOOK_DT = 0.1
 
 
 def default_tabs_for_cfg(terrain_cfg) -> List[str]:
@@ -231,11 +274,13 @@ def format_hud_lines(
     device: str = "keyboard",
     following: bool = False,
     camera_mode: Optional[str] = None,
+    camera_detail: str = "",
 ) -> List[str]:
     """The four single-line HUD strings: status, commanded, achieved, hint.
 
-    Line 3 is deliberately just ``M: keys``.  The full key list already lives
-    in the terminal legend (M) and in Genesis's I overlay, and the long hint
+    Line 3 is deliberately just the two keys worth advertising (T cycles the
+    camera, M prints the legend).  The full key list already lives in the
+    terminal legend (M) and in Genesis's I overlay, and the long hint
     that used to sit at BOTTOM_CENTER overlapped the BOTTOM_LEFT telemetry
     into unreadable mush.  TOP_RIGHT only stays collision-free BECAUSE the
     hint is a handful of characters: a centered status line (~45 chars) and a
@@ -250,9 +295,16 @@ def format_hud_lines(
 
     if camera_mode is None:
         camera_mode = "front" if following else "free"
+    # ``camera_detail`` is the gta rig's live orbit state (``d4.5``).  Kept to a
+    # handful of characters on purpose: the status line is TOP_CENTER and the
+    # TOP_RIGHT hint only stays clear of it because the status stays short (see
+    # the docstring above and _install_hud).
+    cam = f"cam {camera_mode}"
+    if camera_detail:
+        cam += f" {camera_detail}"
     status = (f"tab {ti + 1}/{n_tabs} {name}   "
               f"level L{level} (row {li + 1}/{n_lvls})   "
-              f"cam {camera_mode}")
+              f"{cam}")
 
     vx, vy, yaw = (list(command) + [0.0, 0.0, 0.0])[:3] if command is not None \
         else (0.0, 0.0, 0.0)
@@ -267,7 +319,7 @@ def format_hud_lines(
     if realtime is not None:
         achieved_line += f"   {float(realtime):.2f}x RT"
 
-    hint = "M: keys"
+    hint = "T: cam  M: keys"
 
     return [_ascii_only(status), _ascii_only(commanded),
             _ascii_only(achieved_line), _ascii_only(hint)]
@@ -292,16 +344,23 @@ def format_arena_legend(
         for i, lvl in enumerate(levels)
     )
     lines.append(f"  levels (difficulty, [ / ]): {level_str}")
-    lines.append("  drive:")
+    lines.append("  drive (robot body frame -- NOT camera-relative):")
     lines.append("    Up / Down     forward / backward")
     lines.append("    Left / Right  turn left / right")
     lines.append("    Q / E         strafe left / right")
     lines.append("    Space         hard stop")
+    lines.append("  camera:")
+    lines.append("    T                 mode: gta -> rear -> front -> free")
+    lines.append("    mouse drag        gta: orbit (azimuth / pitch); other modes: "
+                 "Genesis trackball")
+    lines.append("    mouse wheel       gta: zoom (distance); other modes: trackball")
+    lines.append("    G                 snap the camera behind the robot")
+    lines.append("    (gta azimuth is a free world angle: it never auto-recenters, so")
+    lines.append("     you can orbit around and look at the robot's front.)")
     lines.append("  arena:")
     lines.append("    Tab / Shift+Tab   next / previous terrain tab")
     lines.append("    [ / ]             easier / harder level in this tab")
     lines.append("    Backspace         respawn on the current tile")
-    lines.append("    T                 camera: rear -> front -> free")
     lines.append("    N                 hot-swap to the next checkpoint of this run")
     lines.append("    J                 toggle gamepad on/off (auto-rescans when on)")
     lines.append("    M                 reprint this legend")
@@ -310,8 +369,9 @@ def format_arena_legend(
     lines.append("  gamepad: auto-detected at startup, no launch flag needed; a")
     lines.append("    hot-plugged pad is picked up within ~2 s; J toggles it on/off")
     lines.append(f"    connected: {gamepad if gamepad else 'none'}")
-    lines.append("    left stick  vx / vy    right stick X  yaw")
-    lines.append("    LB / RB  tab      X / B  level      A  respawn")
+    lines.append("    left stick   vx / vy (body frame)   LB / RB  yaw left / right")
+    lines.append("    right stick  camera look            R3       snap camera behind")
+    lines.append("    D-pad L/R  tab    D-pad U/D  level    A  respawn")
     lines.append("    Y  next camera mode  START  hard stop  BACK  legend")
     return "\n".join(lines)
 
@@ -523,19 +583,48 @@ class NativeArenaUI:
 
         self.tab_index = 0
         self.level_index = 0
-        # T cycles these modes.  ``free`` deliberately writes no camera pose:
-        # Genesis's native trackball then owns the view completely.
-        self.camera_mode = "free"
-        self._camera_override_active = False
+        # T cycles CAMERA_MODES.  ``free`` deliberately writes no camera pose:
+        # Genesis's native trackball then owns the view completely.  ``gta`` is
+        # the startup default because it is the only mode that can be aimed.
+        self.camera_mode = CAMERA_MODES[0]
+        # gta writes a pose from the very first frame, so the arena owns the
+        # camera immediately; play.py's --follow_robot must not also write one
+        # (two writers per frame = a camera that visibly fights itself).  This
+        # used to flip only on a T press, back when the default was ``free``.
+        self._camera_override_active = True
         # Smoothed world anchor: fast enough in XY to follow locomotion, but
         # intentionally slow in Z so the camera does not inherit body bounce
         # from individual foot impacts.  Yaw gets its own wrapped filter.
         self._camera_anchor: Optional[np.ndarray] = None
         self._camera_yaw: Optional[float] = None
+        self._camera_height: Optional[float] = None
+        viewer_cfg = getattr(getattr(env, "cfg", None), "viewer", None)
+        self._follow_camera_stride = max(
+            int(getattr(viewer_cfg, "follow_camera_stride", 1)), 1
+        )
+        self._follow_camera_frame = 0
+        # gta orbit rig.  ``None`` azimuth means "snap behind the robot on the
+        # next update" -- the state used at startup, after a teleport, and after
+        # an explicit snap request.  Once set it is a free world angle that
+        # nothing but the user changes.
+        self._camera_azimuth: Optional[float] = None
+        self._camera_pitch = float(GTA_PITCH)
+        self._camera_distance = float(GTA_DISTANCE)
+        self._camera_snap_pending = False
+        # Mouse-look ingress.  The pyglet handlers below run on the VIEWER
+        # thread and may only stash numbers here; the rig is integrated on the
+        # sim thread in update_follow_camera, exactly like the drive keys are
+        # only latched by the keybind callbacks and ramped in poll().  Anything
+        # else would call env.set_viewer_camera off-thread.
+        self._look_lock = threading.Lock()
+        self._mouse_look = [0.0, 0.0]   # accumulated drag pixels (dx, dy)
+        self._mouse_scroll = 0.0        # accumulated wheel notches
+        self._look_clock: Optional[float] = None
         self._shift_held = False
         self._lock = threading.Lock()
         self._registered: List[str] = []
         self._focus_guard_window = None
+        self._look_window = None
         # HUD state (see _install_hud / update_hud)
         self._hud_window = None
         self._hud_plugin: Optional[_HudPlugin] = None
@@ -625,6 +714,7 @@ class NativeArenaUI:
             return
         self._registered = [kb.name for kb in keybinds]
         self._install_focus_guard()
+        self._install_look_handlers()
         self._install_hud()
 
     # -- HUD -----------------------------------------------------------------
@@ -732,6 +822,7 @@ class NativeArenaUI:
                 device=self._device_label(),
                 following=self.following,
                 camera_mode=self.camera_mode,
+                camera_detail=self.camera_detail(),
             )
         except Exception as exc:
             print(f"[arena] HUD text build failed: {exc}")
@@ -797,6 +888,67 @@ class NativeArenaUI:
             return
         self._focus_guard_window = window
 
+    def _install_look_handlers(self) -> None:
+        """Mouse-look for keyboard users: drag = orbit, wheel = zoom, in gta only.
+
+        Same shadowing trick as ``_install_focus_guard``: pyglet resolves event
+        handlers as instance attributes before class methods, so assigning here
+        wins over ``pyrender.Viewer.on_mouse_drag`` without patching Genesis.
+
+        Two contracts hold this together:
+
+        * THREADING -- these fire on the viewer thread.  They only accumulate
+          plain floats under ``_look_lock``; the rig is integrated and
+          ``env.set_viewer_camera`` is called on the SIM thread, from
+          ``update_follow_camera``.  Touching the camera (or anything env-side)
+          from here would be the same class of bug the drive keys avoid by
+          latching instead of writing ``env.commands``.
+        * OWNERSHIP -- in every mode except ``gta`` the event is passed straight
+          through to the original handler, so Genesis's trackball behaves
+          exactly as it always did.  In ``gta`` it is *swallowed* (return True =
+          pyglet's EVENT_HANDLED) rather than chained: letting the trackball
+          also process the drag would silently accumulate a pose that jumps out
+          at the user the moment they cycle to ``free``.
+        """
+        window = getattr(self.viewer, "_pyrender_viewer", None)
+        if window is None:
+            return
+        if "on_mouse_drag" in vars(window) or "on_mouse_scroll" in vars(window):
+            return  # already wrapped
+        original_drag = getattr(window, "on_mouse_drag", None)
+        original_scroll = getattr(window, "on_mouse_scroll", None)
+        if original_drag is None or original_scroll is None:
+            return
+
+        def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
+            if self.camera_mode != "gta":
+                return original_drag(x, y, dx, dy, buttons, modifiers)
+            try:
+                with self._look_lock:
+                    self._mouse_look[0] += float(dx)
+                    self._mouse_look[1] += float(dy)
+            except Exception:  # pragma: no cover - must never break the viewer
+                pass
+            return True
+
+        def on_mouse_scroll(x, y, dx, dy):
+            if self.camera_mode != "gta":
+                return original_scroll(x, y, dx, dy)
+            try:
+                with self._look_lock:
+                    self._mouse_scroll += float(dy)
+            except Exception:  # pragma: no cover
+                pass
+            return True
+
+        try:
+            window.on_mouse_drag = on_mouse_drag
+            window.on_mouse_scroll = on_mouse_scroll
+        except Exception as exc:  # pragma: no cover - depends on Genesis build
+            print(f"[arena] mouse-look unavailable ({exc}); pad/keys still work")
+            return
+        self._look_window = window
+
     def unregister(self) -> None:
         """Best-effort removal of every keybind this object registered."""
         self._remove_hud()
@@ -807,6 +959,16 @@ class NativeArenaUI:
             except Exception:
                 pass
             self._focus_guard_window = None
+        window = getattr(self, "_look_window", None)
+        if window is not None:
+            # Deleting the instance attributes un-shadows pyrender's own class
+            # methods, so the trackball is exactly as it was before install.
+            for name in ("on_mouse_drag", "on_mouse_scroll"):
+                try:
+                    delattr(window, name)
+                except Exception:
+                    pass
+            self._look_window = None
         viewer = self.viewer
         if viewer is None:
             return
@@ -855,6 +1017,8 @@ class NativeArenaUI:
             self._goto(self.tab_index, self.level_index, announce="respawn")
         elif event == "camera_next":
             self.next_camera_mode()
+        elif event == "camera_snap":
+            self.snap_camera_behind()
         elif event == "legend":
             self.print_legend()
         elif event in ("model_next", "model_prev"):
@@ -918,6 +1082,19 @@ class NativeArenaUI:
         self.source.clear()
         self._zero_command()
         if ok:
+            # A teleport changes the intended camera reference discontinuously.
+            # Reacquire the stable rig on the new tile instead of easing across
+            # the whole map from the prior one.
+            self._camera_anchor = None
+            self._camera_yaw = None
+            self._camera_height = None
+            # Landing on a new tile is the one moment where recentring the free
+            # gta azimuth is what the user wants: they asked to be put somewhere
+            # else and the first thing they need is to see where the robot is
+            # facing.  Ordinary driving never touches it.
+            self._camera_azimuth = None
+            if self.following:
+                self.update_follow_camera(force=True)
             self.frame_current_tile()
         # Reflect the switch on screen immediately instead of up to one HUD
         # refresh period later.
@@ -968,19 +1145,42 @@ class NativeArenaUI:
     @property
     def following(self) -> bool:
         """Whether this arena currently writes a robot-relative camera pose."""
-        return self.camera_mode in {"rear", "front"}
+        return self.camera_mode in FOLLOW_CAMERA_MODES
 
     @property
     def camera_override_active(self) -> bool:
-        """Whether a T press has taken camera ownership from --follow_robot."""
+        """Whether the arena, rather than --follow_robot, owns the camera.
+
+        True from construction now that ``gta`` is the startup mode: it writes
+        a pose every control frame, and play.py's ``--follow_robot`` branch
+        must stand down or the two writers fight over the same camera.  (It
+        used to flip only on a T press, back when the default was ``free``.)
+        """
         return self._camera_override_active
 
+    def snap_camera_behind(self) -> bool:
+        """Recentre the free gta azimuth behind the robot (R3 / G).
+
+        This is the *only* automatic recentring in the mode, and it is opt-in
+        by design: a camera that eases back behind the robot on its own can
+        never be parked in front of it.
+
+        Only a flag is set here; the actual angle is taken from the base yaw on
+        the next ``update_follow_camera``, which is the one place that is
+        allowed to read simulator state (sim thread).  Harmless no-op in
+        rear/front (already body-relative) and in free (Genesis owns the view).
+        """
+        if self.camera_mode != "gta":
+            return False
+        self._camera_snap_pending = True
+        return True
+
     def next_camera_mode(self) -> str:
-        """Cycle rear third-person -> front -> free camera mode."""
+        """Cycle gta orbit -> rear third-person -> front -> free camera mode."""
         viewer = self.viewer
         if viewer is None:
             return self.camera_mode
-        modes = ("rear", "front", "free")
+        modes = CAMERA_MODES
         previous_mode = self.camera_mode
         self.camera_mode = modes[(modes.index(self.camera_mode) + 1) % len(modes)]
         # A user who has pressed T explicitly selected a camera mode.  In the
@@ -999,16 +1199,129 @@ class NativeArenaUI:
             # long camera fly-in when switching back to a robot-relative mode.
             self._camera_anchor = None
             self._camera_yaw = None
+            self._camera_height = None
+            # The trackball has been moved by hand in the meantime, so the old
+            # orbit angle means nothing any more: come back in behind the robot.
+            self._camera_azimuth = None
         if self.following:
-            self.update_follow_camera()
+            # A camera-mode switch must take effect immediately.  Normal
+            # tracking can then use the configured, lower-rate update path.
+            self.update_follow_camera(force=True)
         self.update_hud(force=True)
         print(f"[arena] camera mode: {self.camera_mode}")
         return self.camera_mode
 
-    def update_follow_camera(self) -> bool:
-        """Update a body-relative rear/front camera once per control frame."""
+    def _look_dt(self, dt: Optional[float]) -> float:
+        """Seconds since the last accepted camera update, for rate integration.
+
+        ``update_follow_camera`` is called from ``interaction_loop`` without a
+        dt (and is stride-skipped), so the rig measures its own instead of
+        guessing a frame time.  Clamped to ``GTA_MAX_LOOK_DT`` so a stall does
+        not turn one frame's stick deflection into a full camera whip.  Tests
+        pass ``dt`` explicitly to stay deterministic.
+        """
+        now = time.monotonic()
+        if dt is None:
+            last = self._look_clock
+            dt = 0.0 if last is None else (now - last)
+        self._look_clock = now
+        return min(max(float(dt), 0.0), GTA_MAX_LOOK_DT)
+
+    def _take_mouse_look(self) -> Tuple[float, float, float]:
+        """Drain the viewer thread's accumulated drag/scroll.  Sim thread only."""
+        with self._look_lock:
+            dx, dy = self._mouse_look
+            scroll = self._mouse_scroll
+            self._mouse_look[0] = 0.0
+            self._mouse_look[1] = 0.0
+            self._mouse_scroll = 0.0
+        return float(dx), float(dy), float(scroll)
+
+    @staticmethod
+    def _wrap_pi(angle: float) -> float:
+        """Fold an angle into (-pi, pi].
+
+        The azimuth is integrated every frame and never reset by anything but
+        an explicit snap, so orbiting one way for a few minutes would otherwise
+        walk it into magnitudes where float32 trig starts losing precision.
+        """
+        return float(math.atan2(math.sin(angle), math.cos(angle)))
+
+    def _advance_gta_rig(self, dt: float, measured_yaw: float) -> None:
+        """Integrate one frame of look input into (azimuth, pitch, distance).
+
+        Sim thread only.  Two input paths feed the same rig: the pad's right
+        stick is a *rate* (rad/s, hence the dt) and the mouse is a *delta*
+        (pixels already accumulated since the last call, hence no dt).
+
+        Sign convention, consistent between the two so muscle memory transfers:
+        stick right / drag right orbits the view to the right (the eye bearing
+        decreases, because yaw is CCW-positive), and stick up / drag up lifts
+        the eye (pitch increases, looking further down at the robot).
+        """
+        if self._camera_azimuth is None or self._camera_snap_pending:
+            # ``azimuth`` is the bearing from the robot TO the eye, so directly
+            # behind a robot facing ``measured_yaw`` is ``measured_yaw + pi``,
+            # wrapped into (-pi, pi] like every other write to this field.
+            self._camera_azimuth = self._wrap_pi(float(measured_yaw) + math.pi)
+            self._camera_snap_pending = False
+            # Whatever the user had queued up belongs to the old angle.
+            self._take_mouse_look()
+            return
+
+        look_x, look_y = getattr(self.source, "look", (0.0, 0.0))
+        mouse_dx, mouse_dy, scroll = self._take_mouse_look()
+
+        azimuth = self._camera_azimuth
+        azimuth -= float(look_x) * GTA_AZIMUTH_RATE * dt
+        azimuth -= mouse_dx * GTA_MOUSE_AZIMUTH_PER_PX
+        self._camera_azimuth = self._wrap_pi(azimuth)
+
+        # ``look_y`` is negative when the stick is up (SDL convention, same
+        # reason ``vx = -lefty``), so negate it to make "up" lift the camera.
+        pitch = self._camera_pitch
+        pitch += -float(look_y) * GTA_PITCH_RATE * dt
+        pitch += mouse_dy * GTA_MOUSE_PITCH_PER_PX
+        # Hard clamp, not a wrap: past ~+-90 deg the eye crosses the pole and
+        # the up-vector flips, which reads as the world turning upside down.
+        self._camera_pitch = min(max(pitch, GTA_PITCH_LIMITS[0]),
+                                 GTA_PITCH_LIMITS[1])
+
+        if scroll:
+            # Multiplicative so a notch feels the same close in and far out.
+            distance = self._camera_distance * (1.0 - GTA_SCROLL_STEP * scroll)
+            self._camera_distance = min(max(distance, GTA_DISTANCE_LIMITS[0]),
+                                        GTA_DISTANCE_LIMITS[1])
+
+    def camera_detail(self) -> str:
+        """Short ASCII HUD fragment describing the live rig (gta only)."""
+        if self.camera_mode != "gta":
+            return ""
+        return f"d{self._camera_distance:.1f}"
+
+    def update_follow_camera(self, force: bool = False,
+                             dt: Optional[float] = None) -> bool:
+        """Update the body-anchored camera (gta orbit, or rear/front).
+
+        The camera follows a slow world-space XY anchor, keeps a fixed world
+        height and only slowly accepts meaningful yaw changes.  In particular,
+        it does not inherit the base's gait-scale vertical bob or tiny yaw
+        oscillations from foot contacts.
+
+        The gta mode reuses that exact anchor and adds a spherical orbit on top
+        of it.  What it does NOT reuse is ``_camera_yaw``: the orbit azimuth is
+        an absolute world angle owned by the user, so unlike rear/front it never
+        rotates with the robot.  Consuming the look input here, on the sim
+        thread, is deliberate -- the mouse callbacks may only stash deltas.
+        """
         if not self.following:
             return False
+        if not force and self._follow_camera_stride > 1:
+            self._follow_camera_frame = (
+                self._follow_camera_frame + 1
+            ) % self._follow_camera_stride
+            if self._follow_camera_frame != 0:
+                return False
         simulator = getattr(self.env, "simulator", None)
         base_pos = getattr(simulator, "base_pos", None)
         if base_pos is None:
@@ -1025,12 +1338,28 @@ class NativeArenaUI:
                 measured_yaw = float(base_euler[self.robot_index, 2].item())
             if self._camera_anchor is None:
                 self._camera_anchor = target.copy()
+                self._camera_height = float(target[2])
             else:
-                # Suppress gait-scale vertical shake much more aggressively
-                # than horizontal position, where too much smoothing reads as
-                # a laggy camera at locomotion speed.
-                alpha = np.array([0.16, 0.16, 0.035], dtype=np.float32)
-                self._camera_anchor += alpha * (target - self._camera_anchor)
+                xy_delta = target[:2] - self._camera_anchor[:2]
+                xy_distance = float(np.linalg.norm(xy_delta))
+                if xy_distance > 3.0:
+                    # Teleport/respawn: reframe instead of slowly flying over
+                    # the whole arena.  Normal locomotion never reaches this
+                    # threshold in one control frame.
+                    self._camera_anchor[:2] = target[:2]
+                    self._camera_height = float(target[2])
+                else:
+                    # ~0.3 s XY follow time constant, plus a speed cap.  This
+                    # looks like a camera rig following the robot rather than
+                    # a camera bolted to its pelvis.
+                    xy_step = 0.06 * xy_delta
+                    step_norm = float(np.linalg.norm(xy_step))
+                    if step_norm > 0.06:
+                        xy_step *= 0.06 / step_norm
+                    self._camera_anchor[:2] += xy_step
+                # The visual camera is world-level, not base-level.  Keep its
+                # anchor Z fixed until a real teleport/reframe occurs.
+                self._camera_anchor[2] = float(self._camera_height)
             if self._camera_yaw is None:
                 self._camera_yaw = measured_yaw
             else:
@@ -1038,8 +1367,37 @@ class NativeArenaUI:
                     np.sin(measured_yaw - self._camera_yaw),
                     np.cos(measured_yaw - self._camera_yaw),
                 )
-                self._camera_yaw += 0.14 * yaw_delta
+                # Ignore sub-degree contact jitter.  Intentional turning still
+                # rotates the rig smoothly over a few tenths of a second.
+                if abs(yaw_delta) > 0.02:
+                    self._camera_yaw += 0.05 * yaw_delta
             target = self._camera_anchor
+            if self.camera_mode == "gta":
+                # Orbit rig.  The anchor (and therefore all of the anti-bob
+                # filtering above) is shared with rear/front; only the offset
+                # differs, and it is driven by the user instead of the heading.
+                self._advance_gta_rig(self._look_dt(dt), measured_yaw)
+                azimuth = float(self._camera_azimuth)
+                pitch = float(self._camera_pitch)
+                radius = float(self._camera_distance)
+                horizontal = radius * math.cos(pitch)
+                eye_offset = np.array(
+                    [
+                        horizontal * math.cos(azimuth),
+                        horizontal * math.sin(azimuth),
+                        radius * math.sin(pitch),
+                    ],
+                    dtype=np.float32,
+                )
+                lookat_offset = np.array(
+                    [0.0, 0.0, GTA_LOOKAT_HEIGHT], dtype=np.float32
+                )
+                # Already world-frame: no body_to_world rotation, which is the
+                # whole point of an absolute azimuth.
+                self.env.set_viewer_camera(target + eye_offset,
+                                           target + lookat_offset)
+                return True
+
             yaw = self._camera_yaw
             cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
 

@@ -36,15 +36,17 @@ from legged_gym.scripts.input_source import (  # noqa: E402
 class FakeController:
     """Stand-in for a pyglet Controller: pollable attributes, no device."""
 
-    def __init__(self, leftx=0.0, lefty=0.0, rightx=0.0, **buttons):
+    def __init__(self, leftx=0.0, lefty=0.0, rightx=0.0, righty=0.0, **buttons):
         self.name = "Fake F310"
         self.device = None
         self.leftx = leftx
         self.lefty = lefty
         self.rightx = rightx
+        self.righty = righty
         self.open_calls = 0
         for name in ("a", "b", "x", "y", "leftshoulder", "rightshoulder",
-                     "start", "back"):
+                     "leftstick", "rightstick", "dpup", "dpdown", "dpleft",
+                     "dpright", "start", "back"):
             setattr(self, name, bool(buttons.get(name, False)))
 
     def open(self):
@@ -91,6 +93,8 @@ class FakeGamepad:
         if self.becomes_available:
             self.available = True
         return self.available
+
+    look = (0.0, 0.0)
 
     def poll(self, dt=0.0):
         self.poll_calls += 1
@@ -274,22 +278,28 @@ class TestKeyboardSource(unittest.TestCase):
 
 
 class TestGamepadSource(unittest.TestCase):
-    def test_signs_match_the_old_pygame_mapping(self):
-        # play.py used vx = -ly, vy = -lx, yaw = -rx.  Stick fully forward on an
-        # SDL-style pad is lefty = -1.
+    def test_left_stick_signs_match_the_old_pygame_mapping(self):
+        # play.py used vx = -ly, vy = -lx.  Stick fully forward on an SDL-style
+        # pad is lefty = -1.  (yaw = -rx moved to LB/RB; see the yaw tests.)
         pad, _ = make_pad(lefty=-1.0)
         self.assertAlmostEqual(pad.poll()[0], 1.5)
         pad, _ = make_pad(lefty=1.0)
         self.assertAlmostEqual(pad.poll()[0], -1.0)   # backward envelope
         pad, _ = make_pad(leftx=-1.0)
         self.assertAlmostEqual(pad.poll()[1], 0.7)    # stick left -> +y (left)
-        pad, _ = make_pad(rightx=1.0)
-        self.assertAlmostEqual(pad.poll()[2], -1.5)   # stick right -> yaw right
+
+    def test_right_stick_no_longer_touches_the_command(self):
+        # The Command contract is 3 numbers and the right stick is not one of
+        # them any more: it must not leak back in as yaw.
+        pad, _ = make_pad(rightx=1.0, righty=-1.0)
+        self.assertEqual(pad.poll(0.016), (0.0, 0.0, 0.0))
+        self.assertFalse(pad.stick_active)  # looking around never steals drive
 
     def test_drift_inside_deadzone_produces_no_motion(self):
         pad, _ = make_pad(leftx=0.08, lefty=-0.05, rightx=0.1)
         self.assertEqual(pad.poll(), (0.0, 0.0, 0.0))
         self.assertFalse(pad.stick_active)
+        self.assertEqual(pad.look, (0.0, 0.0))
 
     def test_stick_active_flag(self):
         pad, controller = make_pad()
@@ -300,11 +310,13 @@ class TestGamepadSource(unittest.TestCase):
         self.assertTrue(pad.stick_active)
 
     def test_output_clamped_to_envelope(self):
-        pad, _ = make_pad(leftx=-5.0, lefty=-5.0, rightx=-5.0)
-        vx, vy, yaw = pad.poll()
+        pad, _ = make_pad(leftx=-5.0, lefty=-5.0, leftshoulder=True)
+        for _ in range(200):
+            vx, vy, yaw = pad.poll(1 / 60.0)
         self.assertAlmostEqual(vx, 1.5)
         self.assertAlmostEqual(vy, 0.7)
-        self.assertAlmostEqual(yaw, 1.5)
+        self.assertLessEqual(yaw, 1.5)
+        self.assertAlmostEqual(yaw, 1.5, places=3)
 
     def test_no_controller_is_safe(self):
         pad = GamepadSource(controller=None, auto_open=False)
@@ -326,13 +338,124 @@ class TestGamepadSource(unittest.TestCase):
         pad.poll()
         self.assertEqual(pad.drain_events(), ["respawn"])
 
-    def test_shoulder_buttons_map_to_tabs(self):
+    def test_dpad_owns_tabs_and_levels(self):
+        # LB/RB became the yaw axis, so tabs moved to the d-pad's left/right
+        # and levels to its up/down.
+        pad, controller = make_pad()
+        pad.poll()
+        controller.dpleft = True
+        controller.dpright = True
+        controller.dpup = True
+        controller.dpdown = True
+        pad.poll()
+        self.assertEqual(sorted(pad.drain_events()),
+                         ["level_next", "level_prev", "tab_next", "tab_prev"])
+
+    def test_right_stick_click_snaps_the_camera(self):
+        pad, controller = make_pad()
+        pad.poll()
+        controller.rightstick = True
+        pad.poll()
+        self.assertEqual(pad.drain_events(), ["camera_snap"])
+
+    def test_shoulders_emit_no_events_they_are_an_axis(self):
         pad, controller = make_pad()
         pad.poll()
         controller.leftshoulder = True
         controller.rightshoulder = True
         pad.poll()
-        self.assertEqual(sorted(pad.drain_events()), ["tab_next", "tab_prev"])
+        self.assertEqual(pad.drain_events(), [])
+
+
+class TestGamepadYawOnShoulders(unittest.TestCase):
+    """LB/RB are digital, so the yaw command must be ramped, not stepped."""
+
+    def test_lb_is_yaw_left_and_rb_is_yaw_right(self):
+        pad, controller = make_pad(leftshoulder=True)
+        for _ in range(200):
+            yaw = pad.poll(1 / 60.0)[2]
+        self.assertAlmostEqual(yaw, 1.5, places=3)
+
+        pad, controller = make_pad(rightshoulder=True)
+        for _ in range(200):
+            yaw = pad.poll(1 / 60.0)[2]
+        self.assertAlmostEqual(yaw, -1.5, places=3)
+
+    def test_first_frame_is_not_a_step_input(self):
+        pad, _ = make_pad(leftshoulder=True)
+        first = pad.poll(1 / 60.0)[2]
+        self.assertGreater(first, 0.0)
+        self.assertLess(first, 0.5)  # nowhere near the 1.5 rad/s envelope
+
+    def test_release_coasts_down_and_keeps_pad_ownership_meanwhile(self):
+        pad, controller = make_pad(leftshoulder=True)
+        for _ in range(200):
+            pad.poll(1 / 60.0)
+        self.assertTrue(pad.stick_active)
+        controller.leftshoulder = False
+        yaw = pad.poll(1 / 60.0)[2]
+        self.assertGreater(yaw, 1.0)     # coasting, not snapped to zero
+        # The pad must keep owning the frame while it coasts, or the keyboard
+        # would take over mid-decay and the yaw would jump.
+        self.assertTrue(pad.stick_active)
+        for _ in range(400):
+            yaw = pad.poll(1 / 60.0)[2]
+        self.assertLess(abs(yaw), 1e-3)
+        self.assertFalse(pad.stick_active)
+
+    def test_both_shoulders_cancel(self):
+        pad, _ = make_pad(leftshoulder=True, rightshoulder=True)
+        for _ in range(60):
+            yaw = pad.poll(1 / 60.0)[2]
+        self.assertAlmostEqual(yaw, 0.0)
+
+    def test_holding_only_lb_makes_the_pad_own_the_command(self):
+        # The bug this guards: stick_active used to be stick-only, so holding
+        # LB alone left the (zero) keyboard command in charge and the robot
+        # simply did not turn.
+        pad, _ = make_pad(leftshoulder=True)
+        merged = MergedSource(gamepad=pad)
+        for _ in range(120):
+            cmd = merged.poll(1 / 60.0)
+        self.assertAlmostEqual(cmd[2], 1.5, places=3)
+
+    def test_poll_signature_still_takes_dt_first(self):
+        # play.py / MergedSource call poll(dt) positionally.
+        params = list(inspect.signature(GamepadSource.poll).parameters)
+        self.assertEqual(params[:2], ["self", "dt"])
+
+
+class TestGamepadLook(unittest.TestCase):
+    """The right stick is camera look: shaped, separate, never in the command."""
+
+    def test_look_is_shaped_like_the_drive_axes(self):
+        pad, _ = make_pad(rightx=1.0, righty=-1.0)
+        pad.poll(0.016)
+        look_x, look_y = pad.look
+        self.assertAlmostEqual(look_x, 1.0)    # expo fixes the endpoints
+        self.assertAlmostEqual(look_y, -1.0)   # stick up is negative (SDL)
+        pad, _ = make_pad(rightx=0.5)
+        pad.poll(0.016)
+        self.assertLess(pad.look[0], 0.5)      # deadzone + expo soften centre
+
+    def test_look_is_zero_without_a_controller(self):
+        pad = GamepadSource(controller=None, auto_open=False)
+        pad.poll(0.016)
+        self.assertEqual(pad.look, (0.0, 0.0))
+
+    def test_merged_passes_look_through(self):
+        pad, controller = make_pad(rightx=-1.0)
+        merged = MergedSource(gamepad=pad)
+        merged.poll(0.016)
+        self.assertAlmostEqual(merged.look[0], -1.0)
+
+    def test_merged_look_is_centred_without_or_with_a_disabled_pad(self):
+        self.assertEqual(MergedSource().look, (0.0, 0.0))
+        pad, _ = make_pad(rightx=1.0)
+        merged = MergedSource(gamepad=pad)
+        merged.poll(0.016)
+        merged.set_gamepad_enabled(False)
+        self.assertEqual(merged.look, (0.0, 0.0))
 
 
 class TestMergedSource(unittest.TestCase):
@@ -383,7 +506,9 @@ class TestMergedSource(unittest.TestCase):
         merged.poll(0.016)
         controller.y = True
         merged.poll(0.016)
-        self.assertEqual(merged.drain_events(), ["follow_toggle"])
+        # Y used to emit "follow_toggle", which NativeArenaUI.apply() did not
+        # know and reported as an unknown event; it is the camera cycle now.
+        self.assertEqual(merged.drain_events(), ["camera_next"])
 
     def test_clear_stops_the_keyboard(self):
         merged = MergedSource()
