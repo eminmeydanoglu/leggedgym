@@ -1,0 +1,26 @@
+{
+  "lsp": {
+    "basedpyright": {
+      "settings": {
+        "python": {
+          "pythonPath": ".venv/bin/python"
+        },
+        "basedpyright.analysis": {
+          "diagnosticSeverityOverrides": {
+            "reportAttributeAccessIssue": "warning",
+            "reportIncompatibleMethodOverride": "warning",
+            "reportIncompatibleVariableOverride": "warning",
+            "reportPossiblyUnboundVariable": "warning"
+          }
+        }
+      }
+    },
+    "pyright": {
+      "settings": {
+        "python": {
+          "pythonPath": ".venv/bin/python"
+        }
+      }
+    }
+  }
+}

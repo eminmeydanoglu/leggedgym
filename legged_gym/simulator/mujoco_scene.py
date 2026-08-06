@@ -174,76 +174,240 @@ def _hfield_geometry(cfg, terrain):
     }
 
 
-def _add_visual_dressing(spec):
-    """Skybox, ground material and lights.
+# Horizon tone. The skybox fades to it, and distant geometry hazes into it, so the two
+# have to be the same colour or the terrain edge cuts a hard line against the sky.
+_HORIZON_RGB = (0.62, 0.70, 0.78)
 
-    This world is driven interactively by a human (play scripts, teleop), so a bare
-    grey void is a real usability problem -- without a horizon or shadows it is very
-    hard to judge the robot's heading and the terrain's slope. None of this affects
-    physics.
+# Half-width, in metres, of the ground area the key light's shadow map covers. MuJoCo
+# expresses this as `vis.map.shadowclip`, a *fraction of model extent*, but extent
+# swings from ~20 m (plane worlds) to ~42 m and up (multi-tile terrain banks), so a
+# fixed fraction means the shadow resolution silently changes with the terrain. We fix
+# the metres instead and convert once the model is compiled and extent is known.
+#
+# Measured on both a 20 m plane world and a 42 m heightfield world: below ~4.5 m the
+# shadow disappears entirely rather than degrading, so 6.0 keeps a margin over that
+# cliff while still being tight enough that the shadow edge is smooth rather than
+# stair-stepped. Only meaningful together with the tracked key light below -- a
+# world-fixed light with a frustum this tight would drop the robot's shadow as soon as
+# it walked away from the origin.
+_SHADOW_RADIUS_M = 6.0
+
+
+def _value_noise(shape, octaves, rng):
+    """Wrapping multi-octave value noise in [0, 1].
+
+    Wrapping matters: these textures are tiled across the whole world by `texrepeat`,
+    and a seam at every tile boundary would read as a grid of lines on the ground.
+    """
+    h, w = shape
+    out = np.zeros((h, w), dtype=np.float32)
+    amp_total = 0.0
+    for octave in range(octaves):
+        n = 2 ** (octave + 2)
+        amp = 0.5 ** octave
+
+        lattice = rng.random((n, n), dtype=np.float32)
+        ys = np.linspace(0, n, h, endpoint=False)
+        xs = np.linspace(0, n, w, endpoint=False)
+        y0 = np.floor(ys).astype(int) % n
+        x0 = np.floor(xs).astype(int) % n
+        # The modulo on the *upper* neighbour is what makes the result wrap.
+        y1 = (y0 + 1) % n
+        x1 = (x0 + 1) % n
+
+        fy = (ys - np.floor(ys)).astype(np.float32)[:, None]
+        fx = (xs - np.floor(xs)).astype(np.float32)[None, :]
+        fy = fy * fy * (3.0 - 2.0 * fy)   # smoothstep: rounded blobs, not diamonds
+        fx = fx * fx * (3.0 - 2.0 * fx)
+
+        top = lattice[np.ix_(y0, x0)] * (1.0 - fx) + lattice[np.ix_(y0, x1)] * fx
+        bot = lattice[np.ix_(y1, x0)] * (1.0 - fx) + lattice[np.ix_(y1, x1)] * fx
+        out += amp * (top * (1.0 - fy) + bot * fy)
+        amp_total += amp
+
+    return out / amp_total
+
+
+def _terrain_texture_rgb(size=512, seed=7):
+    """Earth-toned ground detail for the heightfield.
+
+    Two noise bands rather than one: the low band keeps a large slope from reading as a
+    single flat colour, and the high band keeps the surface textured right under the
+    robot, which is where the eye actually judges whether it is moving.
+    """
+    rng = np.random.default_rng(seed)
+    macro = _value_noise((size, size), octaves=3, rng=rng)
+    micro = _value_noise((size, size), octaves=6, rng=rng)
+    grain = rng.random((size, size), dtype=np.float32)
+
+    dark = np.array([0.30, 0.28, 0.24], dtype=np.float32)
+    light = np.array([0.55, 0.52, 0.44], dtype=np.float32)
+
+    blend = np.clip(0.5 + 0.7 * (macro - 0.5) + 1.1 * (micro - 0.5), 0.0, 1.0)[..., None]
+    rgb = dark + (light - dark) * blend
+    rgb *= (0.90 + 0.20 * grain)[..., None]
+    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _floor_texture_rgb(size=512, seed=3):
+    """Checker floor for plane worlds.
+
+    A checker gives the eye a fixed reference for translation; on a featureless plane a
+    walking robot is otherwise almost impossible to distinguish from a hovering one. The
+    noise on top is deliberately weak -- at grazing angles a strong per-pixel grain
+    aliases into crawling speckle across the whole floor.
+    """
+    rng = np.random.default_rng(seed)
+    idx = np.arange(size)
+    half = size // 2
+
+    check = ((idx[:, None] // half + idx[None, :] // half) % 2).astype(np.float32)
+    grain = _value_noise((size, size), octaves=5, rng=rng)
+
+    base = np.array([0.30, 0.32, 0.35], dtype=np.float32)
+    alt = np.array([0.37, 0.39, 0.43], dtype=np.float32)
+    rgb = base + (alt - base) * check[..., None]
+    rgb *= (0.96 + 0.08 * grain)[..., None]
+
+    # Thin darker grout along the tile seams: a strong near-field depth cue.
+    line = ((idx % half) < max(1, size // 256)).astype(np.float32)
+    seam = np.maximum(line[:, None], line[None, :])[..., None]
+    rgb *= 1.0 - 0.35 * seam
+    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _add_rgb_texture(spec, name, rgb):
+    """Attach an (H, W, 3) uint8 array as a 2D texture."""
+    tex = spec.add_texture()
+    tex.name = name
+    tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+    tex.builtin = mujoco.mjtBuiltin.mjBUILTIN_NONE
+    tex.height, tex.width = int(rgb.shape[0]), int(rgb.shape[1])
+    tex.nchannel = 3
+    tex.data = rgb.tobytes()
+    return tex
+
+
+def _set_rgb_texture(material, texture_name):
+    # `textures` is a fixed-length vector indexed by mjtTextureRole, not a plain list;
+    # copy it out, set the RGB slot, and assign the whole thing back.
+    roles = [""] * len(material.textures)
+    roles[mujoco.mjtTextureRole.mjTEXROLE_RGB] = texture_name
+    material.textures = roles
+
+
+def _robot_root_body(spec):
+    """The robot's floating base, or None if the MJCF has no free-jointed body.
+
+    Used only to host the key light, so a miss is not fatal -- the caller falls back to
+    a world-fixed light and merely loses the tight shadow frustum.
+    """
+    for body in spec.bodies:
+        if body.name == "world":
+            continue
+        for joint in body.joints:
+            if joint.type == mujoco.mjtJoint.mjJNT_FREE:
+                return body
+    return None
+
+
+def _add_visual_dressing(spec):
+    """Skybox, ground materials and lights.
+
+    This world is driven interactively by a human (play scripts, teleop), so a bare grey
+    void is a real usability problem -- without a horizon, ground texture or shadows it
+    is very hard to judge the robot's heading, its height off the ground, and the
+    terrain's slope. None of this affects physics.
     """
     sky = spec.add_texture()
     sky.name = "skybox"
     sky.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
     sky.builtin = mujoco.mjtBuiltin.mjBUILTIN_GRADIENT
-    sky.rgb1 = [0.24, 0.34, 0.47]
-    sky.rgb2 = [0.03, 0.04, 0.06]
+    sky.rgb1 = [0.15, 0.26, 0.43]
+    # Bottom of the gradient is the horizon, so it has to match the haze colour.
+    sky.rgb2 = list(_HORIZON_RGB)
     sky.width = 512
     sky.height = 3072
 
-    # A checker gives the eye a fixed reference for translation; on a featureless plane
-    # a walking robot is otherwise almost impossible to distinguish from a hovering one.
-    checker = spec.add_texture()
-    checker.name = "groundchecker"
-    checker.type = mujoco.mjtTexture.mjTEXTURE_2D
-    checker.builtin = mujoco.mjtBuiltin.mjBUILTIN_CHECKER
-    checker.rgb1 = [0.30, 0.32, 0.35]
-    checker.rgb2 = [0.38, 0.40, 0.44]
-    checker.width = 300
-    checker.height = 300
+    _add_rgb_texture(spec, "groundtex", _floor_texture_rgb())
+    _add_rgb_texture(spec, "terraintex", _terrain_texture_rgb())
 
     ground_mat = spec.add_material()
     ground_mat.name = "groundmat"
-    # `textures` is a fixed-length vector indexed by mjtTextureRole, not a plain list;
-    # copy it out, set the RGB slot, and assign the whole thing back.
-    roles = [""] * len(ground_mat.textures)
-    roles[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "groundchecker"
-    ground_mat.textures = roles
-    ground_mat.texrepeat = [8, 8]
+    _set_rgb_texture(ground_mat, "groundtex")
+    # texuniform makes texrepeat a per-metre rate, so tile size is independent of how
+    # large the plane geom happens to be: 1.0 here means one texture (two checkers)
+    # per metre.
+    ground_mat.texrepeat = [1.0, 1.0]
     ground_mat.texuniform = True
-    ground_mat.reflectance = 0.05
+    ground_mat.reflectance = 0.12
+    ground_mat.specular = 0.2
+    ground_mat.shininess = 0.3
 
-    # Matte, slightly warm terrain so height changes read through shading alone.
     terrain_mat = spec.add_material()
     terrain_mat.name = "terrainmat"
-    terrain_mat.rgba = [0.46, 0.44, 0.39, 1.0]
-    terrain_mat.specular = 0.1
-    terrain_mat.shininess = 0.1
+    _set_rgb_texture(terrain_mat, "terraintex")
+    terrain_mat.texrepeat = [0.5, 0.5]
+    terrain_mat.texuniform = True
+    # White base: the colour comes from the texture, not from rgba tinting it.
+    terrain_mat.rgba = [1.0, 1.0, 1.0, 1.0]
+    terrain_mat.specular = 0.12
+    terrain_mat.shininess = 0.15
 
-    # Directional key light: casts the shadows that make slopes and stair risers legible.
-    key = spec.worldbody.add_light()
+    # Directional key light: casts the shadows that make slopes and stair risers legible,
+    # and -- more than anything else -- tell the viewer whether the robot's feet are on
+    # the ground.
+    #
+    # Hosted on the robot's floating base with mode=TRACK rather than in the worldbody:
+    # TRACK moves the light with the body while holding its orientation fixed in world,
+    # so the lighting direction never swims as the robot pitches and rolls, but the
+    # shadow frustum stays centred on the robot. That is what lets `_SHADOW_RADIUS_M`
+    # be small enough for a smooth shadow edge. The 12 m offset is not cosmetic: the
+    # shadow camera has to sit above the geometry it renders, and dropping it to the
+    # robot's own height loses the shadow completely.
+    host = _robot_root_body(spec) or spec.worldbody
+    key = host.add_light()
     key.name = "keylight"
     key.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
     key.pos = [0.0, 0.0, 12.0]
     key.dir = [-0.35, -0.35, -0.87]
-    key.diffuse = [0.7, 0.7, 0.7]
-    key.specular = [0.25, 0.25, 0.25]
+    key.diffuse = [0.85, 0.82, 0.75]
+    key.specular = [0.35, 0.35, 0.35]
     key.castshadow = True
+    if host is not spec.worldbody:
+        key.mode = mujoco.mjtCamLight.mjCAMLIGHT_TRACK
 
     # Fill light from the opposite side, shadowless, so the shadowed faces of steps do
-    # not go fully black.
+    # not go fully black. Tinted cool against the warm key.
     fill = spec.worldbody.add_light()
     fill.name = "filllight"
     fill.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
     fill.pos = [0.0, 0.0, 12.0]
     fill.dir = [0.5, 0.5, -0.75]
-    fill.diffuse = [0.25, 0.25, 0.25]
+    fill.diffuse = [0.22, 0.25, 0.30]
     fill.specular = [0.0, 0.0, 0.0]
     fill.castshadow = False
 
-    spec.visual.headlight.ambient = [0.35, 0.35, 0.35]
-    spec.visual.headlight.diffuse = [0.35, 0.35, 0.35]
+    # Low ambient: the old 0.35 flattened every surface by lifting the shadowed faces
+    # almost to the lit ones, which is most of why the arena looked depthless.
+    spec.visual.headlight.ambient = [0.18, 0.19, 0.21]
+    spec.visual.headlight.diffuse = [0.20, 0.20, 0.20]
     spec.visual.headlight.specular = [0.05, 0.05, 0.05]
+
+    spec.visual.rgba.haze = [*_HORIZON_RGB, 1.0]
+    spec.visual.map.haze = 0.25
+    spec.visual.quality.shadowsize = 8192
+    spec.visual.quality.offsamples = 8
+
+
+def _apply_shadow_radius(model):
+    """Convert `_SHADOW_RADIUS_M` into MuJoCo's extent-relative `shadowclip`.
+
+    Post-compile because `stat.extent` is only known once the model exists.
+    """
+    extent = float(model.stat.extent)
+    if extent > 0.0:
+        model.vis.map.shadowclip = _SHADOW_RADIUS_M / extent
 
 
 def _add_play_stair_colliders(spec, cfg):
@@ -406,4 +570,5 @@ def build_scene(cfg, terrain=None) -> "mujoco.MjModel":
 
     model = spec.compile()
     _apply_sim_options(model, cfg)
+    _apply_shadow_radius(model)
     return model

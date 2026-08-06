@@ -69,21 +69,21 @@ from legged_gym.utils.terrain import (
 # Keymap
 # ---------------------------------------------------------------------------
 #
-# Genesis's ``DefaultControlsPlugin`` already owns R, S, Z, A, H, F, V, W, L, D,
-# O, C, P and F11 (all on KeyAction.RELEASE), and the pyrender viewer reserves I
-# for the help overlay as a *protected* keybind.  That rules out both WASD and
-# the Viser TFGH/RY layout without overwriting the viewer's own debug toggles,
-# which this module deliberately does not do -- nothing here is registered with
-# ``overwrite=True``.  Arrows + Q/E are collision-free and need no explanation.
+# The arena deliberately takes over W/A/S/D from Genesis's default debug
+# controls.  Interactive driving is the primary use of native play, and a
+# familiar WASD layout is more valuable here than those viewer toggles.  The
+# bindings below are registered with ``overwrite=True`` so the RELEASE actions
+# cannot also fire Genesis's old W/A/S/D callbacks.  I remains protected by the
+# pyrender help overlay and is intentionally not used.
 #
 # name -> (Key attribute name, drive action)
 DRIVE_KEYMAP: Dict[str, Tuple[str, str]] = {
-    "arena_forward": ("UP", "forward"),
-    "arena_backward": ("DOWN", "backward"),
-    "arena_yaw_left": ("LEFT", "yaw_left"),
-    "arena_yaw_right": ("RIGHT", "yaw_right"),
-    "arena_strafe_left": ("Q", "strafe_left"),
-    "arena_strafe_right": ("E", "strafe_right"),
+    "arena_forward": ("W", "forward"),
+    "arena_backward": ("S", "backward"),
+    "arena_strafe_left": ("A", "strafe_left"),
+    "arena_strafe_right": ("D", "strafe_right"),
+    "arena_yaw_left": ("Q", "yaw_left"),
+    "arena_yaw_right": ("E", "yaw_right"),
 }
 
 # name -> (Key attribute name, event) fired once per press.
@@ -365,9 +365,10 @@ def format_arena_legend(
     )
     lines.append(f"  levels (difficulty, [ / ]): {level_str}")
     lines.append("  drive (robot body frame -- NOT camera-relative):")
-    lines.append("    Up / Down     forward / backward")
-    lines.append("    Left / Right  turn left / right")
-    lines.append("    Q / E         strafe left / right")
+    lines.append("    W / S         forward / backward")
+    lines.append("    A / D         strafe left / right")
+    lines.append("    Q / E         turn left / right")
+    lines.append("    Shift + W/S   turbo forward/backward: 2.0 m/s")
     lines.append("    Space         hard stop")
     lines.append("  camera:")
     lines.append("    T                 mode: gta -> rear -> front -> free")
@@ -386,8 +387,7 @@ def format_arena_legend(
     lines.append("    J                 toggle gamepad on/off (auto-rescans when on)")
     lines.append("    M                 reprint this legend")
     if backend == "genesis":
-        lines.append("  (Genesis reserves I for its own help overlay; R/S/Z/A/H/F/V/W/L/D/O/C/P "
-                     "stay with the viewer's debug toggles.)")
+        lines.append("  (Genesis reserves I for its own help overlay; W/A/S/D are assigned to drive.)")
     lines.append("  gamepad: auto-detected at startup, no launch flag needed; a")
     lines.append("    hot-plugged pad is picked up within ~2 s; J toggles it on/off")
     lines.append(f"    connected: {gamepad if gamepad else 'none'}")
@@ -644,6 +644,7 @@ class NativeArenaUI:
         self._mouse_scroll = 0.0        # accumulated wheel notches
         self._look_clock: Optional[float] = None
         self._shift_held = False
+        self._shift_keys = set()
         self._lock = threading.Lock()
         self._registered: List[str] = []
         self._focus_guard_window = None
@@ -746,7 +747,7 @@ class NativeArenaUI:
                     getattr(Key, side),
                     key_action=KeyAction.PRESS,
                     callback=self._set_shift,
-                    args=(True,),
+                    args=(side, True),
                 )
             )
             keybinds.append(
@@ -755,12 +756,15 @@ class NativeArenaUI:
                     getattr(Key, side),
                     key_action=KeyAction.RELEASE,
                     callback=self._set_shift,
-                    args=(False,),
+                    args=(side, False),
                 )
             )
 
         try:
-            self.viewer.register_keybinds(*keybinds)
+            # W/A/S/D replace the native viewer's RELEASE debug bindings; the
+            # matching RELEASE drive bindings must replace them too, otherwise
+            # steering also toggles viewer state when a key is released.
+            self.viewer.register_keybinds(*keybinds, overwrite=True)
         except Exception as exc:
             print(f"[arena] could not register keybinds ({exc}); keyboard drive is off")
             self.viewer = None
@@ -805,7 +809,7 @@ class NativeArenaUI:
         def on_key(key_name: str, pressed: bool) -> None:
             try:
                 if key_name in ("LSHIFT", "RSHIFT"):
-                    self._set_shift(pressed)
+                    self._set_shift(key_name, pressed)
                     return
                 action = drive_by_key.get(key_name)
                 if action is not None:
@@ -1034,6 +1038,7 @@ class NativeArenaUI:
             try:
                 self.source.clear()
                 self._shift_held = False
+                self._shift_keys.clear()
             except Exception:
                 pass
             return original()
@@ -1198,8 +1203,14 @@ class NativeArenaUI:
         self._registered = []
 
     # -- viewer-thread callbacks --------------------------------------------
-    def _set_shift(self, down: bool) -> None:
-        self._shift_held = bool(down)
+    def _set_shift(self, side: str, down: bool) -> None:
+        """Track either Shift key and expose its aggregate state to driving."""
+        if down:
+            self._shift_keys.add(side)
+        else:
+            self._shift_keys.discard(side)
+        self._shift_held = bool(self._shift_keys)
+        self.source.keyboard.set_turbo(self._shift_held)
 
     def _on_action_key(self, event: str) -> None:
         if event == "tab_next" and self._shift_held:

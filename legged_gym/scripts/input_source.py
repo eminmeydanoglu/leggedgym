@@ -192,6 +192,7 @@ class KeyboardSource:
         self.tau_decel = float(tau_decel)
         self._lock = threading.Lock()
         self._held: Dict[str, bool] = {a: False for a in DRIVE_ACTIONS}
+        self._turbo_held = False
         self._vel: List[float] = [0.0, 0.0, 0.0]
 
     # -- event ingress (viewer thread) --------------------------------------
@@ -207,11 +208,22 @@ class KeyboardSource:
         with self._lock:
             self._held[action] = False
 
+    def set_turbo(self, held: bool) -> None:
+        """Select the held-key high-speed forward/backward envelope.
+
+        The UI owns the physical Shift keys and calls this with their aggregate
+        state.  Keeping the modifier here makes turbo part of the same
+        thread-safe input snapshot as the drive keys.
+        """
+        with self._lock:
+            self._turbo_held = bool(held)
+
     def clear(self) -> None:
         """Hard stop: forget every held key and zero the ramped command."""
         with self._lock:
             for a in self._held:
                 self._held[a] = False
+            self._turbo_held = False
             self._vel = [0.0, 0.0, 0.0]
 
     # -- query ---------------------------------------------------------------
@@ -221,12 +233,17 @@ class KeyboardSource:
 
     def target(self) -> Command:
         """Un-ramped command implied by the currently held keys."""
-        h = self.held()
+        with self._lock:
+            h = dict(self._held)
+            turbo = self._turbo_held
         m = self.envelope
-        vx = (m.forward if h["forward"] else 0.0) - (m.backward if h["backward"] else 0.0)
+        forward = m.turbo_forward if turbo else m.forward
+        backward = m.turbo_backward if turbo else m.backward
+        vx = (forward if h["forward"] else 0.0) - (backward if h["backward"] else 0.0)
+        vx = min(max(vx, -abs(backward)), abs(forward))
         vy = (m.lateral if h["strafe_left"] else 0.0) - (m.lateral if h["strafe_right"] else 0.0)
         yaw = (m.yaw if h["yaw_left"] else 0.0) - (m.yaw if h["yaw_right"] else 0.0)
-        return m.clamp(vx, vy, yaw)
+        return (vx, *m.clamp(0.0, vy, yaw)[1:])
 
     @property
     def active(self) -> bool:

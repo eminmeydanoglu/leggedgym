@@ -47,10 +47,10 @@ import numpy as np
 # is never reported -- an unmapped key must not reach the caller as a mystery
 # string it has no branch for.
 _KEY_NAME_BY_GLFW_CODE = {
-    glfw.KEY_UP: "UP",
-    glfw.KEY_DOWN: "DOWN",
-    glfw.KEY_LEFT: "LEFT",
-    glfw.KEY_RIGHT: "RIGHT",
+    glfw.KEY_W: "W",
+    glfw.KEY_S: "S",
+    glfw.KEY_A: "A",
+    glfw.KEY_D: "D",
     glfw.KEY_Q: "Q",
     glfw.KEY_E: "E",
     glfw.KEY_T: "T",
@@ -236,6 +236,14 @@ class MujocoViewer:
 
             self._scene = mujoco.MjvScene(self.model, maxgeom=_MAX_SCENE_GEOM)
             self._scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1
+            # HAZE fades distant geometry into the skybox horizon colour set by
+            # `mujoco_scene._add_visual_dressing`; without it the far edge of the
+            # terrain cuts a hard line against the sky and the arena reads flat.
+            # REFLECTION is what the plane world's `groundmat.reflectance` needs to
+            # show anything -- on a heightfield it costs nothing, since only planes
+            # reflect.
+            self._scene.flags[mujoco.mjtRndFlag.mjRND_HAZE] = 1
+            self._scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 1
             self._opt = mujoco.MjvOption()
             self._cam = mujoco.MjvCamera()
             # Start from MuJoCo's own default free camera (it derives a sane

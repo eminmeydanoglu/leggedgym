@@ -100,7 +100,7 @@ def test_dead_viewer_setters_are_inert(monkeypatch):
 # ---------------------------------------------------------------------------
 
 EXPECTED_KEY_NAMES = {
-    "UP", "DOWN", "LEFT", "RIGHT", "Q", "E", "T", "M", "N", "J", "G",
+    "W", "S", "A", "D", "Q", "E", "T", "M", "N", "J", "G",
     "TAB", "SPACE", "BACKSPACE", "BRACKETLEFT", "BRACKETRIGHT",
     "LSHIFT", "RSHIFT", "ESCAPE",
 }
@@ -121,10 +121,10 @@ def test_keymap_is_unambiguous():
 @pytest.mark.parametrize(
     "glfw_attr,name",
     [
-        ("KEY_UP", "UP"),
-        ("KEY_DOWN", "DOWN"),
-        ("KEY_LEFT", "LEFT"),
-        ("KEY_RIGHT", "RIGHT"),
+        ("KEY_W", "W"),
+        ("KEY_S", "S"),
+        ("KEY_A", "A"),
+        ("KEY_D", "D"),
         ("KEY_Q", "Q"),
         ("KEY_E", "E"),
         ("KEY_T", "T"),
@@ -148,7 +148,7 @@ def test_glfw_key_name_translates_each_contract_key(glfw_attr, name):
 
 
 def test_glfw_key_name_returns_none_for_unmapped_keys():
-    for attr in ("KEY_W", "KEY_A", "KEY_S", "KEY_D", "KEY_F11", "KEY_ENTER"):
+    for attr in ("KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT", "KEY_F11", "KEY_ENTER"):
         assert mv.glfw_key_name(getattr(mv.glfw, attr)) is None
     assert mv.glfw_key_name(-1) is None
 

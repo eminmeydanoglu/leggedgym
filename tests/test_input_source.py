@@ -262,6 +262,19 @@ class TestKeyboardSource(unittest.TestCase):
         self.assertLessEqual(abs(vy), e.lateral)
         self.assertLessEqual(abs(yaw), e.yaw)
 
+    def test_shift_turbo_only_expands_forward_backward_to_two_mps(self):
+        kb = KeyboardSource()
+        kb.press("forward")
+        self.assertAlmostEqual(kb.target()[0], 1.5)
+        kb.set_turbo(True)
+        self.assertAlmostEqual(kb.target()[0], 2.0)
+        kb.release("forward")
+        kb.press("backward")
+        self.assertAlmostEqual(kb.target()[0], -2.0)
+        kb.press("strafe_left")
+        kb.press("yaw_left")
+        self.assertEqual(kb.target()[1:], (0.7, 1.5))
+
     def test_clear_is_a_hard_stop(self):
         kb = KeyboardSource()
         kb.press("forward")

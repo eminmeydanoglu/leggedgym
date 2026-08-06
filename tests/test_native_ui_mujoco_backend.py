@@ -133,11 +133,11 @@ class TestKeyRouting(unittest.TestCase):
         arena, viewer = make_arena()
         held = arena.source.keyboard.held
         self.assertFalse(held()["forward"])
-        viewer.key_cb("UP", True)
+        viewer.key_cb("W", True)
         self.assertTrue(held()["forward"])
         # The release edge is the whole reason the viewer reports both: without
         # it the robot would drive on with nobody touching the keyboard.
-        viewer.key_cb("UP", False)
+        viewer.key_cb("W", False)
         self.assertFalse(held()["forward"])
 
     def test_every_drive_key_maps_to_its_documented_action(self):
@@ -174,6 +174,16 @@ class TestKeyRouting(unittest.TestCase):
         viewer.key_cb("RSHIFT", True)
         viewer.key_cb("TAB", True)
         self.assertEqual(arena.source.drain_events(), ["tab_prev"])
+
+    def test_shift_w_uses_the_keyboard_turbo_envelope(self):
+        arena, viewer = make_arena()
+        viewer.key_cb("LSHIFT", True)
+        viewer.key_cb("W", True)
+        self.assertAlmostEqual(arena.source.keyboard.target()[0], 2.0)
+        viewer.key_cb("W", False)
+        viewer.key_cb("LSHIFT", False)
+        viewer.key_cb("S", True)
+        self.assertAlmostEqual(arena.source.keyboard.target()[0], -1.0)
 
     def test_action_keys_map_to_their_events(self):
         arena, viewer = make_arena()
@@ -276,7 +286,7 @@ class TestDegradation(unittest.TestCase):
         self.assertIsNone(arena._hud_lines)
         self.assertFalse(arena.update_hud(force=True))
         # Drive still works; only the on-screen text is gone.
-        viewer.key_cb("UP", True)
+        viewer.key_cb("W", True)
         self.assertTrue(arena.source.keyboard.held()["forward"])
 
     def test_a_viewer_without_key_support_disables_drive_not_the_session(self):
@@ -296,7 +306,7 @@ class TestDegradation(unittest.TestCase):
         self.assertIsNone(arena._hud_lines)
         # The callbacks are intentionally left attached (the contract has no
         # removers) and must still be harmless after teardown.
-        viewer.key_cb("UP", True)
+        viewer.key_cb("W", True)
         viewer.drag_cb(1.0, 1.0)
 
 

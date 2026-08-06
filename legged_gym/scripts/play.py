@@ -751,6 +751,13 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None,
     # value so the number is readable instead of flickering.
     fps_ema = None
     realtime_ema = None
+    # Wall-clock cost of the frame's actual WORK (step + policy + render), sampled
+    # before the real-time sleep below.  fps_ema/realtime_ema are measured across the
+    # sleep, so they saturate at the control rate and read ~1.00x on any machine fast
+    # enough to keep up -- which makes them useless for answering "how much did that
+    # cost?".  This one keeps falling as the frame gets more expensive, and only when
+    # it crosses frame_dt does playback actually drop below real-time.
+    busy_ema = None
     # Throttled console mirror of the HUD telemetry: the HUD does not exist in
     # headless runs and is easy to miss on screen, while this line is also what
     # makes scripted RTF measurement possible.  The guard is one
@@ -773,7 +780,14 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None,
             realtime_ema = inst_rt if realtime_ema is None else 0.9 * realtime_ema + 0.1 * inst_rt
         t_prev = t_start
         if fps_ema is not None and time.monotonic() >= rtf_print_next:
-            print(f"[play] {fps_ema:5.1f} FPS   {realtime_ema:.2f}x real-time")
+            line = f"[play] {fps_ema:5.1f} FPS   {realtime_ema:.2f}x real-time"
+            if busy_ema is not None and busy_ema > 1e-6:
+                # "headroom" = how many times faster than real-time the loop COULD
+                # run if the pacing sleep were removed.  Below 1.0x the sleep never
+                # fires and the sim is genuinely behind.
+                line += (f"   |  work {busy_ema * 1000:5.1f} ms/frame "
+                         f"({frame_dt / busy_ema:.2f}x headroom)")
+            print(line)
             rtf_print_next = time.monotonic() + 5.0
 
         # Arena actions (tab / level / respawn / model swap) are queued by
@@ -914,6 +928,7 @@ def interaction_loop(env, policy, args, task_type, viser_viewer=None,
         
         # sleep for the remainder of the frame budget to match real-time playback
         elapsed = time.perf_counter() - t_start
+        busy_ema = elapsed if busy_ema is None else 0.9 * busy_ema + 0.1 * elapsed
         remaining = frame_dt - elapsed
         if remaining > 0:
             time.sleep(remaining)
