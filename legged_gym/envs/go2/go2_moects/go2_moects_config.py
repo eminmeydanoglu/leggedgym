@@ -426,6 +426,24 @@ class Go2MoECTSCfgPPO(LeggedRobotCTSCfgPPO):
         terrain_gate_log_interval = 10
 
 
+class Go2DenseCTSCfg(Go2MoECTSCfg):
+    """Environment-identical dense control for ``go2_moects``."""
+
+
+class Go2DenseCTSCfgPPO(Go2MoECTSCfgPPO):
+    """MoE-CTS training contract with only the student encoder replaced."""
+
+    class policy(Go2MoECTSCfgPPO.policy):
+        student_encoder_type = 'dense'
+        # 1,087,626 params versus 1,088,264 in the existing MoE encoder.
+        student_encoder_hidden_dims = [1024, 810]
+
+    class runner(Go2MoECTSCfgPPO.runner):
+        experiment_name = 'go2_dense_cts'
+        run_name = 'dense_cts_param_matched' + get_simulator_suffix()
+        terrain_gate_log_interval = 0
+
+
 class Go2MoECTSHIMCfg(Go2MoECTSCommonCfg):
     """HIM arm env dims (mirrors Go2BenchHIMCfg.env on the shared substrate)."""
 

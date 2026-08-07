@@ -111,6 +111,18 @@ def _set_pd_gain_scale(env, values: torch.Tensor):
         sim._kp_scale_scalar[:] = scales
 
 
+def _prepare_pd_gain_cfg(env_cfg):
+    """Disable reset-time PD-gain randomization for the whole probe session.
+
+    genesis_simulator.reset_idx() unconditionally re-draws kp/kd whenever
+    domain_rand.randomize_pd_gain is True, regardless of which axis is being
+    swept.  Without this, every reset between commands silently corrupts the
+    pd_gain_scale label for every axis-sweep that is NOT pd_gain_scale itself
+    (see probe_moe_latent.py run_grid, which applies this cfg for all axes).
+    """
+    env_cfg.domain_rand.randomize_pd_gain = False
+
+
 def _prepare_control_delay_cfg(env_cfg, max_delay: int = 6):
     """Allocate Genesis's action queue, while keeping eval delay deterministic."""
     env_cfg.domain_rand.randomize_ctrl_delay = True
@@ -215,6 +227,7 @@ AXES = {
     "pd_gain_scale": Axis(
         name="pd_gain_scale", setter=_set_pd_gain_scale, in_dist=(1.0, 1.0), nominal=1.0,
         default_grid=[0.5, 0.65, 0.8, 1.0, 1.2, 1.35, 1.5], unit="scale",
+        prepare_cfg_fn=_prepare_pd_gain_cfg,
         readback=lambda env: env.simulator._kp_scale_scalar[:, 0],
     ),
     "control_delay": Axis(

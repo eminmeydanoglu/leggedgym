@@ -45,6 +45,17 @@ def _make_ac():
     )
 
 
+def _make_dense_ac():
+    torch.manual_seed(0)
+    return ActorCriticMoECTS(
+        NUM_OBS, NUM_ACTIONS, NUM_PRIVILEGED, NUM_HISTORY, NUM_LATENT, NUM_CRITIC,
+        student_encoder_type="dense", student_encoder_hidden_dims=[1024, 810],
+        norm_type="l2norm", init_noise_std=1.0,
+        actor_hidden_dims=[512, 256, 128], critic_hidden_dims=[512, 256, 128],
+        privilege_encoder_hidden_dims=[512, 256],
+    )
+
+
 # Mirror of the storage track's CriticMiniBatch namedtuple (pinned contract):
 # (critic_observations, observation_histories, target_values, returns,
 #  advantages, old_actions_log_prob, old_mu, old_sigma)
@@ -168,6 +179,35 @@ class TestActorCriticMoECTS(unittest.TestCase):
         for p in self.ac.history_encoder.parameters():
             self.assertIsNone(p.grad)
         self.assertIsNotNone(self.ac.actor[0].weight.grad)
+
+
+class TestActorCriticDenseCTS(unittest.TestCase):
+    def test_parameter_matched_encoder_contract(self):
+        moe = _make_ac().history_encoder
+        dense = _make_dense_ac().history_encoder
+        moe_params = sum(p.numel() for p in moe.parameters())
+        dense_params = sum(p.numel() for p in dense.parameters())
+        self.assertEqual(moe_params, 1_088_264)
+        self.assertEqual(dense_params, 1_087_626)
+        self.assertLess(abs(moe_params - dense_params) / moe_params, 0.001)
+
+        latent, weights = dense.forward_with_weights(torch.randn(7, NUM_HISTORY))
+        self.assertEqual(tuple(latent.shape), (7, NUM_LATENT))
+        self.assertEqual(tuple(weights.shape), (7, 1))
+        self.assertTrue(torch.equal(weights, torch.ones_like(weights)))
+        self.assertTrue(torch.allclose(
+            latent.norm(dim=-1), torch.ones(7), atol=1e-4))
+
+    def test_dense_encoder_loss_has_zero_load_balance(self):
+        ac = _make_dense_ac()
+        alg = PPO_MOE_CTS(ac, device="cpu", num_teacher=6,
+                          num_learning_epochs=1, num_mini_batches=2,
+                          load_balance_coef=0.01)
+        total, latent, balance, weights, _, _ = alg._compute_encoder_losses(
+            torch.randn(8, NUM_HISTORY), torch.randn(8, NUM_PRIVILEGED))
+        self.assertTrue(torch.allclose(total, latent))
+        self.assertEqual(float(balance), 0.0)
+        self.assertEqual(tuple(weights.shape), (8, 1))
 
 
 class TestPPOMoECTS(unittest.TestCase):
@@ -546,6 +586,7 @@ class TestMoECTSRegistryAndConfig(unittest.TestCase):
         import legged_gym.envs  # noqa: F401  (registers tasks)
         from legged_gym.utils import task_registry
         cls.env_cfg, cls.train_cfg = task_registry.get_cfgs("go2_moects")
+        cls.env_cfg_dense, cls.train_cfg_dense = task_registry.get_cfgs("go2_dense_cts")
         cls.env_cfg_him, cls.train_cfg_him = task_registry.get_cfgs("go2_moects_him")
 
     def test_cts_arm_wiring(self):
@@ -571,6 +612,25 @@ class TestMoECTSRegistryAndConfig(unittest.TestCase):
         self.assertAlmostEqual(terr.terrain_spacing, 0.5)
         self.assertTrue(terr.measure_heights)
         self.assertEqual(len(terr.measured_points_x) * len(terr.measured_points_y), 187)
+
+    def test_dense_arm_changes_only_student_encoder_and_run_identity(self):
+        from legged_gym.envs.go2.go2_moects.go2_moects_config import (
+            Go2MoECTSCfg, Go2DenseCTSCfg)
+        from legged_gym.utils.helpers import class_to_dict
+        moe = class_to_dict(self.train_cfg)
+        dense = class_to_dict(self.train_cfg_dense)
+        # Use fresh configs: an earlier terrain-builder test deliberately adds
+        # derived fields to the registry's singleton go2_moects terrain cfg.
+        self.assertEqual(class_to_dict(Go2MoECTSCfg()),
+                         class_to_dict(Go2DenseCTSCfg()))
+        self.assertEqual(dense["policy"]["student_encoder_type"], "dense")
+        self.assertEqual(dense["policy"]["student_encoder_hidden_dims"], [1024, 810])
+        self.assertEqual(dense["runner"]["experiment_name"], "go2_dense_cts")
+        self.assertEqual(dense["runner"]["terrain_gate_log_interval"], 0)
+        self.assertEqual(moe["algorithm"], dense["algorithm"])
+        for key, value in moe["policy"].items():
+            if key not in {"student_encoder_hidden_dims", "student_encoder_type"}:
+                self.assertEqual(value, dense["policy"][key])
 
     def test_eval_resolution_in_cts_runner_namespace(self):
         # CTSRunner._init_agent_and_algo resolves class names with eval() in

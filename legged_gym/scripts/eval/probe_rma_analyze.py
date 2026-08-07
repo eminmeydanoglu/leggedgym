@@ -65,6 +65,11 @@ import torch.nn as nn
 # scipy — always present
 from scipy.stats import spearmanr
 
+# Shared implementations. Local definitions below remain temporarily as
+# compatibility documentation; these aliases are rebound after the legacy
+# metric function so all runtime calls use probe_lib without changing results.
+from legged_gym.scripts.eval import probe_lib as _probe_lib
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -398,6 +403,23 @@ def compute_decoder_metrics(
         "y_pred_nonlinear": y_pred_mlp[valid],
         "idx_oof":         idx_v,
     }
+
+
+# Runtime delegation to the common CPU-only library. The RMA-specific nonlinear
+# decoder remains local so historical MLP results and report schema stay intact.
+NORM_RANGES = {k: _probe_lib.NORM_RANGES[k] for k in
+               ("friction", "added_mass", "com_x", "com_y", "com_z")}
+dr_normalize = _probe_lib.dr_normalize
+dr_unnormalize = _probe_lib.dr_unnormalize
+group_kfold_splits = _probe_lib.group_kfold_splits
+_NumpyRidgePipeline = _probe_lib._NumpyRidgePipeline
+_best_ridge_numpy = _probe_lib._best_ridge_numpy
+
+
+def compute_decoder_metrics(X, y, groups, n_splits=5):
+    """Compatibility wrapper around the shared OOF implementation."""
+    return _probe_lib.compute_decoder_metrics(
+        X, y, groups, n_splits=n_splits, nonlinear_predictor=_train_torch_mlp)
 
 
 # ---------------------------------------------------------------------------

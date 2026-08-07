@@ -5,6 +5,8 @@ from legged_gym.envs.go2.go2_moects.go2_moects_config import (
     Go2MoECTSCommonCfg,
     Go2MoECTSCfg,
     Go2MoECTSCfgPPO,
+    Go2DenseCTSCfg,
+    Go2DenseCTSCfgPPO,
     Go2MoECTSHIMCfg,
     Go2MoECTSHIMCfgPPO,
 )

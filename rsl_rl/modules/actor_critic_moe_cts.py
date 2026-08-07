@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 from .actor_critic_cts import ActorCriticCTS
-from .moe_utils import StudentMoEEncoder, L2Norm, SimNorm, MLP
+from .moe_utils import StudentMoEEncoder, StudentDenseEncoder, L2Norm, SimNorm, MLP
 
 
 class ActorCriticMoECTS(ActorCriticCTS):
@@ -40,6 +40,7 @@ class ActorCriticMoECTS(ActorCriticCTS):
                  critic_hidden_dims=[512, 256, 128],
                  expert_num=8,
                  student_encoder_hidden_dims=[512, 256, 256],
+                 student_encoder_type='moe',
                  norm_type='l2norm',
                  activation='elu',
                  **kwargs):
@@ -55,15 +56,22 @@ class ActorCriticMoECTS(ActorCriticCTS):
                          activation=activation,
                          **kwargs)
 
-        # Replace the MLP history encoder with the MoE student encoder.
-        self.history_encoder = StudentMoEEncoder(
-            expert_num=expert_num,
-            input_dim=num_history_encoder_input,
-            hidden_dims=student_encoder_hidden_dims,
-            output_dim=num_latent_dims,
-            activation=activation,
-            norm_type=norm_type,
-        )
+        if student_encoder_type == 'moe':
+            self.history_encoder = StudentMoEEncoder(
+                expert_num=expert_num, input_dim=num_history_encoder_input,
+                hidden_dims=student_encoder_hidden_dims,
+                output_dim=num_latent_dims, activation=activation,
+                norm_type=norm_type)
+        elif student_encoder_type == 'dense':
+            self.history_encoder = StudentDenseEncoder(
+                input_dim=num_history_encoder_input,
+                hidden_dims=student_encoder_hidden_dims,
+                output_dim=num_latent_dims, activation=activation,
+                norm_type=norm_type)
+        else:
+            raise ValueError(
+                f"Unknown student_encoder_type {student_encoder_type!r}; "
+                "expected 'moe' or 'dense'.")
         # Normalize the teacher latent like the student latent.
         norm_layer = L2Norm() if norm_type == 'l2norm' else SimNorm()
         self.privilege_encoder = nn.Sequential(self.privilege_encoder, norm_layer)
@@ -72,7 +80,7 @@ class ActorCriticMoECTS(ActorCriticCTS):
         self.critic = MLP([num_critic_obs + num_latent_dims, *critic_hidden_dims, 1], activation=activation)
 
         print(f"Privilege Encoder (+{norm_type}): {self.privilege_encoder}")
-        print(f"Student MoE Encoder: {self.history_encoder}")
+        print(f"Student {student_encoder_type} Encoder: {self.history_encoder}")
         print(f"Critic MLP: {self.critic}")
 
     # Actor input is [latent, observations] -- latent FIRST. The host

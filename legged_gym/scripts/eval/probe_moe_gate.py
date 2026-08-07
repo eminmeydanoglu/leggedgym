@@ -245,6 +245,9 @@ def _override_cfg_for_probe(env_cfg, cli):
     env_cfg.env.auto_reset = True
     env_cfg.env.debug = False
     env_cfg.seed = cli.seed
+    for axis_name in getattr(cli, "prepare_axes", ()):
+        from legged_gym.scripts.eval.dr_axes import get_axis
+        get_axis(axis_name).prepare_cfg(env_cfg)
     if cli.nominal:
         env_cfg.domain_rand.randomize_friction = False
         env_cfg.domain_rand.randomize_base_mass = False

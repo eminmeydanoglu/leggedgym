@@ -173,3 +173,24 @@ class StudentMoEEncoder(nn.Module):
         # Kept free of any state mutation so torch.jit.script can compile it.
         latent, _ = self.moe(obs)
         return self.norm_layer(latent)
+
+
+class StudentDenseEncoder(nn.Module):
+    """Parameter-matched dense control for the MoE student encoder."""
+
+    def __init__(self, input_dim, hidden_dims, output_dim,
+                 activation='elu', norm_type='l2norm'):
+        super().__init__()
+        self.network = MLP([input_dim, *hidden_dims, output_dim], activation)
+        self.norm_layer = L2Norm() if norm_type == 'l2norm' else SimNorm()
+
+    def forward_with_weights(self, obs):
+        latent = self.norm_layer(self.network(obs))
+        # Preserve PPO_MOE_CTS's loss API. One constant route makes the
+        # inapplicable load-balance term exactly zero.
+        weights = torch.ones(
+            (obs.shape[0], 1), dtype=latent.dtype, device=latent.device)
+        return latent, weights
+
+    def forward(self, obs):
+        return self.norm_layer(self.network(obs))

@@ -87,7 +87,8 @@ from legged_gym.envs.go2.go2_nav.go2_nav_config import GO2NavCfg, GO2NavCfgPPO
 from legged_gym.envs.go2.go2_moects.go2_moects import Go2MoECTS
 from legged_gym.envs.go2.go2_moects.go2_moects_him import Go2MoECTSHIM
 from legged_gym.envs.go2.go2_moects.go2_moects_config import (
-    Go2MoECTSCfg, Go2MoECTSCfgPPO, Go2MoECTSHIMCfg, Go2MoECTSHIMCfgPPO)
+    Go2MoECTSCfg, Go2MoECTSCfgPPO, Go2DenseCTSCfg, Go2DenseCTSCfgPPO,
+    Go2MoECTSHIMCfg, Go2MoECTSHIMCfgPPO)
 
 # tron1_pf
 from legged_gym.envs.tron1pf.tron1pf import TRON1PF
@@ -126,6 +127,7 @@ task_registry.register( "go2_cat", Go2CaT, Go2CaTCfg(), Go2CaTCfgPPO())
 task_registry.register( "go2_ts_depth", Go2TSDepth, Go2TSDepthCfg(), Go2TSDepthCfgPPO()) # unvalidated
 task_registry.register( "go2_nav", GO2Nav, GO2NavCfg(), GO2NavCfgPPO())
 task_registry.register( "go2_moects", Go2MoECTS, Go2MoECTSCfg(), Go2MoECTSCfgPPO())
+task_registry.register( "go2_dense_cts", Go2MoECTS, Go2DenseCTSCfg(), Go2DenseCTSCfgPPO())
 task_registry.register( "go2_moects_him", Go2MoECTSHIM, Go2MoECTSHIMCfg(), Go2MoECTSHIMCfgPPO())
 task_registry.register( "tron1pf", TRON1PF, TRON1PFCfg(), TRON1PFCfgPPO())
 task_registry.register( "tron1pf_ee", TRON1PF_EE, TRON1PF_EECfg(), TRON1PF_EECfgPPO())

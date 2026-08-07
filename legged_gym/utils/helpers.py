@@ -82,7 +82,7 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
 # one-environment debug run therefore has no teacher role at all and fails the
 # reference split's exact-count checks.  Keep the exception task-specific so
 # existing debug runs retain their one-environment behavior.
-_MOE_CTS_DEBUG_TASKS = frozenset(("go2_moects",))
+_MOE_CTS_DEBUG_TASKS = frozenset(("go2_moects", "go2_dense_cts"))
 _MOE_CTS_DEBUG_NUM_ENVS = 4
 
 
