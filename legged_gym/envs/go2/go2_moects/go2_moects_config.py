@@ -431,7 +431,7 @@ class Go2DenseCTSCfg(Go2MoECTSCfg):
 
 
 class Go2DenseCTSCfgPPO(Go2MoECTSCfgPPO):
-    """MoE-CTS training contract with only the student encoder replaced."""
+    """Dense-encoder control with no isolated Genesis evaluation scene."""
 
     class policy(Go2MoECTSCfgPPO.policy):
         student_encoder_type = 'dense'
@@ -441,6 +441,12 @@ class Go2DenseCTSCfgPPO(Go2MoECTSCfgPPO):
     class runner(Go2MoECTSCfgPPO.runner):
         experiment_name = 'go2_dense_cts'
         run_name = 'dense_cts_param_matched' + get_simulator_suffix()
+        # A persistent eval scene duplicates Genesis terrain/SDF allocations.
+        # Dense-CTS is intended to run at the 8192-env MoE-CTS scale on a
+        # 32 GiB L4 host, so keep a single training scene and rely on normal
+        # PPO TensorBoard scalars for in-run monitoring.
+        eval_interval = 0
+        eval_num_envs = 0
         terrain_gate_log_interval = 0
 
 

@@ -626,6 +626,8 @@ class TestMoECTSRegistryAndConfig(unittest.TestCase):
         self.assertEqual(dense["policy"]["student_encoder_type"], "dense")
         self.assertEqual(dense["policy"]["student_encoder_hidden_dims"], [1024, 810])
         self.assertEqual(dense["runner"]["experiment_name"], "go2_dense_cts")
+        self.assertEqual(dense["runner"]["eval_interval"], 0)
+        self.assertEqual(dense["runner"]["eval_num_envs"], 0)
         self.assertEqual(dense["runner"]["terrain_gate_log_interval"], 0)
         self.assertEqual(moe["algorithm"], dense["algorithm"])
         for key, value in moe["policy"].items():
